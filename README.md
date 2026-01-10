@@ -18,8 +18,9 @@ Collect historical and real-time data for the top crypto tokens across multiple 
   - OHLCV (price, volume, transactions)
 - **Normalized Architecture**: Asset narratives and filtering status are decoupled from time-series data into a dedicated cache.
 - **Top 50 Tokens**: Automatically fetches top tokens by market cap, filtering out stablecoins and wrapped assets via official CoinGecko taxonomies.
-- **Persistent Metadata**: Shared cache (`data/asset_metadata.csv`) ensures high performance and consistent narrative selection.
-- **Database Ready**: Complete PostgreSQL/Supabase schema for Spot, Futures, and Metadata.
+- **Persistent Metadata**: DB-first architecture ensures metadata is synced to Supabase (only writes `data/asset_metadata.csv` if explicitly requested).
+- **Stateless Execution**: Optimized for GitHub Actions. Checks Supabase for the last existing data date to perform efficient incremental updates without local file persistence.
+- **Database Ready**: Complete PostgreSQL/Supabase schema with idempotent `reset_database.sql` script.
 
 ---
 
@@ -67,6 +68,18 @@ python alts_scraper.py --start 2023-01-01 --end-days-ago 1
 python alts_scraper.py --skip-ohlcv
 ```
 
+### GitHub Actions (Stateless)
+The system is designed to run statelessly in the cloud. It will:
+1. Connect to `DATABASE_URL`.
+2. Check the last sync date for each asset.
+3. Fetch only missing data (Incremental).
+4. Upsert results to the DB.
+
+**Recommended Schedule:**
+- **01:00 AM Madrid**: Daily Close (Finalizes previous day).
+- **03:00 PM Madrid**: Intraday Snapshot (US Open).
+- **07:00 PM Madrid**: Intraday Snapshot (Pre-Close).
+
 ### CLI Options
 
 | Option | Default | Description |
@@ -76,6 +89,7 @@ python alts_scraper.py --skip-ohlcv
 | `--start` | 2017-01-01 | Start date (YYYY-MM-DD) |
 | `--end-days-ago` | 1 | End date as N days ago |
 | `--output-dir` | data | Output directory |
+| `--csv` | False | Save local CSV files |
 | `--skip-ohlcv` | false | Skip OHLCV price data |
 | `--skip-merge` | false | Skip merging into existing files |
 
