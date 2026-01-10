@@ -24,8 +24,12 @@ import argparse
 import requests
 import pandas as pd
 import psycopg2
+import warnings
 from psycopg2.extras import execute_values
 from datetime import datetime, timedelta, timezone, time as dtime
+
+# Suppress pandas warning about raw DB connections
+warnings.filterwarnings("ignore", ".*pandas only supports SQLAlchemy connectable.*")
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 

@@ -3,7 +3,11 @@ import time
 import requests
 import pandas as pd
 import psycopg2
+import warnings
 from psycopg2.extras import execute_values
+
+# Suppress pandas warning about raw DB connections
+warnings.filterwarnings("ignore", ".*pandas only supports SQLAlchemy connectable.*")
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 import argparse
