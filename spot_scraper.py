@@ -61,7 +61,11 @@ class DatabaseManager:
             for _, row in df.iterrows():
                 cur.execute("""
                     SELECT upsert_spot_daily_ohlcv(
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s::DATE, %s::VARCHAR, %s::VARCHAR, 
+                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, 
+                        %s::DECIMAL, %s::DECIMAL, 
+                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, 
+                        %s::BIGINT, %s::BIGINT, %s::BIGINT
                     )
                 """, (
                     row.get('date'), row.get('symbol'), row.get('exchange'),
