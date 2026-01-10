@@ -11,6 +11,35 @@
 -- Enable required extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
+-- Migration: Add missing columns if table already exists
+DO $$ 
+BEGIN
+    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename  = 'futures_daily_metrics') THEN
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS oi_usd_open DECIMAL(24, 4);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS oi_usd_high DECIMAL(24, 4);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS oi_usd_low DECIMAL(24, 4);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_open DECIMAL(18, 10);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_high DECIMAL(18, 10);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_low DECIMAL(18, 10);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_close DECIMAL(18, 10);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS ls_acc_global DECIMAL(12, 6);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS ls_acc_top DECIMAL(12, 6);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS ls_pos_top DECIMAL(12, 6);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS sell_volume_base DECIMAL(24, 8);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS volume_delta DECIMAL(24, 8);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS buy_txn_count BIGINT;
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS sell_txn_count BIGINT;
+    END IF;
+    
+    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename  = 'spot_daily_ohlcv') THEN
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS buy_volume_base DECIMAL(24, 8);
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS sell_volume_base DECIMAL(24, 8);
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS volume_delta DECIMAL(24, 8);
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS buy_txn_count BIGINT;
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS sell_txn_count BIGINT;
+    END IF;
+END $$;
+
 -- ==============================================================================
 -- EXCHANGES TABLE
 -- Stores exchange metadata and identification codes
@@ -241,7 +270,8 @@ CREATE OR REPLACE FUNCTION upsert_futures_daily_metrics(
     p_sell_volume_base DECIMAL(24,8),
     p_volume_delta DECIMAL(24,8),
     p_txn_count BIGINT,
-    p_buy_txn_count BIGINT
+    p_buy_txn_count BIGINT,
+    p_sell_txn_count BIGINT
 )
 RETURNS VOID AS $$
 BEGIN
