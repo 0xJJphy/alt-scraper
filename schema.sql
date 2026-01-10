@@ -483,16 +483,19 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trigger_update_timestamp ON futures_daily_metrics;
 CREATE TRIGGER trigger_update_timestamp
     BEFORE UPDATE ON futures_daily_metrics
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS trigger_update_timestamp_exchanges ON exchanges;
 CREATE TRIGGER trigger_update_timestamp_exchanges
     BEFORE UPDATE ON exchanges
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS trigger_update_timestamp_symbols ON symbols;
 CREATE TRIGGER trigger_update_timestamp_symbols
     BEFORE UPDATE ON symbols
     FOR EACH ROW
@@ -945,11 +948,13 @@ $$ LANGUAGE plpgsql;
 -- ==============================================================================
 -- TRIGGER FOR ASSET METADATA
 -- ==============================================================================
+DROP TRIGGER IF EXISTS trigger_update_timestamp_metadata ON asset_metadata;
 CREATE TRIGGER trigger_update_timestamp_metadata
     BEFORE UPDATE ON asset_metadata
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS trigger_update_timestamp_spot ON spot_daily_ohlcv;
 CREATE TRIGGER trigger_update_timestamp_spot
     BEFORE UPDATE ON spot_daily_ohlcv
     FOR EACH ROW
