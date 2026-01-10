@@ -114,18 +114,55 @@ class DatabaseManager:
         finally:
              if conn: conn.close()
 
+    def get_all_asset_metadata(self) -> pd.DataFrame:
+        """Fetch all asset metadata from DB."""
+        if not self.enabled: return pd.DataFrame()
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            query = "SELECT symbol, narrative, is_filtered FROM asset_metadata"
+            df = pd.read_sql(query, conn)
+            conn.close()
+            return df
+        except Exception as e:
+            print(f"    [DB INFO] Could not fetch metadata: {e}")
+            return pd.DataFrame()
+        finally:
+            if conn: conn.close()
+
 class AssetMetadataManager:
-    def __init__(self, file_path: str = "data/asset_metadata.csv"):
+    def __init__(self, file_path: str = "data/asset_metadata.csv", db_manager: Optional[DatabaseManager] = None, allow_csv: bool = True):
         self.file_path = file_path
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        if os.path.exists(file_path):
-            self.df = pd.read_csv(file_path)
-            # Ensure correct types
-            if 'is_filtered' in self.df.columns:
-                self.df['is_filtered'] = self.df['is_filtered'].astype(int)
-        else:
-            self.df = pd.DataFrame(columns=['symbol', 'narrative', 'is_filtered'])
-            self.df.to_csv(file_path, index=False)
+        self.db_manager = db_manager
+        self.allow_csv = allow_csv
+        
+        # Load from DB first if enabled
+        db_loaded = False
+        if self.db_manager and self.db_manager.enabled:
+            print("  [Meta] Loading from Database...")
+            db_df = self.db_manager.get_all_asset_metadata()
+            if not db_df.empty:
+                self.df = db_df
+                db_loaded = True
+                print(f"  [Meta] Loaded {len(self.df)} assets from DB")
+
+        # Fallback to CSV or create new
+        if not db_loaded:
+             if os.path.exists(file_path):
+                try:
+                    self.df = pd.read_csv(file_path)
+                    if 'is_filtered' in self.df.columns:
+                        self.df['is_filtered'] = self.df['is_filtered'].astype(int)
+                except:
+                     self.df = pd.DataFrame(columns=['symbol', 'narrative', 'is_filtered'])
+             else:
+                self.df = pd.DataFrame(columns=['symbol', 'narrative', 'is_filtered'])
+
+        # Create/Touch CSV if allowed
+        if self.allow_csv:
+             os.makedirs(os.path.dirname(file_path), exist_ok=True)
+             if not os.path.exists(file_path) or not db_loaded: # Only write if new or not from DB
+                 self.df.to_csv(file_path, index=False)
 
     def _select_best_narrative(self, categories: List[str]) -> str:
         """Pick the most significant narrative from a list of categories."""
@@ -185,7 +222,14 @@ class AssetMetadataManager:
             # Update cache
             new_row = pd.DataFrame([{'symbol': symbol, 'narrative': narrative, 'is_filtered': is_filtered}])
             self.df = pd.concat([self.df, new_row], ignore_index=True).drop_duplicates('symbol')
-            self.df.to_csv(self.file_path, index=False)
+            
+            # Persist to DB immediately
+            if self.db_manager and self.db_manager.enabled:
+                self.db_manager.upsert_asset_metadata(symbol, narrative, is_filtered)
+            
+            # Persist to CSV if allowed
+            if self.allow_csv:
+                self.df.to_csv(self.file_path, index=False)
             
             return {"narrative": narrative, "is_filtered": is_filtered}
             
@@ -472,6 +516,7 @@ class SpotScraper:
 def main():
     parser = argparse.ArgumentParser(description="Fetch historical Spot OHLCV data from major exchanges")
     parser.add_argument("--limit", type=int, default=100, help="Number of top tokens to fetch (default: 100)")
+    parser.add_argument("--top", type=int, dest="limit", help="Alias for --limit (backwards compatibility)")
     parser.add_argument("--csv", action="store_true", help="Save results to local CSV files (default: False)")
     parser.add_argument("--top-range", type=str, default=None, help="Rank range (e.g. 1-50)")
     parser.add_argument("--symbols", type=str, default=None, help="Specific symbols (e.g. BTC,ETH)")
@@ -480,7 +525,11 @@ def main():
     parser.add_argument("--output-dir", type=str, default="data/spot", help="Output directory")
     args = parser.parse_args()
     
-    meta = AssetMetadataManager()
+    scraper = SpotScraper(args.output_dir)
+    db_manager = DatabaseManager()
+    
+    # Initialize Metadata Manager with DB support
+    meta = AssetMetadataManager(db_manager=db_manager, allow_csv=args.csv)
     target_bases = []
     
     if args.symbols:
@@ -496,7 +545,7 @@ def main():
             _, end_rank = map(int, args.top_range.split("-"))
             limit = end_rank
         else:
-            limit = args.top
+            limit = args.limit
             
         candidates = coingecko_get_top_candidates(n=limit)
         valid_candidates = []
@@ -510,15 +559,13 @@ def main():
             start_rank, end_rank = map(int, args.top_range.split("-"))
             target_bases = valid_candidates[start_rank-1:end_rank]
         else:
-            target_bases = valid_candidates[:args.top]
+            target_bases = valid_candidates[:args.limit]
 
     exchanges = [e.strip().lower() for e in args.exchanges.split(",")]
     start_dt = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end_dt = datetime.now(timezone.utc)
     start_ts, end_ts = to_unix_ms(start_dt), to_unix_ms(end_dt)
     
-    scraper = SpotScraper(args.output_dir)
-    db_manager = DatabaseManager()
     print("=" * 60)
     print(f"Exchange Spot OHLCV Backfill (Cache: {len(meta.df)} assets)")
     print("=" * 60)

@@ -1,0 +1,62 @@
+name: Alts Scraper Pipeline
+
+on:
+  schedule:
+    # Madrid is UTC+1 (Winter) / UTC+2 (Summer)
+    # 1. Daily Close: 1 AM Madrid = 00:00 UTC (Winter) / 23:00 UTC (Summer)
+    #    Target: ~00:15 UTC to ensure daily candle is closed and available.
+    - cron: '15 0 * * *'
+    
+    # 2. Pre-Opening (US/Session): 3 PM Madrid = 14:00 UTC (Winter) / 13:00 UTC (Summer)
+    #    Target: 14:00 UTC (compromise)
+    - cron: '0 14 * * *'
+    
+    # 3. Pre-Close/Evening: 7 PM Madrid = 18:00 UTC (Winter) / 17:00 UTC (Summer)
+    #    Target: 18:00 UTC
+    - cron: '0 18 * * *'
+
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Days to look back (default: 1)'
+        required: false
+        default: '1'
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      COINALYZE_API_KEY: ${{ secrets.COINALYZE_API_KEY }}
+      # Optional: COINGECKO_API_KEY if you add it later
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Spot Scraper (Top 50)
+        run: |
+          # Only fetch top 50 to keep runtime short
+          # DB integration will handle incremental updates
+          python spot_scraper.py --top 50
+        continue-on-error: true
+
+      - name: Run Futures Scraper (Top 50 + Exchanges)
+        run: |
+          # Fetch Top 50 by OI + specific exchanges
+          python alts_scraper.py --limit 50 --exchanges binance,bybit,okx
+        continue-on-error: true

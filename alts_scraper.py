@@ -111,6 +111,113 @@ def to_unix_seconds(dt: datetime) -> int:
     return int(dt.timestamp())
 
 
+class DatabaseManager:
+    """Handles communication with Supabase (PostgreSQL)."""
+    def __init__(self, db_url: Optional[str] = None):
+        if not db_url:
+            db_url = os.getenv("DATABASE_URL")
+        self.db_url = db_url
+        self.enabled = bool(db_url)
+        if self.enabled:
+            print("[DB] Supabase Integration Enabled.")
+        else:
+            print("[DB] Supabase Integration Disabled (DATABASE_URL missing).")
+
+    def upsert_futures_metrics(self, df: pd.DataFrame):
+        """Batch upsert futures metrics into DB."""
+        if not self.enabled or df.empty: return
+        
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+            
+            # Prepare data tuples
+            # Function signature:
+            # upsert_futures_daily_metrics(date, symbol, exchange, oi_open, oi_high, oi_low, oi_close,
+            # funding_open, funding_high, funding_low, funding_close,
+            # pred_funding_open, pred_funding_high, pred_funding_low, pred_funding_close,
+            # liq_longs, liq_shorts, long_short_ratio, longs_qty, shorts_qty,
+            # ls_acc_global, ls_acc_top, ls_pos_top)
+
+            for _, row in df.iterrows():
+                cur.execute("""
+                    SELECT upsert_futures_daily_metrics(
+                        %s, %s, %s, 
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, 
+                        %s, %s, %s,
+                        %s, %s, %s
+                    )
+                """, (
+                    row.get('date'), row.get('symbol'), row.get('exchange'),
+                    row.get('oi_usd_open'), row.get('oi_usd_high'), row.get('oi_usd_low'), row.get('oi_usd_close'),
+                    row.get('funding_open'), row.get('funding_high'), row.get('funding_low'), row.get('funding_close'),
+                    row.get('pred_funding_open'), row.get('pred_funding_high'), row.get('pred_funding_low'), row.get('pred_funding_close'),
+                    row.get('liq_longs'), row.get('liq_shorts'),
+                    row.get('ls_ratio'), row.get('longs_qty'), row.get('shorts_qty'),
+                    row.get('ls_acc_global'), row.get('ls_acc_top'), row.get('ls_pos_top')
+                ))
+            
+            conn.commit()
+            print(f"    [DB] Upserted {len(df)} rows.")
+            
+        except Exception as e:
+            print(f"    [DB ERROR] Upsert failed: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+
+    def get_last_data_date(self, symbol: str, exchange: str) -> Optional[datetime]:
+        """Get the last stored date for a symbol/exchange in the DB."""
+        if not self.enabled: return None
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(date) FROM futures_daily_metrics WHERE symbol = %s AND exchange = %s", (symbol, exchange))
+            res = cur.fetchone()
+            if res and res[0]: return res[0]
+            return None
+        except Exception as e:
+            print(f"    [DB INFO] Could not fetch last date for {symbol}: {e}")
+            return None
+        finally:
+             if conn: conn.close()
+             
+    def get_all_asset_metadata(self) -> pd.DataFrame:
+        """Fetch all asset metadata from DB."""
+        if not self.enabled: return pd.DataFrame()
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            query = "SELECT symbol, narrative, is_filtered FROM asset_metadata"
+            df = pd.read_sql(query, conn)
+            return df
+        except Exception as e:
+            print(f"    [DB INFO] Could not fetch metadata: {e}")
+            return pd.DataFrame()
+        finally:
+            if conn: conn.close()
+
+    def upsert_asset_metadata(self, symbol: str, narrative: str, is_filtered: int):
+        """Upsert asset metadata into asset_metadata table."""
+        if not self.enabled: return
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+            cur.execute("SELECT upsert_asset_metadata(%s, %s, %s)", (symbol, narrative, bool(is_filtered)))
+            conn.commit()
+        except Exception as e:
+            print(f"    [DB ERROR] Metadata upsert failed for {symbol}: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+
+
 def get_incremental_start(path: str, default_start_sec: int, symbol: str, exchange: str, db_manager: Optional[DatabaseManager] = None) -> int:
     """
     Find start timestamp from:
@@ -148,19 +255,38 @@ def get_incremental_start(path: str, default_start_sec: int, symbol: str, exchan
 
 
 class AssetMetadataManager:
-    def __init__(self, file_path: str = "data/asset_metadata.csv"):
+    def __init__(self, file_path: str = "data/asset_metadata.csv", db_manager: Optional[DatabaseManager] = None, allow_csv: bool = True):
         self.file_path = file_path
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        if os.path.exists(file_path):
-            try:
-                self.df = pd.read_csv(file_path)
-                if 'is_filtered' in self.df.columns:
-                    self.df['is_filtered'] = self.df['is_filtered'].astype(int)
-            except:
+        self.db_manager = db_manager
+        self.allow_csv = allow_csv
+        
+        # Load from DB first if enabled
+        db_loaded = False
+        if self.db_manager and self.db_manager.enabled:
+            print("  [Meta] Loading from Database...")
+            db_df = self.db_manager.get_all_asset_metadata()
+            if not db_df.empty:
+                self.df = db_df
+                db_loaded = True
+                print(f"  [Meta] Loaded {len(self.df)} assets from DB")
+
+        # Fallback to CSV or create new
+        if not db_loaded:
+             if os.path.exists(file_path):
+                try:
+                    self.df = pd.read_csv(file_path)
+                    if 'is_filtered' in self.df.columns:
+                        self.df['is_filtered'] = self.df['is_filtered'].astype(int)
+                except:
+                     self.df = pd.DataFrame(columns=['symbol', 'narrative', 'is_filtered'])
+             else:
                 self.df = pd.DataFrame(columns=['symbol', 'narrative', 'is_filtered'])
-        else:
-            self.df = pd.DataFrame(columns=['symbol', 'narrative', 'is_filtered'])
-            self.df.to_csv(file_path, index=False)
+
+        # Create/Touch CSV if allowed
+        if self.allow_csv:
+             os.makedirs(os.path.dirname(file_path), exist_ok=True)
+             if not os.path.exists(file_path) or not db_loaded: # Only write if new or not from DB
+                 self.df.to_csv(file_path, index=False)
 
     def _select_best_narrative(self, categories: List[str]) -> str:
         """Pick the most significant narrative from a list of categories."""
@@ -203,7 +329,15 @@ class AssetMetadataManager:
 
             new_row = pd.DataFrame([{'symbol': symbol, 'narrative': narrative, 'is_filtered': is_filtered}])
             self.df = pd.concat([self.df, new_row], ignore_index=True).drop_duplicates('symbol')
-            self.df.to_csv(self.file_path, index=False)
+            
+            # Persist to DB immediately
+            if self.db_manager and self.db_manager.enabled:
+                self.db_manager.upsert_asset_metadata(symbol, narrative, is_filtered)
+            
+            # Persist to CSV if allowed
+            if self.allow_csv:
+                self.df.to_csv(self.file_path, index=False)
+                
             return {"narrative": narrative, "is_filtered": is_filtered}
         except Exception as e:
             print(f"    [ERROR] CG Fetch failed for {symbol}: {e}")
@@ -1264,7 +1398,8 @@ def main():
     end_sec = to_unix_seconds(end_dt)
     
     # Determine target tokens (base assets)
-    meta = AssetMetadataManager()
+    # Pass db_manager and respect --csv flag for metadata storage
+    meta = AssetMetadataManager(db_manager=db_manager, allow_csv=args.csv)
     target_bases = []
     
     if args.symbols:
