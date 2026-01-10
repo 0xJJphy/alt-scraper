@@ -476,7 +476,7 @@ def main():
     parser.add_argument("--top-range", type=str, default=None, help="Rank range (e.g. 1-50)")
     parser.add_argument("--symbols", type=str, default=None, help="Specific symbols (e.g. BTC,ETH)")
     parser.add_argument("--exchanges", type=str, default="binance,bybit,okx", help="Exchanges to fetch")
-    parser.add_argument("--start", type=str, default="2020-01-01", help="Start date YYYY-MM-DD")
+    parser.add_argument("--start", type=str, default="2017-01-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--output-dir", type=str, default="data/spot", help="Output directory")
     args = parser.parse_args()
     
