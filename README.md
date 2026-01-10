@@ -208,7 +208,7 @@ erDiagram
 | **Funding Rate**| `funding_open`, `funding_high`, `funding_low`, `funding_close` |
 | **Liquidations**| `liq_longs`, `liq_shorts`, `liq_total` |
 | **OHLCV** | `price_open`, `price_high`, `price_low`, `price_close`, `volume_base`, `volume_usd` |
-| **Metrics** | `ls_ratio`, `txn_count`, `buy_txn_count`, **`volume_delta`** (Buy-Sell) |
+| **Metrics** | `ls_ratio`, `txn_count`, `buy_txn_count`, `sell_txn_count`, **`volume_delta`** (Buy-Sell) |
 
 ---
 

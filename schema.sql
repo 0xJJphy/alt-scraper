@@ -135,9 +135,10 @@ CREATE TABLE IF NOT EXISTS futures_daily_metrics (
     volume_base         DECIMAL(24, 8),             -- Total volume in base asset
     buy_volume_base     DECIMAL(24, 8),             -- Buy volume in base asset
     sell_volume_base    DECIMAL(24, 8),             -- Sell volume in base asset
-    volume_delta        DECIMAL(24, 8),             -- (Buy - Sell) volume (CVD component)
-    txn_count           BIGINT,                     -- Number of transactions
+    volume_delta        DECIMAL(24, 8),             -- (Buy - Sell) volume
+    txn_count           BIGINT,                     -- Total number of transactions
     buy_txn_count       BIGINT,                     -- Number of buy transactions
+    sell_txn_count      BIGINT,                     -- Number of sell transactions
     
     -- Metadata
     created_at          TIMESTAMPTZ DEFAULT NOW(),
@@ -246,7 +247,7 @@ BEGIN
         liq_longs, liq_shorts, liq_total,
         price_open, price_high, price_low, price_close,
         volume_usd, volume_base, buy_volume_base, sell_volume_base, volume_delta,
-        txn_count, buy_txn_count,
+        txn_count, buy_txn_count, sell_txn_count,
         updated_at
     ) VALUES (
         p_date, p_symbol, p_exchange, p_base_asset,
@@ -257,7 +258,7 @@ BEGIN
         p_liq_longs, p_liq_shorts, p_liq_total,
         p_price_open, p_price_high, p_price_low, p_price_close,
         p_volume_usd, p_volume_base, p_buy_volume_base, p_sell_volume_base, p_volume_delta,
-        p_txn_count, p_buy_txn_count,
+        p_txn_count, p_buy_txn_count, p_sell_txn_count,
         NOW()
     )
     ON CONFLICT (date, symbol, exchange) DO UPDATE SET
@@ -291,6 +292,7 @@ BEGIN
         volume_delta = COALESCE(EXCLUDED.volume_delta, futures_daily_metrics.volume_delta),
         txn_count = COALESCE(EXCLUDED.txn_count, futures_daily_metrics.txn_count),
         buy_txn_count = COALESCE(EXCLUDED.buy_txn_count, futures_daily_metrics.buy_txn_count),
+        sell_txn_count = COALESCE(EXCLUDED.sell_txn_count, futures_daily_metrics.sell_txn_count),
         updated_at = NOW();
 END;
 $$ LANGUAGE plpgsql;
@@ -331,7 +333,7 @@ BEGIN
         liq_longs, liq_shorts, liq_total,
         price_open, price_high, price_low, price_close,
         volume_usd, volume_base, buy_volume_base, sell_volume_base, volume_delta,
-        txn_count, buy_txn_count,
+        txn_count, buy_txn_count, sell_txn_count,
         created_at, updated_at
     )
     SELECT 
@@ -343,7 +345,7 @@ BEGIN
         liq_longs, liq_shorts, liq_total,
         price_open, price_high, price_low, price_close,
         volume_usd, volume_base, buy_volume_base, sell_volume_base, volume_delta,
-        txn_count, buy_txn_count,
+        txn_count, buy_txn_count, sell_txn_count,
         NOW(), NOW()
     FROM futures_daily_metrics_staging
     ON CONFLICT (date, symbol, exchange) DO UPDATE SET
@@ -377,6 +379,7 @@ BEGIN
         volume_delta = COALESCE(EXCLUDED.volume_delta, futures_daily_metrics.volume_delta),
         txn_count = COALESCE(EXCLUDED.txn_count, futures_daily_metrics.txn_count),
         buy_txn_count = COALESCE(EXCLUDED.buy_txn_count, futures_daily_metrics.buy_txn_count),
+        sell_txn_count = COALESCE(EXCLUDED.sell_txn_count, futures_daily_metrics.sell_txn_count),
         updated_at = NOW();
     
     GET DIAGNOSTICS rows_affected = ROW_COUNT;
@@ -838,7 +841,7 @@ BEGIN
         p_price_open, p_price_high, p_price_low, p_price_close,
         p_volume_base, p_volume_usd,
         p_buy_volume_base, p_sell_volume_base, p_volume_delta,
-        p_txn_count, p_buy_txn_count,
+        p_txn_count, p_buy_txn_count, p_sell_txn_count,
         NOW()
     )
     ON CONFLICT (date, symbol, exchange) DO UPDATE SET

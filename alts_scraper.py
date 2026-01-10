@@ -729,13 +729,17 @@ class CoinalyzeClient:
             df["sell_volume_base"] = df["volume_base"] - df["buy_volume_base"]
             df["volume_delta"] = df["buy_volume_base"] - df["sell_volume_base"]
             
+        # Calculate sell transactions
+        if "txn_count" in df.columns and "buy_txn_count" in df.columns:
+            df["sell_txn_count"] = df["txn_count"] - df["buy_txn_count"]
+            
         # Calculate USD volumes (estimate using price_close)
         if "volume_base" in df.columns and "price_close" in df.columns:
             df["volume_usd"] = df["volume_base"] * df["price_close"]
             
         final_cols = ["date", "price_open", "price_high", "price_low", "price_close",
                      "volume_base", "buy_volume_base", "sell_volume_base", "volume_delta",
-                     "volume_usd", "txn_count", "buy_txn_count"]
+                     "volume_usd", "txn_count", "buy_txn_count", "sell_txn_count"]
         
         output_cols = [c for c in final_cols if c in df.columns]
         return df[output_cols].drop_duplicates("date").sort_values("date")
