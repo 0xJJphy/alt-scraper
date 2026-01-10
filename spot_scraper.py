@@ -48,16 +48,40 @@ class DatabaseManager:
         else:
             print("[DB] Supabase Integration Disabled (DATABASE_URL missing).")
 
+    def _to_python(self, val):
+        """Convert numpy/pandas types to native Python types for psycopg2."""
+        if val is None or pd.isna(val):
+            return None
+        # Handle numpy types
+        if hasattr(val, 'item'):  # numpy scalar
+            val = val.item()
+        # Handle infinity
+        if isinstance(val, float) and (val == float('inf') or val == float('-inf')):
+            return None
+        return val
+
+    def _sanitize_float(self, val) -> Optional[float]:
+        """Convert to float, handling NaN/None/Inf."""
+        val = self._to_python(val)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
     def _sanitize_int(self, val) -> Optional[int]:
         """Convert to int, handling NaN/None/Inf/Overflow."""
-        if pd.isna(val) or val is None: return None
+        val = self._to_python(val)
+        if val is None:
+            return None
         try:
             val = int(float(val))
-            # Postgres BIGINT range: -9223372036854775808 to 9223372036854775807
-            if val > 9223372036854775800: return None 
-            if val < -9223372036854775800: return None
+            # Postgres BIGINT range
+            if val > 9223372036854775807 or val < -9223372036854775808:
+                return None
             return val
-        except:
+        except (ValueError, TypeError, OverflowError):
             return None
 
     def upsert_spot_ohlcv(self, df: pd.DataFrame):
@@ -70,22 +94,22 @@ class DatabaseManager:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
 
-            # Prepare records as list of tuples
+            # Prepare records as list of tuples with proper type conversion
             records = []
             for _, row in df.iterrows():
                 records.append((
-                    row.get('date'),
-                    row.get('symbol'),
-                    row.get('exchange'),
-                    row.get('price_open'),
-                    row.get('price_high'),
-                    row.get('price_low'),
-                    row.get('price_close'),
-                    row.get('volume_base'),
-                    row.get('volume_usd'),
-                    row.get('buy_volume_base'),
-                    row.get('sell_volume_base'),
-                    row.get('volume_delta'),
+                    self._to_python(row.get('date')),
+                    self._to_python(row.get('symbol')),
+                    self._to_python(row.get('exchange')),
+                    self._sanitize_float(row.get('price_open')),
+                    self._sanitize_float(row.get('price_high')),
+                    self._sanitize_float(row.get('price_low')),
+                    self._sanitize_float(row.get('price_close')),
+                    self._sanitize_float(row.get('volume_base')),
+                    self._sanitize_float(row.get('volume_usd')),
+                    self._sanitize_float(row.get('buy_volume_base')),
+                    self._sanitize_float(row.get('sell_volume_base')),
+                    self._sanitize_float(row.get('volume_delta')),
                     self._sanitize_int(row.get('txn_count')),
                     self._sanitize_int(row.get('buy_txn_count')),
                     self._sanitize_int(row.get('sell_txn_count'))
