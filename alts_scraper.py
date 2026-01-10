@@ -23,6 +23,8 @@ import time
 import argparse
 import requests
 import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
 from datetime import datetime, timedelta, timezone, time as dtime
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
@@ -1175,6 +1177,7 @@ def fetch_hybrid_futures_data(client: CoinalyzeClient, native: NativeFuturesFetc
     if not df_final.empty:
         df_final['symbol'] = symbol
         df_final['exchange'] = exchange
+        df_final['base_asset'] = token # Add base_asset for DB upsert
     return df_final
 
 
@@ -1205,15 +1208,16 @@ def main():
                        help="Coinalyze API key (or set COINALYZE_API_KEY env var)")
     parser.add_argument("--skip-ohlcv", action="store_true",
                        help="Skip OHLCV data (useful if you have price data from elsewhere)")
-    parser.add_argument("--skip-merge", action="store_true",
-                       help="Skip merging into existing perp CSV files")
+    parser.add_argument("--skip-merge", action="store_true", help="Skip merging metrics into OHLCV files")
+    parser.add_argument("--csv", action="store_true", help="Save results to local CSV files (default: False)")
     parser.add_argument("--exchanges", type=str, default="binance,bybit,okx",
                        help=f"Comma-separated list of exchanges, or 'all' for all (default: binance,bybit,okx). Available: {','.join(EXCHANGE_CODES.keys())}")
     args = parser.parse_args()
     
-    # Initialize Clients
+    # Initialize API Clients
     client = CoinalyzeClient(args.coinalyze_key, rate_delay=1.6)
     native_fetcher = NativeFuturesFetcher()
+    db_manager = DatabaseManager()
     
     # Validate API key
     if not args.coinalyze_key:
@@ -1347,14 +1351,23 @@ def main():
             
             print(f"    -> {len(metrics)} rows collected")
             
-            # Save metrics file
-            if os.path.exists(out_path):
-                df_old = pd.read_csv(out_path)
-                metrics = pd.concat([df_old, metrics], ignore_index=True)
-                metrics.drop_duplicates(subset=['date'], keep='last', inplace=True)
+            # Save to Database (Supabase)
+            if db_manager.enabled:
+                db_manager.upsert_futures_metrics(metrics)
             
-            metrics.sort_values("date").to_csv(out_path, index=False)
-            print(f"  [SAVED] {out_path} ({len(metrics)} total rows)")
+            # Save metrics file (Optional CSV)
+            if args.csv:
+                if os.path.exists(out_path):
+                    df_old = pd.read_csv(out_path)
+                    metrics_csv = pd.concat([df_old, metrics], ignore_index=True)
+                    metrics_csv.drop_duplicates(subset=['date'], keep='last', inplace=True)
+                else:
+                    metrics_csv = metrics
+                
+                metrics_csv.sort_values("date").to_csv(out_path, index=False)
+                print(f"  [CSV] Saved {out_path} ({len(metrics_csv)} total rows)")
+            else:
+                print(f"  [CSV] Skipping local save (use --csv to enable)")
             
             # Optionally merge into existing perp file
             if not args.skip_merge:

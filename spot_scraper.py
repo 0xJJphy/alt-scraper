@@ -2,6 +2,8 @@ import os
 import time
 import requests
 import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 import argparse
@@ -26,6 +28,53 @@ COINALYZE_BASE = "https://api.coinalyze.net/v1"
 
 def to_unix_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
+
+# ==============================================================================
+# Database Management
+# ==============================================================================
+class DatabaseManager:
+    """Handles communication with Supabase (PostgreSQL)."""
+    def __init__(self, db_url: Optional[str] = None):
+        if not db_url:
+            db_url = os.getenv("DATABASE_URL")
+        self.db_url = db_url
+        self.enabled = bool(db_url)
+        if self.enabled:
+            print("[DB] Supabase Integration Enabled.")
+        else:
+            print("[DB] Supabase Integration Disabled (DATABASE_URL missing).")
+
+    def upsert_spot_ohlcv(self, df: pd.DataFrame):
+        """Upsert a dataframe into spot_daily_ohlcv using the schema function."""
+        if not self.enabled or df.empty:
+            return
+
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+            
+            for _, row in df.iterrows():
+                cur.execute("""
+                    SELECT upsert_spot_daily_ohlcv(
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                """, (
+                    row.get('date'), row.get('symbol'), row.get('exchange'),
+                    row.get('price_open'), row.get('price_high'), row.get('price_low'), row.get('price_close'),
+                    row.get('volume_base'), row.get('volume_usd'),
+                    row.get('buy_volume_base'), row.get('sell_volume_base'), row.get('volume_delta'),
+                    row.get('txn_count'), row.get('buy_txn_count'), row.get('sell_txn_count')
+                ))
+            
+            conn.commit()
+            cur.close()
+            print(f"    [DB] Upserted {len(df)} rows to Supabase.")
+        except Exception as e:
+            print(f"    [DB ERROR] Upsert failed: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
 
 class AssetMetadataManager:
     def __init__(self, file_path: str = "data/asset_metadata.csv"):
@@ -260,7 +309,13 @@ class SpotScraper:
                     df = df.merge(cz_df[['date', 'buy_txn_count', 'sell_txn_count']], on='date', how='left')
             except: pass
 
-        return df[['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count', 'symbol', 'exchange']]
+        # Ensure all required columns exist
+        final_cols = ['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count', 'symbol', 'exchange']
+        for col in final_cols:
+            if col not in df.columns:
+                df[col] = float('nan')
+
+        return df[final_cols]
 
     def fetch_bybit(self, symbol: str, start_ts: int, end_ts: int) -> pd.DataFrame:
         """ Bybit Spot via Coinalyze (for Delta support) """
@@ -348,13 +403,19 @@ class SpotScraper:
             except: pass
 
         df['exchange'], df['symbol'] = 'okx', f"{symbol}-USDT"
-        cols = ['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count', 'symbol', 'exchange']
-        valid_cols = [c for c in cols if c in df.columns]
-        return df[valid_cols].sort_values('date')
+        
+        # Ensure all required columns exist
+        final_cols = ['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count', 'symbol', 'exchange']
+        for col in final_cols:
+            if col not in df.columns:
+                df[col] = float('nan')
+
+        return df[final_cols].sort_values('date')
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch historical Spot OHLCV data from major exchanges")
-    parser.add_argument("--top", type=int, default=50, help="Top N tokens from CoinGecko")
+    parser.add_argument("--limit", type=int, default=100, help="Number of top tokens to fetch (default: 100)")
+    parser.add_argument("--csv", action="store_true", help="Save results to local CSV files (default: False)")
     parser.add_argument("--top-range", type=str, default=None, help="Rank range (e.g. 1-50)")
     parser.add_argument("--symbols", type=str, default=None, help="Specific symbols (e.g. BTC,ETH)")
     parser.add_argument("--exchanges", type=str, default="binance,bybit,okx", help="Exchanges to fetch")
@@ -400,6 +461,7 @@ def main():
     start_ts, end_ts = to_unix_ms(start_dt), to_unix_ms(end_dt)
     
     scraper = SpotScraper(args.output_dir)
+    db_manager = DatabaseManager()
     print("=" * 60)
     print(f"Exchange Spot OHLCV Backfill (Cache: {len(meta.df)} assets)")
     print("=" * 60)
@@ -435,17 +497,24 @@ def main():
                 else: break
                 
                 if not df_new.empty:
-                    if os.path.exists(path):
-                        df_old = pd.read_csv(path)
-                        df_final = pd.concat([df_old, df_new], ignore_index=True)
-                        # Remove duplicates based on date, keep the newer ones (last)
-                        df_final.drop_duplicates(subset=['date'], keep='last', inplace=True)
-                        df_final.sort_values('date', inplace=True)
+                    # Save to Database (Supabase)
+                    if db_manager.enabled:
+                        db_manager.upsert_spot_ohlcv(df_new)
+                    
+                    # Save metrics file (Optional CSV)
+                    if args.csv:
+                        if os.path.exists(path):
+                            df_old = pd.read_csv(path)
+                            df_final = pd.concat([df_old, df_new], ignore_index=True)
+                            df_final.drop_duplicates(subset=['date'], keep='last', inplace=True)
+                            df_final.sort_values('date', inplace=True)
+                        else:
+                            df_final = df_new
+                            
+                        df_final.to_csv(path, index=False)
+                        print(f"    [CSV] Saved {base} -> {len(df_final)} total rows (New: {len(df_new)})")
                     else:
-                        df_final = df_new
-                        
-                    df_final.to_csv(path, index=False)
-                    print(f"    [SAVED] {base} -> {len(df_final)} total rows (New: {len(df_new)})")
+                        print(f"    [CSV] Skipping local save (use --csv to enable)")
                 else: print(f"    [SKIPPED] {base} (no new data)")
             except Exception as e: print(f"    [FAILED] {base}: {e}")
             time.sleep(0.5)
