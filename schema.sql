@@ -22,11 +22,19 @@ BEGIN
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_high DECIMAL(18, 10);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_low DECIMAL(18, 10);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_close DECIMAL(18, 10);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS ls_ratio DECIMAL(12, 6);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS longs_qty DECIMAL(24, 8);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS shorts_qty DECIMAL(24, 8);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS ls_acc_global DECIMAL(12, 6);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS ls_acc_top DECIMAL(12, 6);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS ls_pos_top DECIMAL(12, 6);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS liq_longs DECIMAL(24, 4);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS liq_shorts DECIMAL(24, 4);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS liq_total DECIMAL(24, 4);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS buy_volume_base DECIMAL(24, 8);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS sell_volume_base DECIMAL(24, 8);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS volume_delta DECIMAL(24, 8);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS txn_count BIGINT;
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS buy_txn_count BIGINT;
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS sell_txn_count BIGINT;
     END IF;
@@ -35,6 +43,7 @@ BEGIN
         ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS buy_volume_base DECIMAL(24, 8);
         ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS sell_volume_base DECIMAL(24, 8);
         ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS volume_delta DECIMAL(24, 8);
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS txn_count BIGINT;
         ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS buy_txn_count BIGINT;
         ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS sell_txn_count BIGINT;
     END IF;
