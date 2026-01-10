@@ -1,0 +1,11 @@
+# ============================================
+# Alts-Scraper Dependencies
+# ============================================
+
+# Core dependencies
+requests>=2.31.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
+
+# Optional: for enhanced rate limiting
+# ratelimit>=2.2.1
