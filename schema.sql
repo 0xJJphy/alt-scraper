@@ -15,13 +15,27 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 DO $$ 
 BEGIN
     IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename  = 'futures_daily_metrics') THEN
+        -- Standard OHLC
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS price_open DECIMAL(24, 8);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS price_high DECIMAL(24, 8);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS price_low DECIMAL(24, 8);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS price_close DECIMAL(24, 8);
+        
+        -- OI & Funding
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS oi_usd_open DECIMAL(24, 4);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS oi_usd_high DECIMAL(24, 4);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS oi_usd_low DECIMAL(24, 4);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS oi_usd_close DECIMAL(24, 4);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS funding_open DECIMAL(18, 10);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS funding_high DECIMAL(18, 10);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS funding_low DECIMAL(18, 10);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS funding_close DECIMAL(18, 10);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_open DECIMAL(18, 10);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_high DECIMAL(18, 10);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_low DECIMAL(18, 10);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS pred_funding_close DECIMAL(18, 10);
+        
+        -- Ratios & Stats
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS ls_ratio DECIMAL(12, 6);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS longs_qty DECIMAL(24, 8);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS shorts_qty DECIMAL(24, 8);
@@ -31,6 +45,10 @@ BEGIN
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS liq_longs DECIMAL(24, 4);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS liq_shorts DECIMAL(24, 4);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS liq_total DECIMAL(24, 4);
+        
+        -- Volume & Transctions
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS volume_usd DECIMAL(24, 4);
+        ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS volume_base DECIMAL(24, 8);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS buy_volume_base DECIMAL(24, 8);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS sell_volume_base DECIMAL(24, 8);
         ALTER TABLE futures_daily_metrics ADD COLUMN IF NOT EXISTS volume_delta DECIMAL(24, 8);
@@ -40,6 +58,12 @@ BEGIN
     END IF;
     
     IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename  = 'spot_daily_ohlcv') THEN
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS price_open DECIMAL(24, 8);
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS price_high DECIMAL(24, 8);
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS price_low DECIMAL(24, 8);
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS price_close DECIMAL(24, 8);
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS volume_base DECIMAL(24, 8);
+        ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS volume_usd DECIMAL(24, 4);
         ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS buy_volume_base DECIMAL(24, 8);
         ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS sell_volume_base DECIMAL(24, 8);
         ALTER TABLE spot_daily_ohlcv ADD COLUMN IF NOT EXISTS volume_delta DECIMAL(24, 8);
