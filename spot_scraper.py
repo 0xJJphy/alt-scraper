@@ -92,7 +92,7 @@ class DatabaseManager:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("SELECT upsert_asset_metadata(%s, %s, %s)", (symbol, narrative, bool(is_filtered)))
+            cur.execute("SELECT upsert_asset_metadata(%s::VARCHAR, %s::VARCHAR, %s::BOOLEAN)", (symbol, narrative, bool(is_filtered)))
             conn.commit()
             cur.close()
         except Exception as e:

@@ -147,13 +147,13 @@ class DatabaseManager:
             for _, row in df.iterrows():
                 cur.execute("""
                     SELECT upsert_futures_daily_metrics(
-                        %s, %s, %s, 
-                        %s, %s, %s, %s,
-                        %s, %s, %s, %s,
-                        %s, %s, %s, %s,
-                        %s, %s, 
-                        %s, %s, %s,
-                        %s, %s, %s
+                        %s::DATE, %s::VARCHAR, %s::VARCHAR, 
+                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                        %s::DECIMAL, %s::DECIMAL, 
+                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL
                     )
                 """, (
                     row.get('date'), row.get('symbol'), row.get('exchange'),
@@ -213,7 +213,7 @@ class DatabaseManager:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("SELECT upsert_asset_metadata(%s, %s, %s)", (symbol, narrative, bool(is_filtered)))
+            cur.execute("SELECT upsert_asset_metadata(%s::VARCHAR, %s::VARCHAR, %s::BOOLEAN)", (symbol, narrative, bool(is_filtered)))
             conn.commit()
         except Exception as e:
             print(f"    [DB ERROR] Metadata upsert failed for {symbol}: {e}")
