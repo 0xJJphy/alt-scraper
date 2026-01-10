@@ -127,105 +127,164 @@ class DatabaseManager:
         else:
             print("[DB] Supabase Integration Disabled (DATABASE_URL missing).")
 
+    def _to_python(self, val):
+        """Convert numpy/pandas types to native Python types for psycopg2."""
+        if val is None or pd.isna(val):
+            return None
+        # Handle numpy types
+        if hasattr(val, 'item'):  # numpy scalar
+            val = val.item()
+        # Handle infinity
+        if isinstance(val, float) and (val == float('inf') or val == float('-inf')):
+            return None
+        return val
+
+    def _sanitize_float(self, val) -> Optional[float]:
+        """Convert to float, handling NaN/None/Inf."""
+        val = self._to_python(val)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
     def _sanitize_int(self, val) -> Optional[int]:
         """Convert to int, handling NaN/None/Inf/Overflow."""
-        if pd.isna(val) or val is None: return None
+        val = self._to_python(val)
+        if val is None:
+            return None
         try:
             val = int(float(val))
-            # Postgres BIGINT range: -9223372036854775808 to 9223372036854775807
-            if val > 9223372036854775800: return None 
-            if val < -9223372036854775800: return None
+            # Postgres BIGINT range
+            if val > 9223372036854775807 or val < -9223372036854775808:
+                return None
             return val
-        except:
+        except (ValueError, TypeError, OverflowError):
             return None
 
     def upsert_futures_metrics(self, df: pd.DataFrame):
-        """Batch upsert futures metrics into DB."""
-        if not self.enabled or df.empty: return
-        
+        """Batch upsert futures metrics using execute_values (50-100x faster)."""
+        if not self.enabled or df.empty:
+            return
+
         conn = None
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            
-            # Prepare data tuples
-            # Function signature:
-            # upsert_futures_daily_metrics(date, symbol, exchange, oi_open, oi_high, oi_low, oi_close,
-            # funding_open, funding_high, funding_low, funding_close,
-            # pred_funding_open, pred_funding_high, pred_funding_low, pred_funding_close,
-            # liq_longs, liq_shorts, long_short_ratio, longs_qty, shorts_qty,
-            # ls_acc_global, ls_acc_top, ls_pos_top)
 
-            ok_count = 0
+            # Prepare records as list of tuples with proper type conversion
+            records = []
             for _, row in df.iterrows():
-                try:
-                    # Raw Debugging (Before Sanitization)
-                    raw_txn = row.get("txn_count")
-                    raw_btx = row.get("buy_txn_count")
-                    raw_stx = row.get("sell_txn_count")
-                    
-                    BIGINT_MAX = 9223372036854775807
-                    BIGINT_MIN = -9223372036854775808
+                records.append((
+                    self._to_python(row.get('date')),
+                    self._to_python(row.get('symbol')),
+                    self._to_python(row.get('exchange')),
+                    self._to_python(row.get('base_asset')),
+                    self._sanitize_float(row.get('oi_usd_open')),
+                    self._sanitize_float(row.get('oi_usd_high')),
+                    self._sanitize_float(row.get('oi_usd_low')),
+                    self._sanitize_float(row.get('oi_usd_close')),
+                    self._sanitize_float(row.get('funding_open')),
+                    self._sanitize_float(row.get('funding_high')),
+                    self._sanitize_float(row.get('funding_low')),
+                    self._sanitize_float(row.get('funding_close')),
+                    self._sanitize_float(row.get('pred_funding_open')),
+                    self._sanitize_float(row.get('pred_funding_high')),
+                    self._sanitize_float(row.get('pred_funding_low')),
+                    self._sanitize_float(row.get('pred_funding_close')),
+                    self._sanitize_float(row.get('ls_ratio')),
+                    self._sanitize_float(row.get('longs_qty')),
+                    self._sanitize_float(row.get('shorts_qty')),
+                    self._sanitize_float(row.get('ls_acc_global')),
+                    self._sanitize_float(row.get('ls_acc_top')),
+                    self._sanitize_float(row.get('ls_pos_top')),
+                    self._sanitize_float(row.get('liq_longs')),
+                    self._sanitize_float(row.get('liq_shorts')),
+                    self._sanitize_float(row.get('liq_total')),
+                    self._sanitize_float(row.get('price_open')),
+                    self._sanitize_float(row.get('price_high')),
+                    self._sanitize_float(row.get('price_low')),
+                    self._sanitize_float(row.get('price_close')),
+                    self._sanitize_float(row.get('volume_usd')),
+                    self._sanitize_float(row.get('volume_base')),
+                    self._sanitize_float(row.get('buy_volume_base')),
+                    self._sanitize_float(row.get('sell_volume_base')),
+                    self._sanitize_float(row.get('volume_delta')),
+                    self._sanitize_int(row.get('txn_count')),
+                    self._sanitize_int(row.get('buy_txn_count')),
+                    self._sanitize_int(row.get('sell_txn_count'))
+                ))
 
-                    def _as_int_raw(x):
-                        if x is None or (isinstance(x, float) and pd.isna(x)): return None
-                        try:
-                            if isinstance(x, float) and (x == float("inf") or x == float("-inf")): return "INF"
-                            return int(x) if isinstance(x, (int,)) else int(float(x))
-                        except Exception: return "BAD"
+            # Batch INSERT with ON CONFLICT (upsert)
+            sql = """
+                INSERT INTO futures_daily_metrics (
+                    date, symbol, exchange, base_asset,
+                    oi_usd_open, oi_usd_high, oi_usd_low, oi_usd_close,
+                    funding_open, funding_high, funding_low, funding_close,
+                    pred_funding_open, pred_funding_high, pred_funding_low, pred_funding_close,
+                    ls_ratio, longs_qty, shorts_qty,
+                    ls_acc_global, ls_acc_top, ls_pos_top,
+                    liq_longs, liq_shorts, liq_total,
+                    price_open, price_high, price_low, price_close,
+                    volume_usd, volume_base, buy_volume_base, sell_volume_base, volume_delta,
+                    txn_count, buy_txn_count, sell_txn_count,
+                    updated_at
+                ) VALUES %s
+                ON CONFLICT (date, symbol, exchange) DO UPDATE SET
+                    base_asset = COALESCE(EXCLUDED.base_asset, futures_daily_metrics.base_asset),
+                    oi_usd_open = COALESCE(EXCLUDED.oi_usd_open, futures_daily_metrics.oi_usd_open),
+                    oi_usd_high = COALESCE(EXCLUDED.oi_usd_high, futures_daily_metrics.oi_usd_high),
+                    oi_usd_low = COALESCE(EXCLUDED.oi_usd_low, futures_daily_metrics.oi_usd_low),
+                    oi_usd_close = COALESCE(EXCLUDED.oi_usd_close, futures_daily_metrics.oi_usd_close),
+                    funding_open = COALESCE(EXCLUDED.funding_open, futures_daily_metrics.funding_open),
+                    funding_high = COALESCE(EXCLUDED.funding_high, futures_daily_metrics.funding_high),
+                    funding_low = COALESCE(EXCLUDED.funding_low, futures_daily_metrics.funding_low),
+                    funding_close = COALESCE(EXCLUDED.funding_close, futures_daily_metrics.funding_close),
+                    pred_funding_open = COALESCE(EXCLUDED.pred_funding_open, futures_daily_metrics.pred_funding_open),
+                    pred_funding_high = COALESCE(EXCLUDED.pred_funding_high, futures_daily_metrics.pred_funding_high),
+                    pred_funding_low = COALESCE(EXCLUDED.pred_funding_low, futures_daily_metrics.pred_funding_low),
+                    pred_funding_close = COALESCE(EXCLUDED.pred_funding_close, futures_daily_metrics.pred_funding_close),
+                    ls_ratio = COALESCE(EXCLUDED.ls_ratio, futures_daily_metrics.ls_ratio),
+                    longs_qty = COALESCE(EXCLUDED.longs_qty, futures_daily_metrics.longs_qty),
+                    shorts_qty = COALESCE(EXCLUDED.shorts_qty, futures_daily_metrics.shorts_qty),
+                    ls_acc_global = COALESCE(EXCLUDED.ls_acc_global, futures_daily_metrics.ls_acc_global),
+                    ls_acc_top = COALESCE(EXCLUDED.ls_acc_top, futures_daily_metrics.ls_acc_top),
+                    ls_pos_top = COALESCE(EXCLUDED.ls_pos_top, futures_daily_metrics.ls_pos_top),
+                    liq_longs = COALESCE(EXCLUDED.liq_longs, futures_daily_metrics.liq_longs),
+                    liq_shorts = COALESCE(EXCLUDED.liq_shorts, futures_daily_metrics.liq_shorts),
+                    liq_total = COALESCE(EXCLUDED.liq_total, futures_daily_metrics.liq_total),
+                    price_open = COALESCE(EXCLUDED.price_open, futures_daily_metrics.price_open),
+                    price_high = COALESCE(EXCLUDED.price_high, futures_daily_metrics.price_high),
+                    price_low = COALESCE(EXCLUDED.price_low, futures_daily_metrics.price_low),
+                    price_close = COALESCE(EXCLUDED.price_close, futures_daily_metrics.price_close),
+                    volume_usd = COALESCE(EXCLUDED.volume_usd, futures_daily_metrics.volume_usd),
+                    volume_base = COALESCE(EXCLUDED.volume_base, futures_daily_metrics.volume_base),
+                    buy_volume_base = COALESCE(EXCLUDED.buy_volume_base, futures_daily_metrics.buy_volume_base),
+                    sell_volume_base = COALESCE(EXCLUDED.sell_volume_base, futures_daily_metrics.sell_volume_base),
+                    volume_delta = COALESCE(EXCLUDED.volume_delta, futures_daily_metrics.volume_delta),
+                    txn_count = COALESCE(EXCLUDED.txn_count, futures_daily_metrics.txn_count),
+                    buy_txn_count = COALESCE(EXCLUDED.buy_txn_count, futures_daily_metrics.buy_txn_count),
+                    sell_txn_count = COALESCE(EXCLUDED.sell_txn_count, futures_daily_metrics.sell_txn_count),
+                    updated_at = NOW()
+            """
 
-                    for name, raw in [("txn_count", raw_txn), ("buy_txn_count", raw_btx), ("sell_txn_count", raw_stx)]:
-                        rx = _as_int_raw(raw)
-                        if rx in ("INF", "BAD"):
-                            print(f"    [DB WARNING] {row.get('symbol')} {row.get('date')} {name} raw={raw} ({rx})")
-                        elif isinstance(rx, int) and (rx < BIGINT_MIN or rx > BIGINT_MAX):
-                            print(f"    [DB WARNING] OUT OF RANGE (RAW): {row.get('symbol')} {row.get('date')} {name}={rx}")
+            # Template: 37 columns + NOW()
+            template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())"
 
-                    # Sanitize BIGINTs
-                    txn_count = self._sanitize_int(raw_txn)
-                    buy_txn_count = self._sanitize_int(raw_btx)
-                    sell_txn_count = self._sanitize_int(raw_stx)
+            execute_values(cur, sql, records, template=template, page_size=1000)
+            conn.commit()
 
-                    cur.execute("""
-                        SELECT upsert_futures_daily_metrics(
-                            %s::DATE, %s::VARCHAR, %s::VARCHAR, 
-                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                            %s::DECIMAL, %s::DECIMAL, 
-                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                            %s::BIGINT, %s::BIGINT, %s::BIGINT
-                        )
-                    """, (
-                        row.get('date'), row.get('symbol'), row.get('exchange'),
-                        row.get('oi_usd_open'), row.get('oi_usd_high'), row.get('oi_usd_low'), row.get('oi_usd_close'),
-                        row.get('funding_open'), row.get('funding_high'), row.get('funding_low'), row.get('funding_close'),
-                        row.get('pred_funding_open'), row.get('pred_funding_high'), row.get('pred_funding_low'), row.get('pred_funding_close'),
-                        row.get('liq_longs'), row.get('liq_shorts'),
-                        row.get('ls_ratio'), row.get('longs_qty'), row.get('shorts_qty'),
-                        row.get('ls_acc_global'), row.get('ls_acc_top'), row.get('ls_pos_top'),
-                        row.get('liq_longs'), row.get('liq_shorts'), row.get('liq_total'),
-                        row.get('price_open'), row.get('price_high'), row.get('price_low'), row.get('price_close'),
-                        row.get('volume_usd'), row.get('volume_base'), row.get('buy_volume_base'), row.get('sell_volume_base'), row.get('volume_delta'),
-                        txn_count, buy_txn_count, sell_txn_count
-                    ))
-                    conn.commit()
-                    ok_count += 1
-                except Exception as e:
-                    conn.rollback()
-                    print(f"    [DB ERROR] Row failed: {row.get('symbol')} {row.get('date')} - {e}")
-            
-            print(f"    [DB] Upserted {ok_count}/{len(df)} rows.")
+            cur.close()
+            print(f"    [DB] Batch upserted {len(records)} rows.")
 
         except Exception as e:
-            print(f"    [DB ERROR] Connection failed: {e}")
-            if conn: conn.rollback()
+            print(f"    [DB ERROR] Batch insert failed: {e}")
+            if conn:
+                conn.rollback()
         finally:
-            if conn: conn.close()
+            if conn:
+                conn.close()
 
     def get_last_data_date(self, symbol: str, exchange: str) -> Optional[datetime]:
         """Get the last stored date for a symbol/exchange in the DB."""
