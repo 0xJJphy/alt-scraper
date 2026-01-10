@@ -127,6 +127,18 @@ class DatabaseManager:
         else:
             print("[DB] Supabase Integration Disabled (DATABASE_URL missing).")
 
+    def _sanitize_int(self, val) -> Optional[int]:
+        """Convert to int, handling NaN/None/Inf/Overflow."""
+        if pd.isna(val) or val is None: return None
+        try:
+            val = int(float(val))
+            # Postgres BIGINT range: -9223372036854775808 to 9223372036854775807
+            if val > 9223372036854775800: return None 
+            if val < -9223372036854775800: return None
+            return val
+        except:
+            return None
+
     def upsert_futures_metrics(self, df: pd.DataFrame):
         """Batch upsert futures metrics into DB."""
         if not self.enabled or df.empty: return
@@ -162,7 +174,13 @@ class DatabaseManager:
                     row.get('pred_funding_open'), row.get('pred_funding_high'), row.get('pred_funding_low'), row.get('pred_funding_close'),
                     row.get('liq_longs'), row.get('liq_shorts'),
                     row.get('ls_ratio'), row.get('longs_qty'), row.get('shorts_qty'),
-                    row.get('ls_acc_global'), row.get('ls_acc_top'), row.get('ls_pos_top')
+                    row.get('ls_acc_global'), row.get('ls_acc_top'), row.get('ls_pos_top'),
+                    row.get('liq_longs'), row.get('liq_shorts'), row.get('liq_total'),
+                    row.get('price_open'), row.get('price_high'), row.get('price_low'), row.get('price_close'),
+                    row.get('volume_usd'), row.get('volume_base'), row.get('buy_volume_base'), row.get('sell_volume_base'), row.get('volume_delta'),
+                    self._sanitize_int(row.get('txn_count')), 
+                    self._sanitize_int(row.get('buy_txn_count')), 
+                    self._sanitize_int(row.get('sell_txn_count'))
                 ))
             
             conn.commit()
