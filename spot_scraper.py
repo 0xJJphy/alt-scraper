@@ -398,7 +398,8 @@ class SpotScraper:
         while current_start < end_ts:
             params = {"symbol": f"{symbol}USDT", "interval": "1d", "startTime": current_start, "endTime": end_ts, "limit": limit}
             try:
-                resp = requests.get(BINANCE_SPOT_API, params=params)
+                print(".", end="", flush=True)
+                resp = requests.get(BINANCE_SPOT_API, params=params, timeout=10)
                 if resp.status_code == 400: return pd.DataFrame()
                 resp.raise_for_status()
                 data = resp.json()
