@@ -822,13 +822,36 @@ class NativeFuturesFetcher:
             df_ls = pd.DataFrame(ls_data)
             if not df_ls.empty:
                 df_ls['date'] = pd.to_datetime(df_ls['timestamp'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-                df_ls.rename(columns={'longShortRatio':'ls_ratio'}, inplace=True)
-                df_ls = df_ls[['date', 'ls_ratio']]
+                df_ls.rename(columns={'longShortRatio':'ls_acc_global'}, inplace=True)
+                df_ls['ls_ratio'] = df_ls['ls_acc_global']
+                df_ls = df_ls[['date', 'ls_ratio', 'ls_acc_global']]
+            
+            # Top Trader Account Ratio
+            ls_top_resp = requests.get(f"{base_url}/futures/data/topLongShortAccountRatio", 
+                                  params={"symbol": sym, "period": "1d", "startTime": start_sec * 1000, "endTime": end_sec * 1000, "limit": 500})
+            ls_top_data = ls_top_resp.json()
+            df_ls_top = pd.DataFrame(ls_top_data)
+            if not df_ls_top.empty:
+                df_ls_top['date'] = pd.to_datetime(df_ls_top['timestamp'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
+                df_ls_top.rename(columns={'longShortRatio':'ls_acc_top'}, inplace=True)
+                df_ls_top = df_ls_top[['date', 'ls_acc_top']]
+
+            # Top Trader Position Ratio
+            ls_pos_resp = requests.get(f"{base_url}/futures/data/topLongShortPositionRatio", 
+                                  params={"symbol": sym, "period": "1d", "startTime": start_sec * 1000, "endTime": end_sec * 1000, "limit": 500})
+            ls_pos_data = ls_pos_resp.json()
+            df_ls_pos = pd.DataFrame(ls_pos_data)
+            if not df_ls_pos.empty:
+                df_ls_pos['date'] = pd.to_datetime(df_ls_pos['timestamp'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
+                df_ls_pos.rename(columns={'longShortRatio':'ls_pos_top'}, inplace=True)
+                df_ls_pos = df_ls_pos[['date', 'ls_pos_top']]
             
             # Merge all
             dfs = [d for d in [df_oi if 'df_oi' in locals() else None, 
                                df_f if 'df_f' in locals() else None, 
-                               df_ls if 'df_ls' in locals() else None] if d is not None]
+                               df_ls if 'df_ls' in locals() else None,
+                               df_ls_top if 'df_ls_top' in locals() else None,
+                               df_ls_pos if 'df_ls_pos' in locals() else None] if d is not None]
             if not dfs: return pd.DataFrame()
             
             res = dfs[0]
@@ -876,7 +899,9 @@ class NativeFuturesFetcher:
                     df_ls.rename(columns={'accountRatio':'ls_ratio'}, inplace=True)
                 
                 if 'ls_ratio' in df_ls.columns:
-                    df_ls = df_ls[['date', 'ls_ratio']]
+                    df_ls.rename(columns={'ls_ratio':'ls_acc_global'}, inplace=True)
+                    df_ls['ls_ratio'] = df_ls['ls_acc_global']
+                    df_ls = df_ls[['date', 'ls_ratio', 'ls_acc_global']]
                 else:
                     df_ls = pd.DataFrame()
 
@@ -966,21 +991,31 @@ class NativeFuturesFetcher:
 
     @staticmethod
     def fetch_okx_ls_rubik(base: str) -> pd.DataFrame:
-        """Fetch Long/Short Ratio from OKX Rubik API."""
+        """Fetch multiple Long/Short Ratios from OKX Rubik API."""
         try:
-            # Rubik L/S ratio for perp: /api/v5/rubik/stat/contracts/long-short-account-ratio
-            # instId should be base-USDT
             params = {"ccy": base.upper(), "period": "1D"}
-            resp = requests.get(f"{OKX_V5_API}/rubik/stat/contracts/long-short-account-ratio", params=params)
-            resp.raise_for_status()
-            data = resp.json().get("data", [])
-            if not data: return pd.DataFrame()
+            # Global Account Ratio
+            r1 = requests.get(f"{OKX_V5_API}/rubik/stat/contracts/long-short-account-ratio", params=params).json().get("data", [])
+            df1 = pd.DataFrame(r1, columns=['t', 'ls_acc_global']) if r1 else pd.DataFrame()
             
-            # Returns [ts, ratio]
-            df = pd.DataFrame(data, columns=['t', 'ls_ratio'])
-            df['date'] = pd.to_datetime(pd.to_numeric(df['t']), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-            df['ls_ratio'] = pd.to_numeric(df['ls_ratio'])
-            return df[['date', 'ls_ratio']]
+            # Top Trader Account Ratio
+            r2 = requests.get(f"{OKX_V5_API}/rubik/stat/contracts/top-traders-long-short-account-ratio", params=params).json().get("data", [])
+            df2 = pd.DataFrame(r2, columns=['t', 'ls_acc_top']) if r2 else pd.DataFrame()
+            
+            # Top Trader Position Ratio
+            r3 = requests.get(f"{OKX_V5_API}/rubik/stat/contracts/top-traders-long-short-position-ratio", params=params).json().get("data", [])
+            df3 = pd.DataFrame(r3, columns=['t', 'ls_pos_top']) if r3 else pd.DataFrame()
+            
+            dfs = [d for d in [df1, df2, df3] if not d.empty]
+            if not dfs: return pd.DataFrame()
+            
+            res = dfs[0]
+            for d in dfs[1:]: res = res.merge(d, on='t', how='outer')
+            
+            res['date'] = pd.to_datetime(pd.to_numeric(res['t']), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
+            if 'ls_acc_global' in res.columns:
+                res['ls_ratio'] = res['ls_acc_global']
+            return res.drop(columns=['t'])
         except Exception as e:
             print(f"    [OKX Rubik Error] {e}")
             return pd.DataFrame()

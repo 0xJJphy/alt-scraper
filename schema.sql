@@ -116,10 +116,13 @@ CREATE TABLE IF NOT EXISTS futures_daily_metrics (
     pred_funding_low    DECIMAL(18, 10),
     pred_funding_close  DECIMAL(18, 10),
     
-    -- Long/Short Ratio
-    ls_ratio            DECIMAL(12, 6),             -- Longs / Shorts ratio
+    -- Long/Short Ratios
+    ls_ratio            DECIMAL(12, 6),             -- Generic Longs / Shorts ratio
     longs_qty           DECIMAL(24, 8),             -- Quantity of long positions
     shorts_qty          DECIMAL(24, 8),             -- Quantity of short positions
+    ls_acc_global       DECIMAL(12, 6),             -- Global Account L/S Ratio
+    ls_acc_top          DECIMAL(12, 6),             -- Top Trader Account L/S Ratio
+    ls_pos_top          DECIMAL(12, 6),             -- Top Trader Position L/S Ratio
     
     -- Liquidations (USD)
     liq_longs           DECIMAL(24, 4),             -- Long liquidations volume
@@ -171,6 +174,7 @@ CREATE TABLE IF NOT EXISTS spot_daily_ohlcv (
     volume_delta        DECIMAL(24, 8),
     txn_count           BIGINT,
     buy_txn_count       BIGINT,
+    sell_txn_count      BIGINT,
     
     created_at          TIMESTAMPTZ DEFAULT NOW(),
     updated_at          TIMESTAMPTZ DEFAULT NOW(),
@@ -221,6 +225,9 @@ CREATE OR REPLACE FUNCTION upsert_futures_daily_metrics(
     p_ls_ratio DECIMAL(12,6),
     p_longs_qty DECIMAL(24,8),
     p_shorts_qty DECIMAL(24,8),
+    p_ls_acc_global DECIMAL(12,6),
+    p_ls_acc_top DECIMAL(12,6),
+    p_ls_pos_top DECIMAL(12,6),
     p_liq_longs DECIMAL(24,4),
     p_liq_shorts DECIMAL(24,4),
     p_liq_total DECIMAL(24,4),
@@ -244,6 +251,7 @@ BEGIN
         funding_open, funding_high, funding_low, funding_close,
         pred_funding_open, pred_funding_high, pred_funding_low, pred_funding_close,
         ls_ratio, longs_qty, shorts_qty,
+        ls_acc_global, ls_acc_top, ls_pos_top,
         liq_longs, liq_shorts, liq_total,
         price_open, price_high, price_low, price_close,
         volume_usd, volume_base, buy_volume_base, sell_volume_base, volume_delta,
@@ -255,6 +263,7 @@ BEGIN
         p_funding_open, p_funding_high, p_funding_low, p_funding_close,
         p_pred_funding_open, p_pred_funding_high, p_pred_funding_low, p_pred_funding_close,
         p_ls_ratio, p_longs_qty, p_shorts_qty,
+        p_ls_acc_global, p_ls_acc_top, p_ls_pos_top,
         p_liq_longs, p_liq_shorts, p_liq_total,
         p_price_open, p_price_high, p_price_low, p_price_close,
         p_volume_usd, p_volume_base, p_buy_volume_base, p_sell_volume_base, p_volume_delta,
@@ -278,6 +287,9 @@ BEGIN
         ls_ratio = COALESCE(EXCLUDED.ls_ratio, futures_daily_metrics.ls_ratio),
         longs_qty = COALESCE(EXCLUDED.longs_qty, futures_daily_metrics.longs_qty),
         shorts_qty = COALESCE(EXCLUDED.shorts_qty, futures_daily_metrics.shorts_qty),
+        ls_acc_global = COALESCE(EXCLUDED.ls_acc_global, futures_daily_metrics.ls_acc_global),
+        ls_acc_top = COALESCE(EXCLUDED.ls_acc_top, futures_daily_metrics.ls_acc_top),
+        ls_pos_top = COALESCE(EXCLUDED.ls_pos_top, futures_daily_metrics.ls_pos_top),
         liq_longs = COALESCE(EXCLUDED.liq_longs, futures_daily_metrics.liq_longs),
         liq_shorts = COALESCE(EXCLUDED.liq_shorts, futures_daily_metrics.liq_shorts),
         liq_total = COALESCE(EXCLUDED.liq_total, futures_daily_metrics.liq_total),
@@ -330,6 +342,7 @@ BEGIN
         funding_open, funding_high, funding_low, funding_close,
         pred_funding_open, pred_funding_high, pred_funding_low, pred_funding_close,
         ls_ratio, longs_qty, shorts_qty,
+        ls_acc_global, ls_acc_top, ls_pos_top,
         liq_longs, liq_shorts, liq_total,
         price_open, price_high, price_low, price_close,
         volume_usd, volume_base, buy_volume_base, sell_volume_base, volume_delta,
@@ -342,6 +355,7 @@ BEGIN
         funding_open, funding_high, funding_low, funding_close,
         pred_funding_open, pred_funding_high, pred_funding_low, pred_funding_close,
         ls_ratio, longs_qty, shorts_qty,
+        ls_acc_global, ls_acc_top, ls_pos_top,
         liq_longs, liq_shorts, liq_total,
         price_open, price_high, price_low, price_close,
         volume_usd, volume_base, buy_volume_base, sell_volume_base, volume_delta,
@@ -365,6 +379,9 @@ BEGIN
         ls_ratio = COALESCE(EXCLUDED.ls_ratio, futures_daily_metrics.ls_ratio),
         longs_qty = COALESCE(EXCLUDED.longs_qty, futures_daily_metrics.longs_qty),
         shorts_qty = COALESCE(EXCLUDED.shorts_qty, futures_daily_metrics.shorts_qty),
+        ls_acc_global = COALESCE(EXCLUDED.ls_acc_global, futures_daily_metrics.ls_acc_global),
+        ls_acc_top = COALESCE(EXCLUDED.ls_acc_top, futures_daily_metrics.ls_acc_top),
+        ls_pos_top = COALESCE(EXCLUDED.ls_pos_top, futures_daily_metrics.ls_pos_top),
         liq_longs = COALESCE(EXCLUDED.liq_longs, futures_daily_metrics.liq_longs),
         liq_shorts = COALESCE(EXCLUDED.liq_shorts, futures_daily_metrics.liq_shorts),
         liq_total = COALESCE(EXCLUDED.liq_total, futures_daily_metrics.liq_total),
@@ -825,7 +842,8 @@ CREATE OR REPLACE FUNCTION upsert_spot_daily_ohlcv(
     p_sell_volume_base DECIMAL(24,8),
     p_volume_delta DECIMAL(24,8),
     p_txn_count BIGINT,
-    p_buy_txn_count BIGINT
+    p_buy_txn_count BIGINT,
+    p_sell_txn_count BIGINT
 )
 RETURNS VOID AS $$
 BEGIN
@@ -834,7 +852,7 @@ BEGIN
         price_open, price_high, price_low, price_close,
         volume_base, volume_usd,
         buy_volume_base, sell_volume_base, volume_delta,
-        txn_count, buy_txn_count,
+        txn_count, buy_txn_count, sell_txn_count,
         updated_at
     ) VALUES (
         p_date, p_symbol, p_exchange,
@@ -856,6 +874,7 @@ BEGIN
         volume_delta = EXCLUDED.volume_delta,
         txn_count = EXCLUDED.txn_count,
         buy_txn_count = EXCLUDED.buy_txn_count,
+        sell_txn_count = EXCLUDED.sell_txn_count,
         updated_at = NOW();
 END;
 $$ LANGUAGE plpgsql;

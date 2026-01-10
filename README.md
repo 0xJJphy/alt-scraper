@@ -166,9 +166,14 @@ erDiagram
         decimal oi_usd_close
         decimal funding_close
         decimal ls_ratio
+        decimal ls_acc_global
+        decimal ls_acc_top
+        decimal ls_pos_top
         decimal liq_total
         decimal volume_delta
         bigint txn_count
+        bigint buy_txn_count
+        bigint sell_txn_count
     }
 
     SPOT_DATA {
@@ -179,6 +184,8 @@ erDiagram
         decimal volume_usd
         decimal volume_delta
         bigint txn_count
+        bigint buy_txn_count
+        bigint sell_txn_count
     }
 ```
 
@@ -208,7 +215,7 @@ erDiagram
 | **Funding Rate**| `funding_open`, `funding_high`, `funding_low`, `funding_close` |
 | **Liquidations**| `liq_longs`, `liq_shorts`, `liq_total` |
 | **OHLCV** | `price_open`, `price_high`, `price_low`, `price_close`, `volume_base`, `volume_usd` |
-| **Metrics** | `ls_ratio`, `txn_count`, `buy_txn_count`, `sell_txn_count`, **`volume_delta`** (Buy-Sell) |
+| **Metrics** | `ls_acc_global`, `ls_acc_top`, `ls_pos_top`, `txn_count`, `buy_txn_count`, `sell_txn_count`, **`volume_delta`** (Buy-Sell) |
 
 ---
 

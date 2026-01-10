@@ -181,8 +181,12 @@ class CoinalyzeClient:
             df['sell_volume_base'] = df['volume_base'] - df['buy_volume_base']
             df['volume_delta'] = df['buy_volume_base'] - df['sell_volume_base']
             
+            # Calculate sell transactions
+            if 'txn_count' in df.columns and 'buy_txn_count' in df.columns:
+                df['sell_txn_count'] = df['txn_count'].astype(float) - df['buy_txn_count'].astype(float)
+            
             # Numeric conversion for new columns
-            for col in ['txn_count', 'buy_txn_count']:
+            for col in ['txn_count', 'buy_txn_count', 'sell_txn_count']:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
                 
             return df
@@ -261,7 +265,7 @@ class SpotScraper:
         if df.empty: return pd.DataFrame()
         
         df['exchange'], df['symbol'] = 'bybit', f"{symbol}USDT"
-        cols = ['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'symbol', 'exchange']
+        cols = ['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count', 'symbol', 'exchange']
         valid_cols = [c for c in cols if c in df.columns]
         return df[valid_cols].sort_values('date')
 
