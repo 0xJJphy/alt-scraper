@@ -247,7 +247,20 @@ class SpotScraper:
         df['sell_volume_base'] = df['volume_base'] - df['buy_volume_base']
         df['volume_delta'] = df['buy_volume_base'] - df['sell_volume_base']
         df['exchange'], df['symbol'] = 'binance', f"{symbol}USDT"
-        return df[['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'symbol', 'exchange']]
+        
+        # Try to patch with Coinalyze buy_txn_count if available
+        api_key = os.getenv("COINALYZE_API_KEY")
+        if api_key:
+            try:
+                client = CoinalyzeClient(api_key)
+                # Binance Spot on Coinalyze is s{BASE}USDT.A
+                cz_df = client.fetch_ohlcv(f"s{symbol}USDT.A", start_ts, end_ts)
+                if not cz_df.empty:
+                    # Merge on date to get buy_txn_count
+                    df = df.merge(cz_df[['date', 'buy_txn_count', 'sell_txn_count']], on='date', how='left')
+            except: pass
+
+        return df[['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count', 'symbol', 'exchange']]
 
     def fetch_bybit(self, symbol: str, start_ts: int, end_ts: int) -> pd.DataFrame:
         """ Bybit Spot via Coinalyze (for Delta support) """
@@ -322,8 +335,22 @@ class SpotScraper:
         else:
             df['buy_volume_base'] = df['sell_volume_base'] = df['volume_delta'] = float('nan')
             
+        # Try to patch with Coinalyze for transaction counts
+        api_key = os.getenv("COINALYZE_API_KEY")
+        if api_key:
+            try:
+                client = CoinalyzeClient(api_key)
+                # OKX Spot on Coinalyze is s{BASE}USDT.3
+                cz_df = client.fetch_ohlcv(f"s{symbol}USDT.3", start_ts, end_ts)
+                if not cz_df.empty:
+                    # Merge to get txn_count, buy_txn_count, sell_txn_count
+                    df = df.merge(cz_df[['date', 'txn_count', 'buy_txn_count', 'sell_txn_count']], on='date', how='left')
+            except: pass
+
         df['exchange'], df['symbol'] = 'okx', f"{symbol}-USDT"
-        return df[['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'symbol', 'exchange']].sort_values('date')
+        cols = ['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count', 'symbol', 'exchange']
+        valid_cols = [c for c in cols if c in df.columns]
+        return df[valid_cols].sort_values('date')
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch historical Spot OHLCV data from major exchanges")
