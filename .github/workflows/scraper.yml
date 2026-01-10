@@ -22,6 +22,10 @@ on:
         description: 'Days to look back (default: 1)'
         required: false
         default: '1'
+      top_n:
+        description: 'Number of top tokens (default: 50)'
+        required: false
+        default: '50'
 
 jobs:
   run-scraper:
@@ -50,13 +54,14 @@ jobs:
 
       - name: Run Spot Scraper (Top 50)
         run: |
-          # Only fetch top 50 to keep runtime short
-          # DB integration will handle incremental updates
-          python spot_scraper.py --top 50
+          # Use input if manual, otherwise default to 50
+          TOP=${{ inputs.top_n || 50 }}
+          python spot_scraper.py --top $TOP
         continue-on-error: true
 
       - name: Run Futures Scraper (Top 50 + Exchanges)
         run: |
-          # Fetch Top 50 by OI + specific exchanges
-          python alts_scraper.py --limit 50 --exchanges binance,bybit,okx
+          # Use input if manual, otherwise default to 50
+          TOP=${{ inputs.top_n || 50 }}
+          python alts_scraper.py --limit $TOP --exchanges binance,bybit,okx
         continue-on-error: true
