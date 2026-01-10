@@ -159,17 +159,32 @@ class DatabaseManager:
             ok_count = 0
             for _, row in df.iterrows():
                 try:
-                    # Sanitize BIGINTs
-                    txn_count = self._sanitize_int(row.get('txn_count'))
-                    buy_txn_count = self._sanitize_int(row.get('buy_txn_count'))
-                    sell_txn_count = self._sanitize_int(row.get('sell_txn_count'))
-
-                    # Log OUT OF RANGE debug info
+                    # Raw Debugging (Before Sanitization)
+                    raw_txn = row.get("txn_count")
+                    raw_btx = row.get("buy_txn_count")
+                    raw_stx = row.get("sell_txn_count")
+                    
                     BIGINT_MAX = 9223372036854775807
                     BIGINT_MIN = -9223372036854775808
-                    for name, v in [("txn_count", txn_count), ("buy_txn_count", buy_txn_count), ("sell_txn_count", sell_txn_count)]:
-                         if v is not None and (v < BIGINT_MIN or v > BIGINT_MAX):
-                             print(f"    [DB WARNING] OUT OF RANGE: {row.get('symbol')} {row.get('date')} {name}={v}")
+
+                    def _as_int_raw(x):
+                        if x is None or (isinstance(x, float) and pd.isna(x)): return None
+                        try:
+                            if isinstance(x, float) and (x == float("inf") or x == float("-inf")): return "INF"
+                            return int(x) if isinstance(x, (int,)) else int(float(x))
+                        except Exception: return "BAD"
+
+                    for name, raw in [("txn_count", raw_txn), ("buy_txn_count", raw_btx), ("sell_txn_count", raw_stx)]:
+                        rx = _as_int_raw(raw)
+                        if rx in ("INF", "BAD"):
+                            print(f"    [DB WARNING] {row.get('symbol')} {row.get('date')} {name} raw={raw} ({rx})")
+                        elif isinstance(rx, int) and (rx < BIGINT_MIN or rx > BIGINT_MAX):
+                            print(f"    [DB WARNING] OUT OF RANGE (RAW): {row.get('symbol')} {row.get('date')} {name}={rx}")
+
+                    # Sanitize BIGINTs
+                    txn_count = self._sanitize_int(raw_txn)
+                    buy_txn_count = self._sanitize_int(raw_btx)
+                    sell_txn_count = self._sanitize_int(raw_stx)
 
                     cur.execute("""
                         SELECT upsert_futures_daily_metrics(
