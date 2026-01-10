@@ -5,15 +5,15 @@ on:
     # Madrid is UTC+1 (Winter) / UTC+2 (Summer)
     # 1. Daily Close: 1 AM Madrid = 00:00 UTC (Winter) / 23:00 UTC (Summer)
     #    Target: ~00:15 UTC to ensure daily candle is closed and available.
-    - cron: '15 0 * * *'
+    #- cron: '15 0 * * *'
     
     # 2. Pre-Opening (US/Session): 3 PM Madrid = 14:00 UTC (Winter) / 13:00 UTC (Summer)
     #    Target: 14:00 UTC (compromise)
-    - cron: '0 14 * * *'
+    #- cron: '0 14 * * *'
     
     # 3. Pre-Close/Evening: 7 PM Madrid = 18:00 UTC (Winter) / 17:00 UTC (Summer)
     #    Target: 18:00 UTC
-    - cron: '0 18 * * *'
+    #- cron: '0 18 * * *'
 
   # Allow manual trigger from GitHub UI
   workflow_dispatch:
