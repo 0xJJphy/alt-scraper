@@ -76,6 +76,44 @@ class DatabaseManager:
         finally:
             if conn: conn.close()
 
+    def upsert_asset_metadata(self, symbol: str, narrative: str, is_filtered: int):
+        """Upsert asset metadata into asset_metadata table."""
+        if not self.enabled: return
+        
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+            cur.execute("SELECT upsert_asset_metadata(%s, %s, %s)", (symbol, narrative, bool(is_filtered)))
+            conn.commit()
+            cur.close()
+        except Exception as e:
+            print(f"    [DB ERROR] Metadata upsert failed for {symbol}: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+
+    def get_last_data_date(self, symbol: str, exchange: str) -> Optional[datetime]:
+        """Get the last stored date for a symbol/exchange in the DB."""
+        if not self.enabled: return None
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT MAX(date) FROM spot_daily_ohlcv 
+                WHERE symbol = %s AND exchange = %s
+            """, (symbol, exchange))
+            res = cur.fetchone()
+            if res and res[0]:
+                return res[0] # Returns a date object
+            return None
+        except Exception as e:
+            print(f"    [DB INFO] Could not fetch last date for {symbol}: {e}")
+            return None
+        finally:
+             if conn: conn.close()
+
 class AssetMetadataManager:
     def __init__(self, file_path: str = "data/asset_metadata.csv"):
         self.file_path = file_path
@@ -248,22 +286,41 @@ class SpotScraper:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-    def get_incremental_start(self, path: str, default_start_ts: int) -> int:
-        """Read existing CSV to find the last date and return start_ts - 2 days."""
-        if not os.path.exists(path):
-            return default_start_ts
-        try:
-            df = pd.read_csv(path)
-            if df.empty or 'date' not in df.columns:
-                return default_start_ts
-            last_date_str = df['date'].max()
-            last_date = datetime.strptime(last_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            # Fetch from 2 days before the last date to catch incomplete klines
+    def get_incremental_start(self, path: str, default_start_ts: int, symbol: str, exchange: str, db_manager: Optional[DatabaseManager] = None) -> int:
+        """
+        Determine start date based on:
+        1. Database last record (if available)
+        2. Local CSV file (if available)
+        3. Default start date
+        """
+        last_date = None
+        
+        # 1. Check Database
+        if db_manager and db_manager.enabled:
+            last_date_db = db_manager.get_last_data_date(symbol, exchange)
+            if last_date_db:
+                # Convert date to datetime at midnight UTC
+                last_date = datetime.combine(last_date_db, datetime.min.time(), tzinfo=timezone.utc)
+                print(f"    [Start] Found DB record: {last_date.date()}")
+
+        # 2. Check CSV if no DB record found
+        if not last_date and os.path.exists(path):
+            try:
+                df = pd.read_csv(path)
+                if not df.empty and 'date' in df.columns:
+                    last_date_str = df['date'].max()
+                    last_date = datetime.strptime(last_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    print(f"    [Start] Found CSV record: {last_date.date()}")
+            except Exception as e:
+                print(f"    [INFO] Could not read existing file: {e}")
+
+        # Return logic
+        if last_date:
+            # Re-fetch the last 2 days to ensure completeness
             start_dt = last_date - timedelta(days=2)
             return max(default_start_ts, to_unix_ms(start_dt))
-        except Exception as e:
-            print(f"    [INFO] Could not read existing file for incremental start: {e}")
-            return default_start_ts
+            
+        return default_start_ts
 
     def fetch_binance(self, symbol: str, start_ts: int, end_ts: int) -> pd.DataFrame:
         """ Binance Klines """
@@ -468,7 +525,14 @@ def main():
     print(f"Date Range: {start_dt.date()} to {end_dt.date()}")
     print(f"Exchanges:  {exchanges}")
     print(f"Targeting:  {len(target_bases)} tokens")
+    print(f"Targeting:  {len(target_bases)} tokens")
     print("=" * 60)
+    
+    # Sync Metadata to Database
+    if db_manager.enabled and not meta.df.empty:
+        print(f"[DB] Syncing {len(meta.df)} cached assets metadata...")
+        for _, row in meta.df.iterrows():
+            db_manager.upsert_asset_metadata(row['symbol'], row['narrative'], row['is_filtered'])
     
     for exchange in exchanges:
         print(f"\nProcessing EXCHANGE: {exchange.upper()}")
@@ -489,7 +553,11 @@ def main():
                 path = os.path.join(exch_dir, f"{base}USDT_spot_1d.csv")
                 
                 # Dynamic start for incremental fetch
-                dynamic_start = scraper.get_incremental_start(path, start_ts)
+                # Standardize symbol/exchange format for DB lookup
+                db_symbol = f"{base}USDT"
+                if exchange == 'okx': db_symbol = f"{base}-USDT"
+                
+                dynamic_start = scraper.get_incremental_start(path, start_ts, db_symbol, exchange, db_manager)
                 
                 if exchange == 'binance': df_new = scraper.fetch_binance(base, dynamic_start, end_ts)
                 elif exchange == 'bybit': df_new = scraper.fetch_bybit(base, dynamic_start, end_ts)

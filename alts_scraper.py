@@ -111,22 +111,40 @@ def to_unix_seconds(dt: datetime) -> int:
     return int(dt.timestamp())
 
 
-def get_incremental_start(path: str, default_start_sec: int) -> int:
-    """Read existing CSV to find the last date and return start_sec - 2 days."""
-    if not os.path.exists(path):
-        return default_start_sec
-    try:
-        df = pd.read_csv(path)
-        if df.empty or 'date' not in df.columns:
-            return default_start_sec
-        last_date_str = df['date'].max()
-        last_date = datetime.strptime(last_date_str, "%Y-%m-%d").replace(tzinfo=UTC)
-        # Fetch from 2 days before the last date to catch incomplete daily closes
+def get_incremental_start(path: str, default_start_sec: int, symbol: str, exchange: str, db_manager: Optional[DatabaseManager] = None) -> int:
+    """
+    Find start timestamp from:
+    1. Database last record (if available)
+    2. Local CSV file (if available)
+    3. Default value
+    """
+    last_date = None
+    
+    # 1. Check Database
+    if db_manager and db_manager.enabled:
+        last_date_db = db_manager.get_last_data_date(symbol, exchange)
+        if last_date_db:
+             last_date = datetime.combine(last_date_db, datetime.min.time(), tzinfo=timezone.utc)
+             print(f"    [Start] Found DB record: {last_date.date()}")
+
+    # 2. Check CSV if no DB record found
+    if not last_date and os.path.exists(path):
+        try:
+            df = pd.read_csv(path)
+            if not df.empty and 'date' in df.columns:
+                 last_date_str = df['date'].max()
+                 last_date = datetime.strptime(last_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                 print(f"    [Start] Found CSV record: {last_date.date()}")
+        except Exception as e:
+             print(f"    [INFO] Could not read existing file: {e}")
+
+    # Return logic
+    if last_date:
+        # Re-fetch the last 2 days to ensure completeness
         start_dt = last_date - timedelta(days=2)
         return max(default_start_sec, to_unix_seconds(start_dt))
-    except Exception as e:
-        print(f"    [INFO] Could not read existing file for incremental start: {e}")
-        return default_start_sec
+        
+    return default_start_sec
 
 
 class AssetMetadataManager:
@@ -720,9 +738,8 @@ class CoinalyzeClient:
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
         df["date"] = df["timestamp"].dt.strftime("%Y-%m-%d")
         
-        numeric_cols = ["price_open", "price_high", "price_low", "price_close",
-                       "volume_base", "buy_volume_base", "txn_count", "buy_txn_count"]
-        for col in numeric_cols:
+        for col in ["price_open", "price_high", "price_low", "price_close",
+                       "volume_base", "buy_volume_base", "txn_count", "buy_txn_count"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         
@@ -1243,7 +1260,7 @@ def main():
     start_dt = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=UTC)
     end_date = datetime.now(tz=UTC).date() - timedelta(days=args.end_days_ago)
     end_dt = datetime.combine(end_date, dtime(23, 59, 59), tzinfo=UTC)
-    start_sec = to_unix_seconds(start_dt)
+    default_start_sec = to_unix_seconds(start_dt)
     end_sec = to_unix_seconds(end_dt)
     
     # Determine target tokens (base assets)
@@ -1334,14 +1351,14 @@ def main():
             # Save metrics file path
             out_path = os.path.join(metrics_root, f"{symbol}_1d_metrics.csv")
             
-            # Dynamic start for incremental fetch
-            dynamic_start_sec = get_incremental_start(out_path, start_sec)
+            # Determine start time based on existing data (File or DB)
+            start_sec = get_incremental_start(out_path, default_start_sec, symbol, exchange, db_manager)
             
             # Fetch Hybrid Data (Smart Sourcing)
             metrics = fetch_hybrid_futures_data(
                 client, native_fetcher, 
                 base, exchange, symbol, 
-                dynamic_start_sec, end_sec
+                start_sec, end_sec
             )
             
             if metrics.empty:
