@@ -70,31 +70,47 @@ class DatabaseManager:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
             
+            ok_count = 0
             for _, row in df.iterrows():
-                cur.execute("""
-                    SELECT upsert_spot_daily_ohlcv(
-                        %s::DATE, %s::VARCHAR, %s::VARCHAR, 
-                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, 
-                        %s::DECIMAL, %s::DECIMAL, 
-                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, 
-                        %s::BIGINT, %s::BIGINT, %s::BIGINT
-                    )
-                """, (
-                    row.get('date'), row.get('symbol'), row.get('exchange'),
-                    row.get('price_open'), row.get('price_high'), row.get('price_low'), row.get('price_close'),
-                    row.get('volume_base'), row.get('volume_usd'),
-                    row.get('buy_volume_base'), row.get('sell_volume_base'), row.get('volume_delta'),
-                    self._sanitize_int(row.get('txn_count')), 
-                    self._sanitize_int(row.get('buy_txn_count')), 
-                    self._sanitize_int(row.get('sell_txn_count'))
-                ))
+                try:
+                    # Sanitize BIGINTs
+                    txn_count = self._sanitize_int(row.get('txn_count'))
+                    buy_txn_count = self._sanitize_int(row.get('buy_txn_count'))
+                    sell_txn_count = self._sanitize_int(row.get('sell_txn_count'))
+
+                    # Log OUT OF RANGE debug info
+                    BIGINT_MAX = 9223372036854775807
+                    BIGINT_MIN = -9223372036854775808
+                    for name, v in [("txn_count", txn_count), ("buy_txn_count", buy_txn_count), ("sell_txn_count", sell_txn_count)]:
+                         if v is not None and (v < BIGINT_MIN or v > BIGINT_MAX):
+                             print(f"    [DB WARNING] OUT OF RANGE: {row.get('symbol')} {row.get('date')} {name}={v}")
+
+                    cur.execute("""
+                        SELECT upsert_spot_daily_ohlcv(
+                            %s::DATE, %s::VARCHAR, %s::VARCHAR, 
+                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, 
+                            %s::DECIMAL, %s::DECIMAL, 
+                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, 
+                            %s::BIGINT, %s::BIGINT, %s::BIGINT
+                        )
+                    """, (
+                        row.get('date'), row.get('symbol'), row.get('exchange'),
+                        row.get('price_open'), row.get('price_high'), row.get('price_low'), row.get('price_close'),
+                        row.get('volume_base'), row.get('volume_usd'),
+                        row.get('buy_volume_base'), row.get('sell_volume_base'), row.get('volume_delta'),
+                        txn_count, buy_txn_count, sell_txn_count
+                    ))
+                    conn.commit()
+                    ok_count += 1
+                except Exception as e:
+                    conn.rollback()
+                    print(f"    [DB ERROR] Row failed: {row.get('symbol')} {row.get('date')} - {e}")
             
-            conn.commit()
             cur.close()
-            print(f"    [DB] Upserted {len(df)} rows to Supabase.")
+            print(f"    [DB] Upserted {ok_count}/{len(df)} rows.")
+
         except Exception as e:
-            print(f"    [DB ERROR] Upsert failed: {e}")
-            if conn: conn.rollback()
+            print(f"    [DB ERROR] Connection failed: {e}")
         finally:
             if conn: conn.close()
 

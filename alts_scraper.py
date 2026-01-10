@@ -156,38 +156,58 @@ class DatabaseManager:
             # liq_longs, liq_shorts, long_short_ratio, longs_qty, shorts_qty,
             # ls_acc_global, ls_acc_top, ls_pos_top)
 
+            ok_count = 0
             for _, row in df.iterrows():
-                cur.execute("""
-                    SELECT upsert_futures_daily_metrics(
-                        %s::DATE, %s::VARCHAR, %s::VARCHAR, 
-                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                        %s::DECIMAL, %s::DECIMAL, 
-                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
-                        %s::DECIMAL, %s::DECIMAL, %s::DECIMAL
-                    )
-                """, (
-                    row.get('date'), row.get('symbol'), row.get('exchange'),
-                    row.get('oi_usd_open'), row.get('oi_usd_high'), row.get('oi_usd_low'), row.get('oi_usd_close'),
-                    row.get('funding_open'), row.get('funding_high'), row.get('funding_low'), row.get('funding_close'),
-                    row.get('pred_funding_open'), row.get('pred_funding_high'), row.get('pred_funding_low'), row.get('pred_funding_close'),
-                    row.get('liq_longs'), row.get('liq_shorts'),
-                    row.get('ls_ratio'), row.get('longs_qty'), row.get('shorts_qty'),
-                    row.get('ls_acc_global'), row.get('ls_acc_top'), row.get('ls_pos_top'),
-                    row.get('liq_longs'), row.get('liq_shorts'), row.get('liq_total'),
-                    row.get('price_open'), row.get('price_high'), row.get('price_low'), row.get('price_close'),
-                    row.get('volume_usd'), row.get('volume_base'), row.get('buy_volume_base'), row.get('sell_volume_base'), row.get('volume_delta'),
-                    self._sanitize_int(row.get('txn_count')), 
-                    self._sanitize_int(row.get('buy_txn_count')), 
-                    self._sanitize_int(row.get('sell_txn_count'))
-                ))
+                try:
+                    # Sanitize BIGINTs
+                    txn_count = self._sanitize_int(row.get('txn_count'))
+                    buy_txn_count = self._sanitize_int(row.get('buy_txn_count'))
+                    sell_txn_count = self._sanitize_int(row.get('sell_txn_count'))
+
+                    # Log OUT OF RANGE debug info
+                    BIGINT_MAX = 9223372036854775807
+                    BIGINT_MIN = -9223372036854775808
+                    for name, v in [("txn_count", txn_count), ("buy_txn_count", buy_txn_count), ("sell_txn_count", sell_txn_count)]:
+                         if v is not None and (v < BIGINT_MIN or v > BIGINT_MAX):
+                             print(f"    [DB WARNING] OUT OF RANGE: {row.get('symbol')} {row.get('date')} {name}={v}")
+
+                    cur.execute("""
+                        SELECT upsert_futures_daily_metrics(
+                            %s::DATE, %s::VARCHAR, %s::VARCHAR, 
+                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                            %s::DECIMAL, %s::DECIMAL, 
+                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                            %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL, %s::DECIMAL,
+                            %s::BIGINT, %s::BIGINT, %s::BIGINT
+                        )
+                    """, (
+                        row.get('date'), row.get('symbol'), row.get('exchange'),
+                        row.get('oi_usd_open'), row.get('oi_usd_high'), row.get('oi_usd_low'), row.get('oi_usd_close'),
+                        row.get('funding_open'), row.get('funding_high'), row.get('funding_low'), row.get('funding_close'),
+                        row.get('pred_funding_open'), row.get('pred_funding_high'), row.get('pred_funding_low'), row.get('pred_funding_close'),
+                        row.get('liq_longs'), row.get('liq_shorts'),
+                        row.get('ls_ratio'), row.get('longs_qty'), row.get('shorts_qty'),
+                        row.get('ls_acc_global'), row.get('ls_acc_top'), row.get('ls_pos_top'),
+                        row.get('liq_longs'), row.get('liq_shorts'), row.get('liq_total'),
+                        row.get('price_open'), row.get('price_high'), row.get('price_low'), row.get('price_close'),
+                        row.get('volume_usd'), row.get('volume_base'), row.get('buy_volume_base'), row.get('sell_volume_base'), row.get('volume_delta'),
+                        txn_count, buy_txn_count, sell_txn_count
+                    ))
+                    conn.commit()
+                    ok_count += 1
+                except Exception as e:
+                    conn.rollback()
+                    print(f"    [DB ERROR] Row failed: {row.get('symbol')} {row.get('date')} - {e}")
             
-            conn.commit()
-            print(f"    [DB] Upserted {len(df)} rows.")
-            
+            print(f"    [DB] Upserted {ok_count}/{len(df)} rows.")
+
         except Exception as e:
-            print(f"    [DB ERROR] Upsert failed: {e}")
+            print(f"    [DB ERROR] Connection failed: {e}")
             if conn: conn.rollback()
         finally:
             if conn: conn.close()
