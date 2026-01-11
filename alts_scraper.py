@@ -367,12 +367,14 @@ def get_incremental_start(path: str, default_start_sec: int, symbol: str, exchan
         # Re-fetch the last 7 days to ensure completeness (Hybrid patching)
         fast_forward_sec = to_unix_seconds(last_date - timedelta(days=7))
         
-        # If the requested start is OLDER than the fast-forward point, respect the user's start
-        # This allows for manual backfills/re-scrapes
-        if default_start_sec < fast_forward_sec and default_start_sec > 1483228800: # 1483228800 = 2017-01-01
-             return default_start_sec
-             
-        return fast_forward_sec
+        # If the user didn't specify a start date (it's the 2017 default), 
+        # or if the requested start is newer than our fast_forward, we use incremental.
+        # Threshold: 1483228800 is 2017-01-01 00:00:00 UTC.
+        if default_start_sec <= 1483228800:
+            return fast_forward_sec
+            
+        # If user provided a custom start date newer than 2017, respect it
+        return default_start_sec
         
     return default_start_sec
 
@@ -1487,7 +1489,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Backfill historical crypto futures data from Coinalyze API"
     )
-    parser.add_argument("--top", type=int, default=50,
+    parser.add_argument("--top", "--limit", type=int, default=50, dest="top",
                        help="Number of top tokens to fetch (default: 50)")
     parser.add_argument("--top-range", type=str, default=None,
                        help="Range of top tokens to fetch (e.g., 10-50). Overrides --top.")

@@ -611,12 +611,15 @@ class SpotScraper:
 
         if last_date:
             fast_forward_ts = to_unix_ms(last_date - timedelta(days=7))
-            # If requested start is older than fast-forward, respect user request (backfill mode)
-            # Threshold: 1483228800000 is 2017-01-01 00:00:00 UTC. 
-            # We use a slightly lower value or just check if it matches the default.
-            if default_start_ts < fast_forward_ts:
-                return default_start_ts
-            return fast_forward_ts
+            
+            # If the user didn't specify a start date (it's the 2017 default), 
+            # or if the requested start is newer than our fast_forward, we use incremental.
+            # Convert 1483228800000 (2017-01-01) to compare
+            if default_start_ts <= 1483228800000:
+                return fast_forward_ts
+                
+            # If user provided a custom start date newer than 2017, respect it
+            return default_start_ts
             
         return default_start_ts
 
