@@ -1290,22 +1290,33 @@ def merge_on_date(perp_csv_path: str, metrics: pd.DataFrame) -> None:
 # ==============================================================================
 
 class BinanceFuturesFetcher:
-    """Fetcher for Binance USD-M Futures Direct API."""
-    BASE_URL = "https://fapi.binance.com"
+    """Fetcher for Binance USD-M Futures Direct API with mirror rotation."""
+    MIRRORS = [
+        "https://fapi.binance.com",
+        "https://fapi1.binance.com",
+        "https://fapi2.binance.com",
+        "https://fapi3.binance.com",
+        "https://fapi.binance.cc",
+        "https://fapi.binance.me",
+        "https://data.binance.com"
+    ]
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.binance.com/"
     }
 
     def __init__(self, timeout: int = 30, max_retries: int = 3):
         self.timeout = timeout
         self.max_retries = max_retries
+        self.base_url = self.MIRRORS[0]
 
     def _get(self, endpoint: str, params: dict) -> Optional[dict]:
         for attempt in range(self.max_retries):
             try:
                 resp = requests.get(
-                    f"{self.BASE_URL}{endpoint}",
+                    f"{self.base_url}{endpoint}",
                     params=params,
                     headers=self.HEADERS,
                     timeout=self.timeout
@@ -1318,8 +1329,11 @@ class BinanceFuturesFetcher:
                     time.sleep(wait_time)
                     continue
                 elif resp.status_code in (403, 418, 451):
+                    # Rotate base_url
+                    mirror_idx = (attempt + 1) % len(self.MIRRORS)
+                    self.base_url = self.MIRRORS[mirror_idx]
                     wait_time = 5 ** attempt + 5
-                    print(f"    [Binance] IP blocked (HTTP {resp.status_code}), retrying in {wait_time}s... (attempt {attempt+1}/{self.max_retries})")
+                    print(f"    [Binance] IP blocked (HTTP {resp.status_code}), rotating to {self.base_url} in {wait_time}s... (attempt {attempt+1}/{self.max_retries})")
                     time.sleep(wait_time)
                     continue
                 else:
@@ -1411,7 +1425,7 @@ class BybitFuturesFetcher:
         for attempt in range(self.max_retries):
             try:
                 resp = requests.get(
-                    f"{self.BASE_URL}{endpoint}",
+                    f"{self.base_url}{endpoint}",
                     params=params,
                     headers=self.HEADERS,
                     timeout=self.timeout
@@ -1504,7 +1518,7 @@ class OKXFuturesFetcher:
         for attempt in range(self.max_retries):
             try:
                 resp = requests.get(
-                    f"{self.BASE_URL}{endpoint}",
+                    f"{self.base_url}{endpoint}",
                     params=params,
                     headers=self.HEADERS,
                     timeout=self.timeout

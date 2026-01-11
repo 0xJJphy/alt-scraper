@@ -24,7 +24,15 @@ STABLES_CATEGORIES = [
 ]
 
 # API Endpoints
-BINANCE_SPOT_API = "https://api.binance.com/api/v3/klines"
+BINANCE_SPOT_MIRRORS = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+    "https://data.binance.com"
+]
+BINANCE_SPOT_API = f"{BINANCE_SPOT_MIRRORS[0]}/api/v3/klines"
 BYBIT_SPOT_API = "https://api.bybit.com/v5/market/kline"
 OKX_SPOT_API = "https://www.okx.com/api/v5/market/history-candles"
 OKX_RUBIK_API = "https://www.okx.com/api/v5/rubik/stat/taker-volume"
@@ -790,8 +798,10 @@ class SpotScraper:
         current_start = start_ts
         limit = 1000
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.binance.com/"
         }
 
         while current_start < end_ts:
@@ -814,11 +824,25 @@ class SpotScraper:
                         time.sleep(wait_time)
                         continue
                     elif resp.status_code in (400, 403, 418, 451):
+                        mirror_idx = (attempt + 1) % len(BINANCE_SPOT_MIRRORS)
+                        current_api = f"{BINANCE_SPOT_MIRRORS[mirror_idx]}/api/v3/klines"
                         wait_time = 5 ** attempt + 5
-                        print(f"    [Binance] HTTP {resp.status_code} for {base}, retrying in {wait_time}s... (attempt {attempt+1}/3)")
+                        print(f"    [Binance] HTTP {resp.status_code} for {base}, rotating to {BINANCE_SPOT_MIRRORS[mirror_idx]} in {wait_time}s... (attempt {attempt+1}/3)")
                         time.sleep(wait_time)
                         if attempt == 2:
                             return pd.DataFrame()
+                        # Update api for next attempt
+                        params["symbol"] = f"{base}USDT" # Redundant but safe
+                        try:
+                            resp = requests.get(current_api, params=params, headers=headers, timeout=30)
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                if not data: break
+                                all_data.extend(data)
+                                current_start = data[-1][0] + 86400000
+                                time.sleep(0.3)
+                                break
+                        except: pass
                         continue
                     else:
                         print(f"    [Binance] Unexpected HTTP {resp.status_code}")
