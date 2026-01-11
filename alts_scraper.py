@@ -1276,11 +1276,17 @@ class BinanceFuturesFetcher:
         }
         if f_data:
             frate = f_data.get("lastFundingRate")
-            res["funding_rate"] = float(frate) if frate and frate != "" else 0.0
-            res["predicted_funding_rate"] = res["funding_rate"]
+            val = float(frate) if frate and frate != "" else 0.0
+            for suffix in ['open', 'high', 'low', 'close']:
+                res[f"funding_{suffix}"] = val
+            for suffix in ['open', 'high', 'low', 'close']:
+                res[f"pred_funding_{suffix}"] = val
+                
         if o_data:
             oi_val = o_data.get("openInterest")
-            res["open_interest"] = float(oi_val) if oi_val and oi_val != "" else 0.0
+            val = float(oi_val) if oi_val and oi_val != "" else 0.0
+            for suffix in ['open', 'high', 'low', 'close']:
+                res[f"oi_usd_{suffix}"] = val
         return res
 
 class BybitFuturesFetcher:
@@ -1337,9 +1343,15 @@ class BybitFuturesFetcher:
             fr = tick.get("fundingRate")
             nfr = tick.get("nextFundingRate")
             oi = tick.get("openInterest")
-            res["funding_rate"] = float(fr) if fr and fr != "" else 0.0
-            res["predicted_funding_rate"] = float(nfr) if nfr and nfr != "" else 0.0
-            res["open_interest"] = float(oi) if oi and oi != "" else 0.0
+            
+            f_val = float(fr) if fr and fr != "" else 0.0
+            nf_val = float(nfr) if nfr and nfr != "" else 0.0
+            oi_val = float(oi) if oi and oi != "" else 0.0
+            
+            for suffix in ['open', 'high', 'low', 'close']:
+                res[f"funding_{suffix}"] = f_val
+                res[f"pred_funding_{suffix}"] = nf_val
+                res[f"oi_usd_{suffix}"] = oi_val
             
         return res
 
@@ -1416,13 +1428,18 @@ class OKXFuturesFetcher:
             fdata = f_data["data"][0]
             fr = fdata.get("fundingRate")
             nfr = fdata.get("nextFundingRate")
-            res["funding_rate"] = float(fr) if fr and fr != "" else 0.0
-            res["predicted_funding_rate"] = float(nfr) if nfr and nfr != "" else 0.0
+            f_val = float(fr) if fr and fr != "" else 0.0
+            nf_val = float(nfr) if nfr and nfr != "" else 0.0
+            for suffix in ['open', 'high', 'low', 'close']:
+                res[f"funding_{suffix}"] = f_val
+                res[f"pred_funding_{suffix}"] = nf_val
             
         if o_data and o_data.get("code") == "0":
             odata = o_data["data"][0]
             oi = odata.get("oi")
-            res["open_interest"] = float(oi) if oi and oi != "" else 0.0
+            oi_val = float(oi) if oi and oi != "" else 0.0
+            for suffix in ['open', 'high', 'low', 'close']:
+                res[f"oi_usd_{suffix}"] = oi_val
             
         return res
 
