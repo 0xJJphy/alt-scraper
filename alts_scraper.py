@@ -1258,16 +1258,30 @@ class BinanceFuturesFetcher:
         return res
 
     def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
-        """Fetch today's open candle data."""
+        """Fetch today's open candle data + living metrics (Funding, OI)."""
         clean_symbol = symbol.split('.')[0].replace('_PERP', '')
-        data = self._get("/fapi/v1/klines", {"symbol": clean_symbol, "interval": "1d", "limit": 1})
-        if not data: return None
-        k = data[0]
-        return {
+        # 1. OHLCV
+        k_data = self._get("/fapi/v1/klines", {"symbol": clean_symbol, "interval": "1d", "limit": 1})
+        # 2. Funding
+        f_data = self._get("/fapi/v1/premiumIndex", {"symbol": clean_symbol})
+        # 3. Open Interest
+        o_data = self._get("/fapi/v1/openInterest", {"symbol": clean_symbol})
+
+        if not k_data: return None
+        k = k_data[0]
+        res = {
             "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
             "volume_base": float(k[5]), "volume_usd": float(k[7]), "txn_count": int(k[8]),
             "buy_volume_base": float(k[9])
         }
+        if f_data:
+            frate = f_data.get("lastFundingRate")
+            res["funding_rate"] = float(frate) if frate and frate != "" else 0.0
+            res["predicted_funding_rate"] = res["funding_rate"]
+        if o_data:
+            oi_val = o_data.get("openInterest")
+            res["open_interest"] = float(oi_val) if oi_val and oi_val != "" else 0.0
+        return res
 
 class BybitFuturesFetcher:
     """Fetcher for Bybit V5 Futures Direct API."""
@@ -1301,16 +1315,33 @@ class BybitFuturesFetcher:
         return df[['date', 'ls_acc_global']]
 
     def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
+        """Fetch today's data + living metrics (Funding, OI)."""
         clean_symbol = symbol.split('.')[0]
-        data = self._get("/v5/market/kline", {"category": "linear", "symbol": clean_symbol, "interval": "D", "limit": 1})
-        if not data or data.get("retCode") != 0: return None
-        list_data = data.get("result", {}).get("list", [])
-        if not list_data: return None
-        k = list_data[0]
-        return {
+        # 1. OHLCV
+        k_data = self._get("/v5/market/kline", {"category": "linear", "symbol": clean_symbol, "interval": "D", "limit": 1})
+        # 2. Tickers (has Funding/OI)
+        t_data = self._get("/v5/market/tickers", {"category": "linear", "symbol": clean_symbol})
+
+        if not k_data or k_data.get("retCode") != 0: return None
+        list_k = k_data.get("result", {}).get("list", [])
+        if not list_k: return None
+        k = list_k[0]
+        
+        res = {
             "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
             "volume_base": float(k[5]), "volume_usd": float(k[6])
         }
+        
+        if t_data and t_data.get("retCode") == 0:
+            tick = t_data.get("result", {}).get("list", [])[0]
+            fr = tick.get("fundingRate")
+            nfr = tick.get("nextFundingRate")
+            oi = tick.get("openInterest")
+            res["funding_rate"] = float(fr) if fr and fr != "" else 0.0
+            res["predicted_funding_rate"] = float(nfr) if nfr and nfr != "" else 0.0
+            res["open_interest"] = float(oi) if oi and oi != "" else 0.0
+            
+        return res
 
 class OKXFuturesFetcher:
     """Fetcher for OKX V5 Futures Direct API."""
@@ -1360,17 +1391,40 @@ class OKXFuturesFetcher:
         return res
 
     def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
-        base = symbol.split('USDT')[0].split('.')[0]
-        clean_symbol = f"{base}-USDT-SWAP"
-        data = self._get("/api/v5/market/candles", {"instId": clean_symbol, "bar": "1D", "limit": 1})
-        if not data: return None
-        list_data = data.get("data", [])
-        if not list_data: return None
-        k = list_data[0]
-        return {
+        """Fetch today's data + living metrics (Funding, OI)."""
+        base_asset = symbol.split('USDT')[0].split('.')[0]
+        clean_symbol = f"{base_asset}-USDT-SWAP"
+        
+        # 1. OHLCV
+        k_data = self._get("/api/v5/market/candles", {"instId": clean_symbol, "bar": "1D", "limit": 1})
+        # 2. Funding
+        f_data = self._get("/api/v5/public/funding-rate", {"instId": clean_symbol})
+        # 3. Open Interest
+        o_data = self._get("/api/v5/public/open-interest", {"instId": clean_symbol})
+
+        if not k_data: return None
+        list_k = k_data.get("data", [])
+        if not list_k: return None
+        k = list_k[0]
+        
+        res = {
             "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
             "volume_base": float(k[5]), "volume_usd": float(k[7])
         }
+        
+        if f_data and f_data.get("code") == "0":
+            fdata = f_data["data"][0]
+            fr = fdata.get("fundingRate")
+            nfr = fdata.get("nextFundingRate")
+            res["funding_rate"] = float(fr) if fr and fr != "" else 0.0
+            res["predicted_funding_rate"] = float(nfr) if nfr and nfr != "" else 0.0
+            
+        if o_data and o_data.get("code") == "0":
+            odata = o_data["data"][0]
+            oi = odata.get("oi")
+            res["open_interest"] = float(oi) if oi and oi != "" else 0.0
+            
+        return res
 
 # ==============================================================================
 # Hybrid Sourcing Manager
