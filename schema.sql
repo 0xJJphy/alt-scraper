@@ -878,15 +878,19 @@ COMMENT ON COLUMN futures_daily_metrics.oi_usd_close IS 'Open Interest in USD at
 CREATE OR REPLACE FUNCTION upsert_asset_metadata(
     p_symbol VARCHAR(20),
     p_narrative VARCHAR(100),
-    p_is_filtered BOOLEAN
+    p_is_filtered BOOLEAN,
+    p_market_cap DECIMAL DEFAULT NULL,
+    p_market_cap_rank INTEGER DEFAULT NULL
 )
 RETURNS VOID AS $$
 BEGIN
-    INSERT INTO asset_metadata (symbol, narrative, is_filtered, updated_at)
-    VALUES (p_symbol, p_narrative, p_is_filtered, NOW())
+    INSERT INTO asset_metadata (symbol, narrative, is_filtered, market_cap, market_cap_rank, updated_at)
+    VALUES (p_symbol, p_narrative, p_is_filtered, p_market_cap, p_market_cap_rank, NOW())
     ON CONFLICT (symbol) DO UPDATE SET
         narrative = EXCLUDED.narrative,
         is_filtered = EXCLUDED.is_filtered,
+        market_cap = COALESCE(EXCLUDED.market_cap, asset_metadata.market_cap),
+        market_cap_rank = COALESCE(EXCLUDED.market_cap_rank, asset_metadata.market_cap_rank),
         updated_at = NOW();
 END;
 $$ LANGUAGE plpgsql;

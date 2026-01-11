@@ -319,14 +319,17 @@ class DatabaseManager:
         finally:
             if conn: conn.close()
 
-    def upsert_asset_metadata(self, symbol: str, narrative: str, is_filtered: int):
+    def upsert_asset_metadata(self, symbol: str, narrative: str, is_filtered: int, market_cap: Optional[float] = None, market_cap_rank: Optional[int] = None):
         """Upsert asset metadata into asset_metadata table."""
         if not self.enabled: return
         conn = None
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("SELECT upsert_asset_metadata(%s::VARCHAR, %s::VARCHAR, %s::BOOLEAN)", (symbol, narrative, bool(is_filtered)))
+            cur.execute(
+                "SELECT upsert_asset_metadata(%s::VARCHAR, %s::VARCHAR, %s::BOOLEAN, %s::DECIMAL, %s::INTEGER)",
+                (symbol, narrative, bool(is_filtered), self._sanitize_float(market_cap), self._sanitize_int(market_cap_rank))
+            )
             conn.commit()
         except Exception as e:
             print(f"    [DB ERROR] Metadata upsert failed for {symbol}: {e}")
@@ -423,26 +426,32 @@ class AssetMetadataManager:
             return detailed[0] if detailed else specific[0]
         return categories[0]
 
-    def get_metadata(self, symbol: str, coin_id: str) -> Dict:
+    def get_metadata(self, symbol: str, coin_id: str, market_cap: Optional[float] = None, market_cap_rank: Optional[int] = None) -> Dict:
         """Get narrative and filter status, checking cache first."""
         symbol = symbol.upper()
         cache_row = self.df[self.df['symbol'] == symbol]
         if not cache_row.empty:
             row = cache_row.iloc[0]
+            # Update market_cap if provided
+            if market_cap is not None:
+                self.df.loc[self.df['symbol'] == symbol, 'market_cap'] = market_cap
+                self.df.loc[self.df['symbol'] == symbol, 'market_cap_rank'] = market_cap_rank
+                if self.db_manager and self.db_manager.enabled:
+                    self.db_manager.upsert_asset_metadata(symbol, row['narrative'], int(row['is_filtered']), market_cap, market_cap_rank)
             return {"narrative": row['narrative'], "is_filtered": int(row['is_filtered'])}
-            
+
         print(f"  [CG] Fetching detail for {symbol} ({coin_id})...")
         url = f"{COINGECKO_BASE}/coins/{coin_id}"
         try:
             resp = requests.get(url, params={"localization": "false", "tickers": "false", "market_data": "false", "community_data": "false", "developer_data": "false", "sparkline": "false"})
             if resp.status_code == 429:
                 print("    Rate limit. Waiting 60s..."); time.sleep(60)
-                return self.get_metadata(symbol, coin_id)
+                return self.get_metadata(symbol, coin_id, market_cap, market_cap_rank)
             resp.raise_for_status()
             detail = resp.json()
             categories = detail.get("categories", [])
             cat_ids = [c.lower().replace(" ", "-") for c in categories]
-            
+
             is_filtered = 0
             narrative = "Unknown"
             excluded_cats_indices = [i for i, cid in enumerate(cat_ids) if any(s_cat in cid for s_cat in STABLES_CATEGORIES)]
@@ -452,17 +461,23 @@ class AssetMetadataManager:
             else:
                 narrative = self._select_best_narrative(categories)
 
-            new_row = pd.DataFrame([{'symbol': symbol, 'narrative': narrative, 'is_filtered': is_filtered}])
+            new_row = pd.DataFrame([{
+                'symbol': symbol,
+                'narrative': narrative,
+                'is_filtered': is_filtered,
+                'market_cap': market_cap,
+                'market_cap_rank': market_cap_rank
+            }])
             self.df = pd.concat([self.df, new_row], ignore_index=True).drop_duplicates('symbol')
-            
+
             # Persist to DB immediately
             if self.db_manager and self.db_manager.enabled:
-                self.db_manager.upsert_asset_metadata(symbol, narrative, is_filtered)
-            
+                self.db_manager.upsert_asset_metadata(symbol, narrative, is_filtered, market_cap, market_cap_rank)
+
             # Persist to CSV if allowed
             if self.allow_csv:
                 self.df.to_csv(self.file_path, index=False)
-                
+
             return {"narrative": narrative, "is_filtered": is_filtered}
         except Exception as e:
             print(f"    [ERROR] CG Fetch failed for {symbol}: {e}")
@@ -482,7 +497,12 @@ def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[st
         resp.raise_for_status()
         data = resp.json()
         for coin in data:
-            out.append({"symbol": coin.get("symbol", "").upper(), "id": coin.get("id")})
+            out.append({
+                "symbol": coin.get("symbol", "").upper(),
+                "id": coin.get("id"),
+                "market_cap": coin.get("market_cap"),
+                "market_cap_rank": coin.get("market_cap_rank")
+            })
     except Exception as e:
         print(f"[ERROR] CG Markets API failed: {e}")
     return out
@@ -1708,7 +1728,7 @@ def main():
         raw_symbols = [s.strip().upper() for s in args.symbols.split(",")]
         candidates = coingecko_get_top_candidates(specific_symbols=raw_symbols)
         for c in candidates:
-            res = meta.get_metadata(c['symbol'], c['id'])
+            res = meta.get_metadata(c['symbol'], c['id'], c.get('market_cap'), c.get('market_cap_rank'))
             if res.get("is_filtered") == 0:
                 target_bases.append(c['symbol'])
         selection_desc = f"Specific Symbols: {len(target_bases)}"
@@ -1722,11 +1742,11 @@ def main():
                 limit = args.top
         else:
             limit = args.top
-            
+
         candidates = coingecko_get_top_candidates(n=limit)
         valid_candidates = []
         for c in candidates:
-            res = meta.get_metadata(c['symbol'], c['id'])
+            res = meta.get_metadata(c['symbol'], c['id'], c.get('market_cap'), c.get('market_cap_rank'))
             if res['is_filtered'] == 0:
                 valid_candidates.append(c['symbol'])
             if len(valid_candidates) >= limit: break

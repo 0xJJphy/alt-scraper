@@ -268,13 +268,20 @@ class AssetMetadataManager:
             
         return categories[0]
 
-    def get_metadata(self, symbol: str, coin_id: str) -> Dict:
+    def get_metadata(self, symbol: str, coin_id: str, market_cap: Optional[float] = None, market_cap_rank: Optional[int] = None) -> Dict:
         """Get narrative and filter status, checking cache first."""
         symbol = symbol.upper()
         cache_row = self.df[self.df['symbol'] == symbol]
-        
+
         if not cache_row.empty:
             row = cache_row.iloc[0]
+            # Update market_cap if provided and different
+            if market_cap is not None:
+                self.df.loc[self.df['symbol'] == symbol, 'market_cap'] = market_cap
+                self.df.loc[self.df['symbol'] == symbol, 'market_cap_rank'] = market_cap_rank
+                # Update DB with new market cap
+                if self.db_manager and self.db_manager.enabled:
+                    self.db_manager.upsert_asset_metadata(symbol, row['narrative'], int(row['is_filtered']), market_cap, market_cap_rank)
             return {"narrative": row['narrative'], "is_filtered": int(row['is_filtered'])}
             
         # Not in cache, fetch from CoinGecko
@@ -305,12 +312,18 @@ class AssetMetadataManager:
                 narrative = self._select_best_narrative(categories)
 
             # Update cache
-            new_row = pd.DataFrame([{'symbol': symbol, 'narrative': narrative, 'is_filtered': is_filtered}])
+            new_row = pd.DataFrame([{
+                'symbol': symbol,
+                'narrative': narrative,
+                'is_filtered': is_filtered,
+                'market_cap': market_cap,
+                'market_cap_rank': market_cap_rank
+            }])
             self.df = pd.concat([self.df, new_row], ignore_index=True).drop_duplicates('symbol')
-            
+
             # Persist to DB immediately
             if self.db_manager and self.db_manager.enabled:
-                self.db_manager.upsert_asset_metadata(symbol, narrative, is_filtered)
+                self.db_manager.upsert_asset_metadata(symbol, narrative, is_filtered, market_cap, market_cap_rank)
             
             # Persist to CSV if allowed
             if self.allow_csv:
@@ -790,7 +803,7 @@ def main():
         raw_symbols = [s.strip().upper() for s in args.symbols.split(",")]
         candidates = coingecko_get_top_candidates(specific_symbols=raw_symbols)
         for c in candidates:
-            res = meta.get_metadata(c['symbol'], c['id'])
+            res = meta.get_metadata(c['symbol'], c['id'], c.get('market_cap'), c.get('market_cap_rank'))
             if res.get("is_filtered") == 0:
                 target_bases.append(c['symbol'])
     else:
@@ -800,11 +813,11 @@ def main():
             limit = end_rank
         else:
             limit = args.limit
-            
+
         candidates = coingecko_get_top_candidates(n=limit)
         valid_candidates = []
         for c in candidates:
-            res = meta.get_metadata(c['symbol'], c['id'])
+            res = meta.get_metadata(c['symbol'], c['id'], c.get('market_cap'), c.get('market_cap_rank'))
             if res['is_filtered'] == 0:
                 valid_candidates.append(c['symbol'])
             if len(valid_candidates) >= limit: break
