@@ -418,76 +418,141 @@ class CoinalyzeClient:
 class BinanceSpotFetcher:
     """Fetcher for Binance Spot V3 API."""
     BASE_URL = "https://api.binance.com/api/v3"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
 
-    def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
+    def fetch_current_day_data(self, symbol: str, max_retries: int = 3) -> Optional[Dict]:
         """Fetch today's open candle data."""
-        try:
-            params = {"symbol": f"{symbol}USDT", "interval": "1d", "limit": 1}
-            resp = requests.get(f"{self.BASE_URL}/klines", params=params)
-            data = resp.json()
-            if not data: return None
-            k = data[0]
-            # [ts, o, h, l, c, v, cts, qv, n, tbv, tqv, ignore]
-            return {
-                "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
-                "volume_base": float(k[5]), "volume_usd": float(k[7]), "txn_count": int(k[8]),
-                "buy_volume_base": float(k[9])
-            }
-        except: return None
+        for attempt in range(max_retries):
+            try:
+                params = {"symbol": f"{symbol}USDT", "interval": "1d", "limit": 1}
+                resp = requests.get(f"{self.BASE_URL}/klines", params=params, headers=self.HEADERS, timeout=15)
+                if resp.status_code == 429:
+                    wait_time = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    print(f"    [Binance Spot] Rate limited, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                elif resp.status_code in (403, 418, 451):
+                    print(f"    [Binance Spot] IP blocked (HTTP {resp.status_code}), attempt {attempt+1}/{max_retries}")
+                    time.sleep(2 ** attempt)
+                    continue
+                data = resp.json()
+                if not data: return None
+                k = data[0]
+                # [ts, o, h, l, c, v, cts, qv, n, tbv, tqv, ignore]
+                return {
+                    "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
+                    "volume_base": float(k[5]), "volume_usd": float(k[7]), "txn_count": int(k[8]),
+                    "buy_volume_base": float(k[9])
+                }
+            except requests.exceptions.Timeout:
+                print(f"    [Binance Spot] Timeout, attempt {attempt+1}/{max_retries}")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"    [Binance Spot Error] {e}")
+                return None
+        return None
 
 class BybitSpotFetcher:
     """Fetcher for Bybit V5 Spot API."""
     BASE_URL = "https://api.bybit.com/v5/market"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
 
-    def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
-        try:
-            params = {"category": "spot", "symbol": f"{symbol}USDT", "interval": "D", "limit": 1}
-            resp = requests.get(f"{self.BASE_URL}/kline", params=params).json()
-            data = resp.get("result", {}).get("list", [])
-            if not data: return None
-            k = data[0]
-            # [ts, o, h, l, c, v, qv]
-            return {
-                "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
-                "volume_base": float(k[5]), "volume_usd": float(k[6])
-            }
-        except: return None
+    def fetch_current_day_data(self, symbol: str, max_retries: int = 3) -> Optional[Dict]:
+        for attempt in range(max_retries):
+            try:
+                params = {"category": "spot", "symbol": f"{symbol}USDT", "interval": "D", "limit": 1}
+                resp = requests.get(f"{self.BASE_URL}/kline", params=params, headers=self.HEADERS, timeout=15)
+                if resp.status_code == 429:
+                    print(f"    [Bybit Spot] Rate limited, waiting {2 ** attempt}s...")
+                    time.sleep(2 ** attempt)
+                    continue
+                data = resp.json().get("result", {}).get("list", [])
+                if not data: return None
+                k = data[0]
+                # [ts, o, h, l, c, v, qv]
+                return {
+                    "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
+                    "volume_base": float(k[5]), "volume_usd": float(k[6])
+                }
+            except requests.exceptions.Timeout:
+                print(f"    [Bybit Spot] Timeout, attempt {attempt+1}/{max_retries}")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"    [Bybit Spot Error] {e}")
+                return None
+        return None
 
 class OKXSpotFetcher:
     """Fetcher for OKX V5 Spot API."""
     BASE_URL = "https://www.okx.com/api/v5"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
 
-    def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
-        try:
-            params = {"instId": f"{symbol}-USDT", "bar": "1D", "limit": 1}
-            resp = requests.get(f"{self.BASE_URL}/market/candles", params=params).json()
-            data = resp.get("data", [])
-            if not data: return None
-            k = data[0]
-            return {
-                "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
-                "volume_base": float(k[5]), "volume_usd": float(k[6])
-            }
-        except: return None
+    def fetch_current_day_data(self, symbol: str, max_retries: int = 3) -> Optional[Dict]:
+        for attempt in range(max_retries):
+            try:
+                params = {"instId": f"{symbol}-USDT", "bar": "1D", "limit": 1}
+                resp = requests.get(f"{self.BASE_URL}/market/candles", params=params, headers=self.HEADERS, timeout=15)
+                if resp.status_code == 429:
+                    print(f"    [OKX Spot] Rate limited, waiting {2 ** attempt}s...")
+                    time.sleep(2 ** attempt)
+                    continue
+                elif resp.status_code in (403, 418):
+                    print(f"    [OKX Spot] IP blocked (HTTP {resp.status_code}), attempt {attempt+1}/{max_retries}")
+                    time.sleep(2 ** attempt)
+                    continue
+                data = resp.json().get("data", [])
+                if not data: return None
+                k = data[0]
+                return {
+                    "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
+                    "volume_base": float(k[5]), "volume_usd": float(k[6])
+                }
+            except requests.exceptions.Timeout:
+                print(f"    [OKX Spot] Timeout, attempt {attempt+1}/{max_retries}")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"    [OKX Spot Error] {e}")
+                return None
+        return None
 
-    def fetch_bulk_rubik_delta(self, symbol: str) -> pd.DataFrame:
+    def fetch_bulk_rubik_delta(self, symbol: str, max_retries: int = 3) -> pd.DataFrame:
         """Fetch Taker Buy Volume from Rubik (last 180 days)."""
-        try:
-            params = {"ccy": symbol, "period": "1D", "instType": "SPOT"}
-            resp = requests.get(f"{self.BASE_URL}/rubik/stat/taker-volume", params=params).json()
-            if resp.get('code') != '0':
-                print(f"    [Rubik Info] Code {resp.get('code')}: {resp.get('msg')}")
-            data = resp.get("data", [])
-            if not data: return pd.DataFrame()
-            df = pd.DataFrame(data, columns=['timestamp', 'buy_volume_base', 'sell_volume_base'])
-            df['date'] = pd.to_datetime(df['timestamp'].astype('int64'), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-            df['buy_volume_base'] = pd.to_numeric(df['buy_volume_base'])
-            df['sell_volume_base'] = pd.to_numeric(df['sell_volume_base'])
-            df['volume_delta'] = df['buy_volume_base'] - df['sell_volume_base']
-            return df[['date', 'buy_volume_base', 'sell_volume_base', 'volume_delta']]
-        except Exception as e:
-            print(f"    [Rubik Error] {e}")
-            return pd.DataFrame()
+        for attempt in range(max_retries):
+            try:
+                params = {"ccy": symbol, "period": "1D", "instType": "SPOT"}
+                resp = requests.get(f"{self.BASE_URL}/rubik/stat/taker-volume", params=params, headers=self.HEADERS, timeout=15)
+                if resp.status_code == 429:
+                    print(f"    [OKX Rubik] Rate limited, waiting {2 ** attempt}s...")
+                    time.sleep(2 ** attempt)
+                    continue
+                json_data = resp.json()
+                if json_data.get('code') != '0':
+                    print(f"    [Rubik Info] Code {json_data.get('code')}: {json_data.get('msg')}")
+                    return pd.DataFrame()
+                data = json_data.get("data", [])
+                if not data: return pd.DataFrame()
+                df = pd.DataFrame(data, columns=['timestamp', 'buy_volume_base', 'sell_volume_base'])
+                df['date'] = pd.to_datetime(df['timestamp'].astype('int64'), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
+                df['buy_volume_base'] = pd.to_numeric(df['buy_volume_base'])
+                df['sell_volume_base'] = pd.to_numeric(df['sell_volume_base'])
+                df['volume_delta'] = df['buy_volume_base'] - df['sell_volume_base']
+                return df[['date', 'buy_volume_base', 'sell_volume_base', 'volume_delta']]
+            except requests.exceptions.Timeout:
+                print(f"    [OKX Rubik] Timeout, attempt {attempt+1}/{max_retries}")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"    [Rubik Error] {e}")
+                return pd.DataFrame()
+        return pd.DataFrame()
 
 GLOBAL_FETCHERS = {
     "binance": BinanceSpotFetcher(),
