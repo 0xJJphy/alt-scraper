@@ -52,11 +52,33 @@ jobs:
       - name: Setup VPN
         run: |
           sudo apt-get update
-          sudo apt-get install -y openvpn
+          sudo apt-get install -y openvpn iproute2
           python get_vpn_config.py
+          # Start OpenVPN in background
           sudo openvpn --config client.ovpn --log vpn.log --daemon
-          sleep 15
-          curl -s https://ipinfo.io/json | grep -E "country|ip"
+          
+          echo "Waiting for VPN connection to establish..."
+          MAX_RETRIES=10
+          COUNT=0
+          while [ $COUNT -lt $MAX_RETRIES ]; do
+            sleep 10
+            # Check exit IP
+            IP_INFO=$(curl -s https://ipinfo.io/json || echo '{"country": "ERROR"}')
+            COUNTRY=$(echo $IP_INFO | grep -oP '"country": "\K[^"]+')
+            IP=$(echo $IP_INFO | grep -oP '"ip": "\K[^"]+')
+            echo "Current IP: $IP ($COUNTRY) [Attempt $((COUNT+1))/$MAX_RETRIES]"
+            
+            if [ "$COUNTRY" != "US" ] && [ "$COUNTRY" != "ERROR" ]; then
+              echo "VPN ESTABLISHED: Exit IP is $IP ($COUNTRY)"
+              exit 0
+            fi
+            COUNT=$((COUNT+1))
+          done
+          
+          echo "ERROR: Failed to establish non-US VPN connection after $((MAX_RETRIES * 10))s."
+          echo "--- VPN LOGS ---"
+          cat vpn.log
+          exit 1
           
       - name: Sync Global Metadata
         run: |
@@ -96,12 +118,34 @@ jobs:
       - name: Setup VPN
         run: |
           sudo apt-get update
-          sudo apt-get install -y openvpn
+          sudo apt-get install -y openvpn iproute2
           python get_vpn_config.py
+          # Start OpenVPN in background
           sudo openvpn --config client.ovpn --log vpn.log --daemon
-          sleep 15
-          curl -s https://ipinfo.io/json | grep -E "country|ip"
-
+          
+          echo "Waiting for VPN connection to establish..."
+          MAX_RETRIES=10
+          COUNT=0
+          while [ $COUNT -lt $MAX_RETRIES ]; do
+            sleep 10
+            # Check exit IP
+            IP_INFO=$(curl -s https://ipinfo.io/json || echo '{"country": "ERROR"}')
+            COUNTRY=$(echo $IP_INFO | grep -oP '"country": "\K[^"]+')
+            IP=$(echo $IP_INFO | grep -oP '"ip": "\K[^"]+')
+            echo "Current IP: $IP ($COUNTRY) [Attempt $((COUNT+1))/$MAX_RETRIES]"
+            
+            if [ "$COUNTRY" != "US" ] && [ "$COUNTRY" != "ERROR" ]; then
+              echo "VPN ESTABLISHED: Exit IP is $IP ($COUNTRY)"
+              exit 0
+            fi
+            COUNT=$((COUNT+1))
+          done
+          
+          echo "ERROR: Failed to establish non-US VPN connection after $((MAX_RETRIES * 10))s."
+          echo "--- VPN LOGS ---"
+          cat vpn.log
+          exit 1
+          
       - name: Run Spot Scraper
         if: matrix.scraper_type == 'spot'
         run: |
