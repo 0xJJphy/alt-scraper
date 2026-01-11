@@ -25,6 +25,7 @@ STABLES_CATEGORIES = [
 
 # API Endpoints
 BINANCE_SPOT_MIRRORS = [
+    "https://api-gcp.binance.com",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
