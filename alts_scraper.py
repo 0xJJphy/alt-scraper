@@ -1233,11 +1233,11 @@ class BinanceFuturesFetcher:
         clean_symbol = symbol.split('.')[0].replace('_PERP', '') 
         
         # 1. Global L/S Account Ratio
-        g_data = self._get("/fapi/v1/data/globalLongShortAccountRatio", {"symbol": clean_symbol, "period": period, "limit": limit})
+        g_data = self._get("/futures/data/globalLongShortAccountRatio", {"symbol": clean_symbol, "period": period, "limit": limit})
         # 2. Top Trader L/S Account Ratio
-        a_data = self._get("/fapi/v1/data/topLongShortAccountRatio", {"symbol": clean_symbol, "period": period, "limit": limit})
+        a_data = self._get("/futures/data/topLongShortAccountRatio", {"symbol": clean_symbol, "period": period, "limit": limit})
         # 3. Top Trader L/S Position Ratio
-        p_data = self._get("/fapi/v1/data/topLongShortPositionRatio", {"symbol": clean_symbol, "period": period, "limit": limit})
+        p_data = self._get("/futures/data/topLongShortPositionRatio", {"symbol": clean_symbol, "period": period, "limit": limit})
 
         def to_df(data, col_name):
             if not data: return pd.DataFrame()
@@ -1336,11 +1336,11 @@ class OKXFuturesFetcher:
         clean_symbol = f"{base}-USDT-SWAP"
         
         # 1. Global
-        g_data = self._get("/api/v5/rubik/stat/contracts/long-short-account-ratio", {"instId": clean_symbol, "period": "1D"})
+        g_data = self._get("/api/v5/rubik/stat/contracts/long-short-account-ratio", {"ccy": base.upper(), "period": "1D"})
         # 2. Top Account
-        a_data = self._get("/api/v5/rubik/stat/contracts/top-traders-long-short-account-ratio", {"instId": clean_symbol, "period": "1D"})
+        a_data = self._get("/api/v5/rubik/stat/contracts/top-traders-long-short-account-ratio", {"ccy": base.upper(), "period": "1D"})
         # 3. Top Position
-        p_data = self._get("/api/v5/rubik/stat/contracts/top-traders-long-short-position-ratio", {"instId": clean_symbol, "period": "1D"})
+        p_data = self._get("/api/v5/rubik/stat/contracts/top-traders-long-short-position-ratio", {"ccy": base.upper(), "period": "1D"})
 
         def to_df(data, col_name):
             if not data or not data.get("data"): return pd.DataFrame()
