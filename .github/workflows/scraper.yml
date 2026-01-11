@@ -6,11 +6,11 @@ on:
     # 1. Daily Close: 1 AM Madrid = 00:00 UTC (Winter) / 23:00 UTC (Summer)
     #    Target: ~00:15 UTC to ensure daily candle is closed and available.
     - cron: '15 0 * * *'
-    
+
     # 2. Pre-Opening (US/Session): 3 PM Madrid = 14:00 UTC (Winter) / 13:00 UTC (Summer)
     #    Target: 14:00 UTC (compromise)
     - cron: '0 14 * * *'
-    
+
     # 3. Pre-Close/Evening: 7 PM Madrid = 18:00 UTC (Winter) / 17:00 UTC (Summer)
     #    Target: 18:00 UTC
     - cron: '0 18 * * *'
@@ -29,14 +29,14 @@ on:
         type: boolean
         required: false
         default: false
-    
+
     env:
       PYTHONUNBUFFERED: "1"
 
 jobs:
   sync-metadata:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       COINALYZE_API_KEY: ${{ secrets.COINALYZE_API_KEY }}
@@ -49,53 +49,95 @@ jobs:
       - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Setup VPN
+
+      - name: Setup VPN with multi-server retry
         run: |
           sudo apt-get update
           sudo apt-get install -y openvpn iproute2 curl
-          
+
           # Disable IPv6 to prevent leaks
           sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
           sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
-          
-          # Generate config
-          python get_vpn_config.py
-          
-          # Start OpenVPN in background
-          sudo openvpn --config client.ovpn --log vpn.log --daemon
-          
-          echo "Waiting for VPN connection to establish..."
-          MAX_RETRIES=15
-          COUNT=0
-          while [ $COUNT -lt $MAX_RETRIES ]; do
-            sleep 10
-            # Check if process is still running
-            if ! pgrep openvpn > /dev/null; then
-               echo "FATAL: OpenVPN process died!"
-               cat vpn.log
-               exit 1
+
+          # Function to attempt VPN connection with a single server
+          try_vpn_server() {
+            local attempt=$1
+            echo ""
+            echo "=========================================="
+            echo "[VPN] Server attempt $attempt/3"
+            echo "=========================================="
+
+            # Generate new config (picks random server from top candidates)
+            python get_vpn_config.py
+            if [ $? -ne 0 ]; then
+              echo "[ERROR] Failed to generate VPN config"
+              return 1
             fi
-            
-            # Check exit IP (multi-source for robustness)
-            IP_INFO=$(curl -s --connect-timeout 5 https://ipinfo.io/json || curl -s --connect-timeout 5 https://ifconfig.me/all.json || echo '{"country": "ERROR"}')
-            COUNTRY=$(echo $IP_INFO | grep -oP '"country": "\K[^"]+')
-            IP=$(echo $IP_INFO | grep -oP '"ip": "\K[^"]+')
-            echo "Current IP: $IP ($COUNTRY) [Attempt $((COUNT+1))/$MAX_RETRIES]"
-            
-            if [ "$COUNTRY" != "" ] && [ "$COUNTRY" != "US" ] && [ "$COUNTRY" != "ERROR" ]; then
-              echo "VPN ESTABLISHED: Exit IP is $IP ($COUNTRY)"
-              ip route show
+
+            # Kill any existing OpenVPN process
+            sudo killall openvpn 2>/dev/null || true
+            sleep 3
+
+            # Start OpenVPN
+            sudo openvpn --config client.ovpn --log vpn.log --daemon
+            sleep 5
+
+            # Wait for connection
+            echo "[VPN] Waiting for connection..."
+            local conn_check=0
+            local max_checks=8
+
+            while [ $conn_check -lt $max_checks ]; do
+              sleep 10
+
+              # Check if process is still running
+              if ! pgrep -x openvpn > /dev/null; then
+                echo "[ERROR] OpenVPN process died"
+                echo "--- Last 20 lines of VPN log ---"
+                tail -20 vpn.log 2>/dev/null || echo "(no log)"
+                return 1
+              fi
+
+              # Check exit IP
+              IP_INFO=$(curl -s --connect-timeout 8 https://ipinfo.io/json 2>/dev/null || echo '{"country":"ERROR"}')
+              COUNTRY=$(echo "$IP_INFO" | grep -oP '"country":\s*"\K[^"]+' || echo "ERROR")
+              IP=$(echo "$IP_INFO" | grep -oP '"ip":\s*"\K[^"]+' || echo "unknown")
+
+              echo "[VPN] IP: $IP, Country: $COUNTRY [Check $((conn_check+1))/$max_checks]"
+
+              if [ -n "$COUNTRY" ] && [ "$COUNTRY" != "US" ] && [ "$COUNTRY" != "ERROR" ]; then
+                echo ""
+                echo "[VPN] SUCCESS! Connected via $COUNTRY ($IP)"
+                return 0
+              fi
+
+              conn_check=$((conn_check+1))
+            done
+
+            echo "[ERROR] Timeout waiting for VPN on this server"
+            echo "--- Last 30 lines of VPN log ---"
+            tail -30 vpn.log 2>/dev/null || echo "(no log)"
+            return 1
+          }
+
+          # Try up to 3 different VPN servers
+          MAX_SERVERS=3
+          for i in $(seq 1 $MAX_SERVERS); do
+            if try_vpn_server $i; then
+              echo "[VPN] VPN ESTABLISHED SUCCESSFULLY"
+              ip route show | head -5
               exit 0
             fi
-            COUNT=$((COUNT+1))
+            echo "[VPN] Server $i failed, trying another..."
+            sleep 5
           done
-          
-          echo "ERROR: Failed to establish non-US VPN connection after $((MAX_RETRIES * 10))s."
-          echo "--- VPN LOGS ---"
-          cat vpn.log
-          echo "--- ROUTING TABLE ---"
-          ip route show
+
+          echo ""
+          echo "=========================================="
+          echo "[FATAL] Failed to establish VPN after $MAX_SERVERS server attempts"
+          echo "=========================================="
           exit 1
+
       - name: Sync Global Metadata
         run: |
           TOP=${{ github.event.inputs.top_n || 50 }}
@@ -103,7 +145,7 @@ jobs:
 
       - name: Stop VPN
         if: always()
-        run: sudo killall openvpn || true
+        run: sudo killall openvpn 2>/dev/null || true
 
   run-scrapers:
     needs: sync-metadata
@@ -115,12 +157,12 @@ jobs:
       max-parallel: ${{ github.event.inputs.parallel_execution == 'true' && 2 || 1 }}
       matrix:
         scraper_type: [spot, futures]
-    
+
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       COINALYZE_API_KEY: ${{ secrets.COINALYZE_API_KEY }}
       PYTHONUNBUFFERED: "1"
-      
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -131,54 +173,94 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Setup VPN
+      - name: Setup VPN with multi-server retry
         run: |
           sudo apt-get update
           sudo apt-get install -y openvpn iproute2 curl
-          
+
           # Disable IPv6 to prevent leaks
           sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
           sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
-          
-          # Generate config
-          python get_vpn_config.py
-          
-          # Start OpenVPN in background
-          sudo openvpn --config client.ovpn --log vpn.log --daemon
-          
-          echo "Waiting for VPN connection to establish..."
-          MAX_RETRIES=15
-          COUNT=0
-          while [ $COUNT -lt $MAX_RETRIES ]; do
-            sleep 10
-            # Check if process is still running
-            if ! pgrep openvpn > /dev/null; then
-               echo "FATAL: OpenVPN process died!"
-               cat vpn.log
-               exit 1
+
+          # Function to attempt VPN connection with a single server
+          try_vpn_server() {
+            local attempt=$1
+            echo ""
+            echo "=========================================="
+            echo "[VPN] Server attempt $attempt/3"
+            echo "=========================================="
+
+            # Generate new config (picks random server from top candidates)
+            python get_vpn_config.py
+            if [ $? -ne 0 ]; then
+              echo "[ERROR] Failed to generate VPN config"
+              return 1
             fi
-            
-            # Check exit IP (multi-source for robustness)
-            IP_INFO=$(curl -s --connect-timeout 5 https://ipinfo.io/json || curl -s --connect-timeout 5 https://ifconfig.me/all.json || echo '{"country": "ERROR"}')
-            COUNTRY=$(echo $IP_INFO | grep -oP '"country": "\K[^"]+')
-            IP=$(echo $IP_INFO | grep -oP '"ip": "\K[^"]+')
-            echo "Current IP: $IP ($COUNTRY) [Attempt $((COUNT+1))/$MAX_RETRIES]"
-            
-            if [ "$COUNTRY" != "" ] && [ "$COUNTRY" != "US" ] && [ "$COUNTRY" != "ERROR" ]; then
-              echo "VPN ESTABLISHED: Exit IP is $IP ($COUNTRY)"
-              ip route show
+
+            # Kill any existing OpenVPN process
+            sudo killall openvpn 2>/dev/null || true
+            sleep 3
+
+            # Start OpenVPN
+            sudo openvpn --config client.ovpn --log vpn.log --daemon
+            sleep 5
+
+            # Wait for connection
+            echo "[VPN] Waiting for connection..."
+            local conn_check=0
+            local max_checks=8
+
+            while [ $conn_check -lt $max_checks ]; do
+              sleep 10
+
+              # Check if process is still running
+              if ! pgrep -x openvpn > /dev/null; then
+                echo "[ERROR] OpenVPN process died"
+                echo "--- Last 20 lines of VPN log ---"
+                tail -20 vpn.log 2>/dev/null || echo "(no log)"
+                return 1
+              fi
+
+              # Check exit IP
+              IP_INFO=$(curl -s --connect-timeout 8 https://ipinfo.io/json 2>/dev/null || echo '{"country":"ERROR"}')
+              COUNTRY=$(echo "$IP_INFO" | grep -oP '"country":\s*"\K[^"]+' || echo "ERROR")
+              IP=$(echo "$IP_INFO" | grep -oP '"ip":\s*"\K[^"]+' || echo "unknown")
+
+              echo "[VPN] IP: $IP, Country: $COUNTRY [Check $((conn_check+1))/$max_checks]"
+
+              if [ -n "$COUNTRY" ] && [ "$COUNTRY" != "US" ] && [ "$COUNTRY" != "ERROR" ]; then
+                echo ""
+                echo "[VPN] SUCCESS! Connected via $COUNTRY ($IP)"
+                return 0
+              fi
+
+              conn_check=$((conn_check+1))
+            done
+
+            echo "[ERROR] Timeout waiting for VPN on this server"
+            echo "--- Last 30 lines of VPN log ---"
+            tail -30 vpn.log 2>/dev/null || echo "(no log)"
+            return 1
+          }
+
+          # Try up to 3 different VPN servers
+          MAX_SERVERS=3
+          for i in $(seq 1 $MAX_SERVERS); do
+            if try_vpn_server $i; then
+              echo "[VPN] VPN ESTABLISHED SUCCESSFULLY"
+              ip route show | head -5
               exit 0
             fi
-            COUNT=$((COUNT+1))
+            echo "[VPN] Server $i failed, trying another..."
+            sleep 5
           done
-          
-          echo "ERROR: Failed to establish non-US VPN connection after $((MAX_RETRIES * 10))s."
-          echo "--- VPN LOGS ---"
-          cat vpn.log
-          echo "--- ROUTING TABLE ---"
-          ip route show
+
+          echo ""
+          echo "=========================================="
+          echo "[FATAL] Failed to establish VPN after $MAX_SERVERS server attempts"
+          echo "=========================================="
           exit 1
-          
+
       - name: Run Spot Scraper
         if: matrix.scraper_type == 'spot'
         run: |
@@ -193,4 +275,4 @@ jobs:
 
       - name: Stop VPN
         if: always()
-        run: sudo killall openvpn || true
+        run: sudo killall openvpn 2>/dev/null || true
