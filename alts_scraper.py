@@ -1214,19 +1214,45 @@ def merge_on_date(perp_csv_path: str, metrics: pd.DataFrame) -> None:
 class BinanceFuturesFetcher:
     """Fetcher for Binance USD-M Futures Direct API."""
     BASE_URL = "https://fapi.binance.com"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
 
-    def __init__(self, timeout: int = 15):
+    def __init__(self, timeout: int = 15, max_retries: int = 3):
         self.timeout = timeout
+        self.max_retries = max_retries
 
     def _get(self, endpoint: str, params: dict) -> Optional[dict]:
-        try:
-            resp = requests.get(f"{self.BASE_URL}{endpoint}", params=params, timeout=self.timeout)
-            if resp.status_code == 200:
-                return resp.json()
-            return None
-        except Exception as e:
-            print(f"    [Binance API Error] {e}")
-            return None
+        for attempt in range(self.max_retries):
+            try:
+                resp = requests.get(
+                    f"{self.BASE_URL}{endpoint}",
+                    params=params,
+                    headers=self.HEADERS,
+                    timeout=self.timeout
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                elif resp.status_code == 429:
+                    wait_time = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    print(f"    [Binance] Rate limited, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                elif resp.status_code in (403, 418, 451):
+                    print(f"    [Binance] IP blocked (HTTP {resp.status_code}), attempt {attempt+1}/{self.max_retries}")
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    print(f"    [Binance] HTTP {resp.status_code} for {endpoint}")
+                    return None
+            except requests.exceptions.Timeout:
+                print(f"    [Binance] Timeout, attempt {attempt+1}/{self.max_retries}")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"    [Binance API Error] {e}")
+                return None
+        return None
 
     def fetch_ls_ratios(self, symbol: str, period: str = "1d", limit: int = 30) -> pd.DataFrame:
         """Fetch historical Long/Short ratios in bulk (last 30 days max for Binance)."""
@@ -1243,6 +1269,7 @@ class BinanceFuturesFetcher:
             if not data: return pd.DataFrame()
             df = pd.DataFrame(data)
             df['date'] = pd.to_datetime(df['timestamp'].astype('int64'), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
+            df['longShortRatio'] = pd.to_numeric(df['longShortRatio'], errors='coerce')
             return df[['date', 'longShortRatio']].rename(columns={'longShortRatio': col_name})
 
         df_g = to_df(g_data, 'ls_acc_global')
@@ -1292,18 +1319,45 @@ class BinanceFuturesFetcher:
 class BybitFuturesFetcher:
     """Fetcher for Bybit V5 Futures Direct API."""
     BASE_URL = "https://api.bybit.com"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
 
-    def __init__(self, timeout: int = 15):
+    def __init__(self, timeout: int = 15, max_retries: int = 3):
         self.timeout = timeout
+        self.max_retries = max_retries
 
     def _get(self, endpoint: str, params: dict) -> Optional[dict]:
-        try:
-            resp = requests.get(f"{self.BASE_URL}{endpoint}", params=params, timeout=self.timeout)
-            if resp.status_code == 200: return resp.json()
-            return None
-        except Exception as e:
-            print(f"    [Bybit API Error] {e}")
-            return None
+        for attempt in range(self.max_retries):
+            try:
+                resp = requests.get(
+                    f"{self.BASE_URL}{endpoint}",
+                    params=params,
+                    headers=self.HEADERS,
+                    timeout=self.timeout
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                elif resp.status_code == 429:
+                    wait_time = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    print(f"    [Bybit] Rate limited, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                elif resp.status_code in (403, 418):
+                    print(f"    [Bybit] IP blocked (HTTP {resp.status_code}), attempt {attempt+1}/{self.max_retries}")
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    print(f"    [Bybit] HTTP {resp.status_code} for {endpoint}")
+                    return None
+            except requests.exceptions.Timeout:
+                print(f"    [Bybit] Timeout, attempt {attempt+1}/{self.max_retries}")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"    [Bybit API Error] {e}")
+                return None
+        return None
 
     def fetch_ls_ratios(self, symbol: str, limit: int = 500) -> pd.DataFrame:
         """Fetch historical Long/Short ratio in bulk."""
@@ -1358,20 +1412,48 @@ class BybitFuturesFetcher:
 class OKXFuturesFetcher:
     """Fetcher for OKX V5 Futures Direct API."""
     BASE_URL = "https://www.okx.com"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
 
-    def __init__(self, timeout: int = 15):
+    def __init__(self, timeout: int = 15, max_retries: int = 3):
         self.timeout = timeout
+        self.max_retries = max_retries
 
     def _get(self, endpoint: str, params: dict) -> Optional[dict]:
-        try:
-            resp = requests.get(f"{self.BASE_URL}{endpoint}", params=params, timeout=self.timeout)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("code") == "0": return data
-            return None
-        except Exception as e:
-            print(f"    [OKX API Error] {e}")
-            return None
+        for attempt in range(self.max_retries):
+            try:
+                resp = requests.get(
+                    f"{self.BASE_URL}{endpoint}",
+                    params=params,
+                    headers=self.HEADERS,
+                    timeout=self.timeout
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("code") == "0": return data
+                    print(f"    [OKX] API error code: {data.get('code')}, msg: {data.get('msg')}")
+                    return None
+                elif resp.status_code == 429:
+                    wait_time = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    print(f"    [OKX] Rate limited, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                elif resp.status_code in (403, 418, 451):
+                    print(f"    [OKX] IP blocked (HTTP {resp.status_code}), attempt {attempt+1}/{self.max_retries}")
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    print(f"    [OKX] HTTP {resp.status_code} for {endpoint}")
+                    return None
+            except requests.exceptions.Timeout:
+                print(f"    [OKX] Timeout, attempt {attempt+1}/{self.max_retries}")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"    [OKX API Error] {e}")
+                return None
+        return None
 
     def fetch_ls_ratios(self, symbol: str, limit: int = 180) -> pd.DataFrame:
         """Fetch historical Long/Short ratios in bulk."""
@@ -1389,6 +1471,7 @@ class OKXFuturesFetcher:
             if not data or not data.get("data"): return pd.DataFrame()
             df = pd.DataFrame(data["data"], columns=['ts', 'ratio'])
             df['date'] = pd.to_datetime(df['ts'].astype('int64'), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
+            df['ratio'] = pd.to_numeric(df['ratio'], errors='coerce')
             return df[['date', 'ratio']].rename(columns={'ratio': col_name})
 
         df_g = to_df(g_data, 'ls_acc_global')

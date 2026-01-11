@@ -21,6 +21,7 @@ Collect historical and real-time data for the top crypto tokens across multiple 
 - **Persistent Metadata**: DB-first architecture ensures metadata is synced to Supabase (only writes `data/asset_metadata.csv` if explicitly requested).
 - **Stateless Execution**: Optimized for GitHub Actions. Checks Supabase for the last existing data date to perform efficient incremental updates without local file persistence.
 - **Database Ready**: Complete PostgreSQL/Supabase schema with idempotent `reset_database.sql` script.
+- **Robust API Handling**: All exchange fetchers include retry logic with exponential backoff, proper User-Agent headers, and rate limit detection (HTTP 429/403/418).
 
 ---
 
@@ -74,6 +75,10 @@ The system is designed to run statelessly in the cloud. It will:
 2. Check the last sync date for each asset.
 3. Fetch only missing data (Incremental).
 4. Upsert results to the DB.
+
+**Configuration:**
+- **Timeout**: 90 minutes (to handle 50 tokens × 3 exchanges with rate limiting)
+- **Retry Logic**: Exponential backoff (1s, 2s, 4s) on rate limits (429) and IP blocks (403/418)
 
 **Recommended Schedule:**
 - **01:00 AM Madrid**: Daily Close (Finalizes previous day).
@@ -230,6 +235,25 @@ erDiagram
 | **Liquidations**| `liq_longs`, `liq_shorts`, `liq_total` |
 | **OHLCV** | `price_open`, `price_high`, `price_low`, `price_close`, `volume_base`, `volume_usd` |
 | **Metrics** | `ls_acc_global`, `ls_acc_top`, `ls_pos_top`, `txn_count`, `buy_txn_count`, `sell_txn_count`, **`volume_delta`** (Buy-Sell) |
+
+---
+
+## 🔧 Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| `[Binance] IP blocked (HTTP 403)` | GitHub Actions IPs rate-limited | Retry logic handles this automatically (3 attempts with backoff) |
+| `ls_acc_global`, `ls_acc_top` are NULL | API returns ratio as string | Fixed: numeric conversion applied to all L/S ratio columns |
+| Timeout after 60 minutes | Too many tokens/exchanges | Increased to 90 minutes; consider reducing `--top` |
+| OKX spot "today" data missing | Symbol format mismatch | Fixed: Uses `{BASE}-USDT` format correctly |
+
+### Debug Logs
+The scrapers now output detailed logs for API issues:
+- `[Exchange] Rate limited, waiting Xs...` - Rate limit hit, auto-retry
+- `[Exchange] IP blocked (HTTP 4xx)` - Blocked by exchange, auto-retry
+- `[Exchange] Timeout, attempt X/3` - Connection timeout, auto-retry
 
 ---
 
