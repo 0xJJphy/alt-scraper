@@ -25,6 +25,7 @@ import requests
 import pandas as pd
 import psycopg2
 import warnings
+import concurrent.futures
 from psycopg2.extras import execute_values
 from datetime import datetime, timedelta, timezone, time as dtime
 
@@ -363,9 +364,15 @@ def get_incremental_start(path: str, default_start_sec: int, symbol: str, exchan
 
     # Return logic
     if last_date:
-        # Re-fetch the last 2 days to ensure completeness
-        start_dt = last_date - timedelta(days=2)
-        return max(default_start_sec, to_unix_seconds(start_dt))
+        # Re-fetch the last 7 days to ensure completeness (Hybrid patching)
+        fast_forward_sec = to_unix_seconds(last_date - timedelta(days=7))
+        
+        # If the requested start is OLDER than the fast-forward point, respect the user's start
+        # This allows for manual backfills/re-scrapes
+        if default_start_sec < fast_forward_sec and default_start_sec > 1483228800: # 1483228800 = 2017-01-01
+             return default_start_sec
+             
+        return fast_forward_sec
         
     return default_start_sec
 
@@ -1018,277 +1025,108 @@ class CoinalyzeClient:
 # Native Exchange Fetchers
 # ==============================================================================
 
-class NativeFuturesFetcher:
-    """Fetcher for native exchange APIs (Binance, Bybit, OKX)."""
+class BinanceFuturesFetcher:
+    """Fetcher for Binance Futures API."""
+    def __init__(self):
+        self.base_url = BINANCE_FUTURES_API
 
-    @staticmethod
-    def fetch_binance_core(symbol: str, start_sec: int, end_sec: int) -> pd.DataFrame:
-        """Fetch Price, Volume, OI, and Funding from Binance."""
-        base_url = BINANCE_FUTURES_API
-        sym = symbol.split('.')[0].replace('_PERP', '') # BTCUSDT_PERP -> BTCUSDT
-        try:
-            params = {
-                "symbol": sym,
-                "interval": "1d",
-                "startTime": start_sec * 1000,
-                "endTime": end_sec * 1000,
-                "limit": 1000
-            }
-            resp = requests.get(f"{base_url}/fapi/v1/klines", params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            if not data: return pd.DataFrame()
-            
-            df = pd.DataFrame(data, columns=['t', 'o', 'h', 'l', 'c', 'v', 'ct', 'q', 'n', 'bv', 'bq', 'i'])
-            df['date'] = pd.to_datetime(df['t'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-            df.rename(columns={'o':'price_open', 'h':'price_high', 'l':'price_low', 'c':'price_close', 
-                             'v':'volume_base', 'bv':'buy_volume_base', 'q':'volume_usd', 'n':'txn_count'}, inplace=True)
-            
-            # Numeric conversion
-            for col in ['price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'buy_volume_base', 'volume_usd']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            return df[['date', 'price_open', 'price_high', 'price_low', 'price_close', 
-                      'volume_base', 'buy_volume_base', 'volume_usd', 'txn_count']]
-        except Exception as e:
-            print(f"    [Binance Native Error] {e}")
-            return pd.DataFrame()
-
-    @staticmethod
-    def fetch_binance_oi_funding_ls(symbol: str, start_sec: int, end_sec: int) -> pd.DataFrame:
-        """Fetch OI, Funding, and L/S ratio from Binance."""
-        base_url = BINANCE_FUTURES_API
+    def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
+        """Fetch today's open candle data."""
         sym = symbol.split('.')[0].replace('_PERP', '')
         try:
-            # OI History
-            oi_resp = requests.get(f"{base_url}/fapi/v1/openInterestHist", 
-                                  params={"symbol": sym, "period": "1d", "startTime": start_sec * 1000, "endTime": end_sec * 1000, "limit": 500})
-            oi_data = oi_resp.json()
-            df_oi = pd.DataFrame(oi_data)
-            if not df_oi.empty:
-                df_oi['date'] = pd.to_datetime(df_oi['timestamp'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-                df_oi.rename(columns={'sumOpenInterest':'oi_usd_close'}, inplace=True) # Usually it is sumOpenInterestValue for USD
-                # Binance has sumOpenInterest (base) and sumOpenInterestValue (quote)
-                if 'sumOpenInterestValue' in df_oi.columns:
-                    df_oi.rename(columns={'sumOpenInterestValue':'oi_usd_close'}, inplace=True)
-                df_oi = df_oi[['date', 'oi_usd_close']]
+            params = {"symbol": sym, "interval": "1d", "limit": 1}
+            resp = requests.get(f"{self.base_url}/fapi/v1/klines", params=params)
+            data = resp.json()
+            if not data: return None
+            k = data[0]
+            return {
+                "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
+                "volume_base": float(k[5]), "volume_usd": float(k[7]), "txn_count": int(k[8]),
+                "buy_volume_base": float(k[9])
+            }
+        except: return None
 
-            # Funding History
-            f_resp = requests.get(f"{base_url}/fapi/v1/fundingRate", 
-                                 params={"symbol": sym, "startTime": start_sec * 1000, "endTime": end_sec * 1000, "limit": 1000})
-            f_data = f_resp.json()
-            df_f = pd.DataFrame(f_data)
-            if not df_f.empty:
-                df_f['date'] = pd.to_datetime(df_f['fundingTime'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-                df_f.rename(columns={'fundingRate':'funding_close'}, inplace=True)
-                # Resample or take last per day
-                df_f = df_f.groupby('date').last().reset_index()[['date', 'funding_close']]
+    def fetch_ls_ratios(self, symbol: str) -> Dict:
+        """Fetch latest L/S ratios (Global, Top Account, Top Position)."""
+        sym = symbol.split('.')[0].replace('_PERP', '')
+        res = {}
+        try:
+            # Global
+            r1 = requests.get(f"{self.base_url}/futures/data/globalLongShortAccountRatio", params={"symbol": sym, "period": "1d", "limit": 1}).json()
+            if r1: res['ls_acc_global'] = float(r1[0]['longShortRatio'])
+            # Top Account
+            r2 = requests.get(f"{self.base_url}/futures/data/topLongShortAccountRatio", params={"symbol": sym, "period": "1d", "limit": 1}).json()
+            if r2: res['ls_acc_top'] = float(r2[0]['longShortRatio'])
+            # Top Position
+            r3 = requests.get(f"{self.base_url}/futures/data/topLongShortPositionRatio", params={"symbol": sym, "period": "1d", "limit": 1}).json()
+            if r3: res['ls_pos_top'] = float(r3[0]['longShortRatio'])
+        except: pass
+        return res
 
-            # Long/Short Global Ratio
-            ls_resp = requests.get(f"{base_url}/futures/data/globalLongShortAccountRatio", 
-                                  params={"symbol": sym, "period": "1d", "startTime": start_sec * 1000, "endTime": end_sec * 1000, "limit": 500})
-            ls_data = ls_resp.json()
-            df_ls = pd.DataFrame(ls_data)
-            if not df_ls.empty:
-                df_ls['date'] = pd.to_datetime(df_ls['timestamp'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-                df_ls.rename(columns={'longShortRatio':'ls_acc_global'}, inplace=True)
-                df_ls['ls_ratio'] = df_ls['ls_acc_global']
-                df_ls = df_ls[['date', 'ls_ratio', 'ls_acc_global']]
-            
-            # Top Trader Account Ratio
-            ls_top_resp = requests.get(f"{base_url}/futures/data/topLongShortAccountRatio", 
-                                  params={"symbol": sym, "period": "1d", "startTime": start_sec * 1000, "endTime": end_sec * 1000, "limit": 500})
-            ls_top_data = ls_top_resp.json()
-            df_ls_top = pd.DataFrame(ls_top_data)
-            if not df_ls_top.empty:
-                df_ls_top['date'] = pd.to_datetime(df_ls_top['timestamp'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-                df_ls_top.rename(columns={'longShortRatio':'ls_acc_top'}, inplace=True)
-                df_ls_top = df_ls_top[['date', 'ls_acc_top']]
+class BybitFuturesFetcher:
+    """Fetcher for Bybit V5 API."""
+    def __init__(self):
+        self.base_url = BYBIT_V5_API
 
-            # Top Trader Position Ratio
-            ls_pos_resp = requests.get(f"{base_url}/futures/data/topLongShortPositionRatio", 
-                                  params={"symbol": sym, "period": "1d", "startTime": start_sec * 1000, "endTime": end_sec * 1000, "limit": 500})
-            ls_pos_data = ls_pos_resp.json()
-            df_ls_pos = pd.DataFrame(ls_pos_data)
-            if not df_ls_pos.empty:
-                df_ls_pos['date'] = pd.to_datetime(df_ls_pos['timestamp'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-                df_ls_pos.rename(columns={'longShortRatio':'ls_pos_top'}, inplace=True)
-                df_ls_pos = df_ls_pos[['date', 'ls_pos_top']]
-            
-            # Merge all
-            dfs = [d for d in [df_oi if 'df_oi' in locals() else None, 
-                               df_f if 'df_f' in locals() else None, 
-                               df_ls if 'df_ls' in locals() else None,
-                               df_ls_top if 'df_ls_top' in locals() else None,
-                               df_ls_pos if 'df_ls_pos' in locals() else None] if d is not None]
-            if not dfs: return pd.DataFrame()
-            
-            res = dfs[0]
-            for d in dfs[1:]: res = res.merge(d, on='date', how='outer')
-            return res
-        except Exception as e:
-            print(f"    [Binance Metrics Error] {e}")
-            return pd.DataFrame()
-
-    @staticmethod
-    def fetch_bybit_metrics(symbol: str, start_sec: int, end_sec: int) -> pd.DataFrame:
-        """Fetch OI, Funding, and L/S ratio from Bybit V5."""
+    def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
         sym = symbol.split('.')[0]
         try:
-            # OI
-            oi_resp = requests.get(f"{BYBIT_V5_API}/market/open-interest", 
-                                   params={"category": "linear", "symbol": sym, "intervalTime": "1d", "startTime": start_sec * 1000, "endTime": end_sec * 1000})
-            oi_data = oi_resp.json().get("result", {}).get("list", [])
-            df_oi = pd.DataFrame(oi_data)
-            if not df_oi.empty:
-                df_oi['date'] = pd.to_datetime(pd.to_numeric(df_oi['timestamp']), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-                df_oi.rename(columns={'openInterest':'oi_usd_close'}, inplace=True)
-                df_oi = df_oi[['date', 'oi_usd_close']]
+            params = {"category": "linear", "symbol": sym, "interval": "D", "limit": 1}
+            resp = requests.get(f"{self.base_url}/market/kline", params=params).json()
+            data = resp.get("result", {}).get("list", [])
+            if not data: return None
+            k = data[0]
+            return {
+                "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
+                "volume_base": float(k[5]), "volume_usd": float(k[6])
+            }
+        except: return None
 
-            # Funding
-            f_resp = requests.get(f"{BYBIT_V5_API}/market/funding/history", 
-                                 params={"category": "linear", "symbol": sym, "startTime": start_sec * 1000, "endTime": end_sec * 1000})
-            f_data = f_resp.json().get("result", {}).get("list", [])
-            df_f = pd.DataFrame(f_data)
-            if not df_f.empty:
-                df_f['date'] = pd.to_datetime(pd.to_numeric(df_f['fundingRateTimestamp']), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-                df_f.rename(columns={'fundingRate':'funding_close'}, inplace=True)
-                df_f = df_f.groupby('date').last().reset_index()[['date', 'funding_close']]
+    def fetch_ls_ratios(self, symbol: str) -> Dict:
+        sym = symbol.split('.')[0]
+        res = {}
+        try:
+            r = requests.get(f"{self.base_url}/market/account-ratio", params={"category": "linear", "symbol": sym, "period": "1d", "limit": 1}).json()
+            data = r.get("result", {}).get("list", [])
+            if data:
+                val = float(data[0].get('buyRatio', 0)) / float(data[0].get('sellRatio', 1))
+                res['ls_acc_global'] = val
+        except: pass
+        return res
 
-            # Long/Short Account Ratio
-            ls_resp = requests.get(f"{BYBIT_V5_API}/market/account-ratio", 
-                                  params={"category": "linear", "symbol": sym, "period": "1d", "startTime": start_sec * 1000, "endTime": end_sec * 1000})
-            ls_data = ls_resp.json().get("result", {}).get("list", [])
-            df_ls = pd.DataFrame(ls_data)
-            if not df_ls.empty:
-                df_ls['date'] = pd.to_datetime(pd.to_numeric(df_ls['timestamp']), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-                if 'buyRatio' in df_ls.columns and 'sellRatio' in df_ls.columns:
-                    df_ls['ls_ratio'] = pd.to_numeric(df_ls['buyRatio']) / pd.to_numeric(df_ls['sellRatio'])
-                elif 'accountRatio' in df_ls.columns:
-                    df_ls.rename(columns={'accountRatio':'ls_ratio'}, inplace=True)
-                
-                if 'ls_ratio' in df_ls.columns:
-                    df_ls.rename(columns={'ls_ratio':'ls_acc_global'}, inplace=True)
-                    df_ls['ls_ratio'] = df_ls['ls_acc_global']
-                    df_ls = df_ls[['date', 'ls_ratio', 'ls_acc_global']]
-                else:
-                    df_ls = pd.DataFrame()
+class OKXFuturesFetcher:
+    """Fetcher for OKX V5 API."""
+    def __init__(self):
+        self.base_url = OKX_V5_API
 
-            dfs = [d for d in [df_oi if 'df_oi' in locals() else None, 
-                               df_f if 'df_f' in locals() else None, 
-                               df_ls if 'df_ls' in locals() else None] if d is not None]
-            if not dfs: return pd.DataFrame()
-            res = dfs[0]
-            for d in dfs[1:]: res = res.merge(d, on='date', how='outer')
-            return res
-        except Exception as e:
-            print(f"    [Bybit Metrics Error] {e}")
-            return pd.DataFrame()
-
-    @staticmethod
-    def fetch_okx_metrics(symbol: str, start_sec: int, end_sec: int) -> pd.DataFrame:
-        """Fetch OI, Funding from OKX V5."""
+    def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
         sym = symbol.split('.')[0].replace('USDT_PERP', '-USDT-SWAP')
         try:
-            # OI
-            oi_resp = requests.get(f"{OKX_V5_API}/market/open-interest", params={"instId": sym})
-            # OKX OI history is in public statistical data, but let's use the current one if recent
-            # For brevity and consistency, OKX is better handled hybridly
-            return pd.DataFrame()
-        except Exception as e:
-            return pd.DataFrame()
-
-    @staticmethod
-    def fetch_bybit_core(symbol: str, start_sec: int, end_sec: int) -> pd.DataFrame:
-        """Fetch Price, Volume from Bybit V5."""
-        try:
-            params = {
-                "category": "linear",
-                "symbol": symbol.split('.')[0],
-                "interval": "D",
-                "start": start_sec * 1000,
-                "end": end_sec * 1000,
-                "limit": 1000
+            params = {"instId": sym, "bar": "1D", "limit": 1}
+            resp = requests.get(f"{self.base_url}/market/candles", params=params).json()
+            data = resp.get("data", [])
+            if not data: return None
+            k = data[0]
+            return {
+                "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
+                "volume_base": float(k[5]), "volume_usd": float(k[7])
             }
-            resp = requests.get(f"{BYBIT_V5_API}/market/kline", params=params)
-            resp.raise_for_status()
-            result = resp.json().get("result", {})
-            data = result.get("list", [])
-            if not data: return pd.DataFrame()
-            
-            df = pd.DataFrame(data, columns=['t', 'o', 'h', 'l', 'c', 'v', 'q'])
-            df['date'] = pd.to_datetime(pd.to_numeric(df['t']), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-            df.rename(columns={'o':'price_open', 'h':'price_high', 'l':'price_low', 'c':'price_close', 
-                             'v':'volume_base', 'q':'volume_usd'}, inplace=True)
-            return df[['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd']]
-        except Exception as e:
-            print(f"    [Bybit Native Error] {e}")
-            return pd.DataFrame()
+        except: return None
 
-    @staticmethod
-    def fetch_okx_core(symbol: str, start_sec: int, end_sec: int) -> pd.DataFrame:
-        """Fetch Price, Volume from OKX V5."""
-        try:
-            # OKX symbol on exchange: symbol_on_exchange (usually BASE-USDT-SWAP)
-            # For simplicity, we assume symbol mapping exists in CoinalyzeClient
-            # But here we need the native symbol.
-            native_symbol = symbol.split('.')[0].replace('USDT_PERP', '-USDT-SWAP')
-            # In OKX v5, 'after' means fetch data older than after (TS)
-            # 'before' means fetch data newer than before (TS)
-            # To get range [start, end]:
-            # after = end_ts + 1 day, before = start_ts - 1 day
-            params = {
-                "instId": native_symbol,
-                "bar": "1D",
-                "after": (start_sec - 86400) * 1000, 
-                "before": (end_sec + 86400) * 1000,
-                "limit": 100
-            }
-            resp = requests.get(f"{OKX_V5_API}/market/history-candles", params=params)
-            resp.raise_for_status()
-            data = resp.json().get("data", [])
-            if not data: return pd.DataFrame()
-            
-            df = pd.DataFrame(data, columns=['t', 'o', 'h', 'l', 'c', 'vol', 'volCcy', 'volCcyQuote', 'confirm'])
-            df['date'] = pd.to_datetime(pd.to_numeric(df['t']), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-            df.rename(columns={'o':'price_open', 'h':'price_high', 'l':'price_low', 'c':'price_close', 
-                             'vol':'volume_base', 'volCcyQuote':'volume_usd'}, inplace=True)
-            return df[['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd']]
-        except Exception as e:
-            print(f"    [OKX Native Error] {e}")
-            return pd.DataFrame()
-
-    @staticmethod
-    def fetch_okx_ls_rubik(base: str) -> pd.DataFrame:
-        """Fetch multiple Long/Short Ratios from OKX Rubik API."""
+    def fetch_ls_ratios(self, symbol: str) -> Dict:
+        # OKX uses base asset for Rubik stats
+        base = symbol.split('USDT')[0]
+        res = {}
         try:
             params = {"ccy": base.upper(), "period": "1D"}
-            # Global Account Ratio
-            r1 = requests.get(f"{OKX_V5_API}/rubik/stat/contracts/long-short-account-ratio", params=params).json().get("data", [])
-            df1 = pd.DataFrame(r1, columns=['t', 'ls_acc_global']) if r1 else pd.DataFrame()
-            
-            # Top Trader Account Ratio
-            r2 = requests.get(f"{OKX_V5_API}/rubik/stat/contracts/top-traders-long-short-account-ratio", params=params).json().get("data", [])
-            df2 = pd.DataFrame(r2, columns=['t', 'ls_acc_top']) if r2 else pd.DataFrame()
-            
-            # Top Trader Position Ratio
-            r3 = requests.get(f"{OKX_V5_API}/rubik/stat/contracts/top-traders-long-short-position-ratio", params=params).json().get("data", [])
-            df3 = pd.DataFrame(r3, columns=['t', 'ls_pos_top']) if r3 else pd.DataFrame()
-            
-            dfs = [d for d in [df1, df2, df3] if not d.empty]
-            if not dfs: return pd.DataFrame()
-            
-            res = dfs[0]
-            for d in dfs[1:]: res = res.merge(d, on='t', how='outer')
-            
-            res['date'] = pd.to_datetime(pd.to_numeric(res['t']), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-            if 'ls_acc_global' in res.columns:
-                res['ls_ratio'] = res['ls_acc_global']
-            return res.drop(columns=['t'])
-        except Exception as e:
-            print(f"    [OKX Rubik Error] {e}")
-            return pd.DataFrame()
-
+            r1 = requests.get(f"{self.base_url}/rubik/stat/contracts/long-short-account-ratio", params=params).json().get("data", [])
+            if r1: res['ls_acc_global'] = float(r1[0][1])
+            r2 = requests.get(f"{self.base_url}/rubik/stat/contracts/top-traders-long-short-account-ratio", params=params).json().get("data", [])
+            if r2: res['ls_acc_top'] = float(r2[0][1])
+            r3 = requests.get(f"{self.base_url}/rubik/stat/contracts/top-traders-long-short-position-ratio", params=params).json().get("data", [])
+            if r3: res['ls_pos_top'] = float(r3[0][1])
+        except: pass
+        return res
 
 # ==============================================================================
 # Data Merge Utilities
@@ -1368,89 +1206,282 @@ def merge_on_date(perp_csv_path: str, metrics: pd.DataFrame) -> None:
 
 
 # ==============================================================================
+# Exchange Direct APIs (Hybrid Patching)
+# ==============================================================================
+
+class BinanceFuturesFetcher:
+    """Fetcher for Binance USD-M Futures Direct API."""
+    BASE_URL = "https://fapi.binance.com"
+
+    def __init__(self, timeout: int = 15):
+        self.timeout = timeout
+
+    def _get(self, endpoint: str, params: dict) -> Optional[dict]:
+        try:
+            resp = requests.get(f"{self.BASE_URL}{endpoint}", params=params, timeout=self.timeout)
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except Exception as e:
+            print(f"    [Binance API Error] {e}")
+            return None
+
+    def fetch_ls_ratios(self, symbol: str, period: str = "1d", limit: int = 30) -> pd.DataFrame:
+        """Fetch historical Long/Short ratios in bulk (last 30 days max for Binance)."""
+        clean_symbol = symbol.split('.')[0].replace('_PERP', '') 
+        
+        # 1. Global L/S Account Ratio
+        g_data = self._get("/fapi/v1/data/globalLongShortAccountRatio", {"symbol": clean_symbol, "period": period, "limit": limit})
+        # 2. Top Trader L/S Account Ratio
+        a_data = self._get("/fapi/v1/data/topLongShortAccountRatio", {"symbol": clean_symbol, "period": period, "limit": limit})
+        # 3. Top Trader L/S Position Ratio
+        p_data = self._get("/fapi/v1/data/topLongShortPositionRatio", {"symbol": clean_symbol, "period": period, "limit": limit})
+
+        def to_df(data, col_name):
+            if not data: return pd.DataFrame()
+            df = pd.DataFrame(data)
+            df['date'] = pd.to_datetime(df['timestamp'].astype('int64'), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
+            return df[['date', 'longShortRatio']].rename(columns={'longShortRatio': col_name})
+
+        df_g = to_df(g_data, 'ls_acc_global')
+        df_a = to_df(a_data, 'ls_acc_top')
+        df_p = to_df(p_data, 'ls_pos_top')
+
+        # Merge them
+        res = pd.DataFrame()
+        for df in [df_g, df_a, df_p]:
+            if df.empty: continue
+            if res.empty: res = df
+            else: res = res.merge(df, on='date', how='outer')
+        return res
+
+    def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
+        """Fetch today's open candle data."""
+        clean_symbol = symbol.split('.')[0].replace('_PERP', '')
+        data = self._get("/fapi/v1/klines", {"symbol": clean_symbol, "interval": "1d", "limit": 1})
+        if not data: return None
+        k = data[0]
+        return {
+            "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
+            "volume_base": float(k[5]), "volume_usd": float(k[7]), "txn_count": int(k[8]),
+            "buy_volume_base": float(k[9])
+        }
+
+class BybitFuturesFetcher:
+    """Fetcher for Bybit V5 Futures Direct API."""
+    BASE_URL = "https://api.bybit.com"
+
+    def __init__(self, timeout: int = 15):
+        self.timeout = timeout
+
+    def _get(self, endpoint: str, params: dict) -> Optional[dict]:
+        try:
+            resp = requests.get(f"{self.BASE_URL}{endpoint}", params=params, timeout=self.timeout)
+            if resp.status_code == 200: return resp.json()
+            return None
+        except Exception as e:
+            print(f"    [Bybit API Error] {e}")
+            return None
+
+    def fetch_ls_ratios(self, symbol: str, limit: int = 500) -> pd.DataFrame:
+        """Fetch historical Long/Short ratio in bulk."""
+        clean_symbol = symbol.split('.')[0]
+        data = self._get("/v5/market/account-ratio", {"category": "linear", "symbol": clean_symbol, "period": "1d", "limit": limit})
+        if not data or data.get("retCode") != 0: return pd.DataFrame()
+        
+        list_data = data.get("result", {}).get("list", [])
+        if not list_data: return pd.DataFrame()
+        
+        df = pd.DataFrame(list_data)
+        df['date'] = pd.to_datetime(df['timestamp'].astype('int64'), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
+        # Calculate ratio from buy/sell components
+        df['ls_acc_global'] = pd.to_numeric(df['buyRatio']) / pd.to_numeric(df['sellRatio'])
+        return df[['date', 'ls_acc_global']]
+
+    def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
+        clean_symbol = symbol.split('.')[0]
+        data = self._get("/v5/market/kline", {"category": "linear", "symbol": clean_symbol, "interval": "D", "limit": 1})
+        if not data or data.get("retCode") != 0: return None
+        list_data = data.get("result", {}).get("list", [])
+        if not list_data: return None
+        k = list_data[0]
+        return {
+            "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
+            "volume_base": float(k[5]), "volume_usd": float(k[6])
+        }
+
+class OKXFuturesFetcher:
+    """Fetcher for OKX V5 Futures Direct API."""
+    BASE_URL = "https://www.okx.com"
+
+    def __init__(self, timeout: int = 15):
+        self.timeout = timeout
+
+    def _get(self, endpoint: str, params: dict) -> Optional[dict]:
+        try:
+            resp = requests.get(f"{self.BASE_URL}{endpoint}", params=params, timeout=self.timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") == "0": return data
+            return None
+        except Exception as e:
+            print(f"    [OKX API Error] {e}")
+            return None
+
+    def fetch_ls_ratios(self, symbol: str, limit: int = 180) -> pd.DataFrame:
+        """Fetch historical Long/Short ratios in bulk."""
+        base = symbol.split('USDT')[0].split('.')[0]
+        clean_symbol = f"{base}-USDT-SWAP"
+        
+        # 1. Global
+        g_data = self._get("/api/v5/rubik/stat/contracts/long-short-account-ratio", {"instId": clean_symbol, "period": "1D"})
+        # 2. Top Account
+        a_data = self._get("/api/v5/rubik/stat/contracts/top-traders-long-short-account-ratio", {"instId": clean_symbol, "period": "1D"})
+        # 3. Top Position
+        p_data = self._get("/api/v5/rubik/stat/contracts/top-traders-long-short-position-ratio", {"instId": clean_symbol, "period": "1D"})
+
+        def to_df(data, col_name):
+            if not data or not data.get("data"): return pd.DataFrame()
+            df = pd.DataFrame(data["data"], columns=['ts', 'ratio'])
+            df['date'] = pd.to_datetime(df['ts'].astype('int64'), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
+            return df[['date', 'ratio']].rename(columns={'ratio': col_name})
+
+        df_g = to_df(g_data, 'ls_acc_global')
+        df_a = to_df(a_data, 'ls_acc_top')
+        df_p = to_df(p_data, 'ls_pos_top')
+
+        res = pd.DataFrame()
+        for df in [df_g, df_a, df_p]:
+            if df.empty: continue
+            if res.empty: res = df
+            else: res = res.merge(df, on='date', how='outer')
+        return res
+
+    def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
+        base = symbol.split('USDT')[0].split('.')[0]
+        clean_symbol = f"{base}-USDT-SWAP"
+        data = self._get("/api/v5/market/candles", {"instId": clean_symbol, "bar": "1D", "limit": 1})
+        if not data: return None
+        list_data = data.get("data", [])
+        if not list_data: return None
+        k = list_data[0]
+        return {
+            "price_open": float(k[1]), "price_high": float(k[2]), "price_low": float(k[3]), "price_close": float(k[4]),
+            "volume_base": float(k[5]), "volume_usd": float(k[7])
+        }
+
+# ==============================================================================
 # Hybrid Sourcing Manager
 # ==============================================================================
 
-def fetch_hybrid_futures_data(client: CoinalyzeClient, native: NativeFuturesFetcher, 
+# Global instances for fetchers to reuse connections
+GLOBAL_FETCHERS = {
+    "binance": BinanceFuturesFetcher(),
+    "bybit": BybitFuturesFetcher(),
+    "okx": OKXFuturesFetcher()
+}
+
+def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: str) -> pd.DataFrame:
+    """Bulk update missing columns using direct exchange APIs."""
+    if exchange.lower() not in GLOBAL_FETCHERS: return df
+    fetcher = GLOBAL_FETCHERS[exchange.lower()]
+    
+    # 1. Initialize metric columns if they don't exist
+    target_cols = ['ls_acc_global', 'ls_acc_top', 'ls_pos_top', 
+                   'buy_volume_base', 'sell_volume_base', 'volume_delta', 
+                   'txn_count', 'buy_txn_count', 'sell_txn_count']
+    for col in target_cols:
+        if col not in df.columns:
+            df[col] = None
+
+    # 2. Ensure Today's Data
+    today_str = datetime.now(UTC).strftime('%Y-%m-%d')
+    if df.empty or not (df['date'] == today_str).any():
+        print(f"    [Hybrid] Fetching current day open candle from {exchange.upper()}...")
+        today_data = fetcher.fetch_current_day_data(symbol)
+        if today_data:
+            today_row = pd.DataFrame([today_data])
+            today_row['date'] = today_str
+            today_row['symbol'] = symbol
+            today_row['exchange'] = exchange
+            today_row['base_asset'] = base
+            df = pd.concat([df, today_row], ignore_index=True)
+            
+    if df.empty: return df
+    
+    # 3. Bulk Patch Missing Metrics (L/S Ratios)
+    ls_cols = ['ls_acc_global', 'ls_acc_top', 'ls_pos_top']
+    missing_any = any(col in df.columns and pd.isna(df[col]).any() for col in ls_cols) or \
+                  any(col not in df.columns for col in ls_cols)
+    
+    if missing_any:
+        print(f"    [Hybrid] Fetching historical L/S metrics in bulk from {exchange.upper()}...")
+        limit = 30 if exchange.lower() == "binance" else 180 if exchange.lower() == "okx" else 500
+        df_history = fetcher.fetch_ls_ratios(symbol, limit=limit)
+        
+        if not df_history.empty:
+            df = df.merge(df_history, on='date', how='left', suffixes=('', '_new'))
+            for col in ls_cols:
+                new_col = f"{col}_new"
+                if new_col in df.columns:
+                    df[col] = df[col].fillna(df[new_col])
+                    df.drop(columns=[new_col], inplace=True)
+    
+    # 4. Final Consistency Fix (Calculate Sell/Delta if components exist)
+    if 'volume_base' in df.columns and 'buy_volume_base' in df.columns:
+        # Fill sell_volume if missing
+        df['sell_volume_base'] = df['sell_volume_base'].fillna(df['volume_base'] - df['buy_volume_base'])
+        # Always recalculate volume_delta if we have both buy/sell
+        df['volume_delta'] = df['buy_volume_base'] - df['sell_volume_base']
+        
+    if 'txn_count' in df.columns and 'buy_txn_count' in df.columns:
+        # Calculate sell_txn_count
+        df['sell_txn_count'] = df['txn_count'] - df['buy_txn_count']
+
+    # 5. Final Cleanup
+    if not df.empty:
+        df.drop_duplicates(subset=['date'], keep='last', inplace=True)
+        
+    return df
+
+def fetch_hybrid_futures_data(client: CoinalyzeClient,
                              token: str, exchange: str, symbol: str,
                              start_sec: int, end_sec: int) -> pd.DataFrame:
-    """
-    Manager to fetch data from native APIs or Coinalyze based on Smart Sourcing logic.
-    """
-    days_requested = (end_sec - start_sec) / 86400
-    use_native = days_requested <= 35 and exchange.lower() in ["binance", "bybit", "okx"]
+    """Manager to fetch data from native APIs or Coinalyze based on Smart Sourcing."""
+    print(f"    [Source] Coinalyze + Native Patches")
     
-    # Always fetch Specialized metrics from Coinalyze (except OKX L/S)
-    # Metrics: Liquidations, Predicted Funding, Long/Short Ratio (for history > 30d)
-    
-    print(f"    [Source] {'Native+Coinalyze' if use_native else 'Coinalyze'}")
-    
-    # 1. Fetch Coinalyze metrics (historical/specialized)
-    # We use a subset of METRIC_CALLS to avoid redundant fetching if native is used
     dfs = []
-    
-    # Always Coinalyze: Liquidations
+    # 1. Fetch bulk history from Coinalyze
     df_liq = client.liquidation_daily(symbol, start_sec, end_sec)
     if not df_liq.empty: dfs.append(df_liq)
     
-    # Specialized: Pred Funding
     df_pred = client.predicted_funding_rate_daily(symbol, start_sec, end_sec)
     if not df_pred.empty: dfs.append(df_pred)
 
-    if use_native:
-        # Native Path
-        if exchange.lower() == "binance":
-            df_core = native.fetch_binance_core(symbol, start_sec, end_sec)
-            df_metrics = native.fetch_binance_oi_funding_ls(symbol, start_sec, end_sec)
-            if not df_core.empty: dfs.append(df_core)
-            if not df_metrics.empty: dfs.append(df_metrics)
-        elif exchange.lower() == "bybit":
-            df_core = native.fetch_bybit_core(symbol, start_sec, end_sec)
-            df_metrics = native.fetch_bybit_metrics(symbol, start_sec, end_sec)
-            if not df_core.empty: dfs.append(df_core)
-            if not df_metrics.empty: dfs.append(df_metrics)
-        elif exchange.lower() == "okx":
-            df_core = native.fetch_okx_core(symbol, start_sec, end_sec)
-            df_ls = native.fetch_okx_ls_rubik(token)
-            if not df_core.empty: dfs.append(df_core)
-            if not df_ls.empty: dfs.append(df_ls)
-            
-            # OKX OI/Funding from Coinalyze for now as they are harder natively
-            df_oi = client.open_interest_daily(symbol, start_sec, end_sec)
-            df_f = client.funding_rate_daily(symbol, start_sec, end_sec)
-            if not df_oi.empty: dfs.append(df_oi)
-            if not df_f.empty: dfs.append(df_f)
-    else:
-        # Full Coinalyze Path (Backfill)
-        df_oi = client.open_interest_daily(symbol, start_sec, end_sec)
-        df_f = client.funding_rate_daily(symbol, start_sec, end_sec)
-        df_ls = client.long_short_ratio_daily(symbol, start_sec, end_sec)
-        df_ohlcv = client.ohlcv_daily(symbol, start_sec, end_sec)
-        
-        if not df_oi.empty: dfs.append(df_oi)
-        if not df_f.empty: dfs.append(df_f)
-        if not df_ls.empty: dfs.append(df_ls)
-        if not df_ohlcv.empty: dfs.append(df_ohlcv)
-        
-        # Patch OKX L/S from Rubik always as Coinalyze doesn't have it
-        if exchange.lower() == "okx":
-            df_rubik = native.fetch_okx_ls_rubik(token)
-            if not df_rubik.empty: dfs.append(df_rubik)
+    df_oi = client.open_interest_daily(symbol, start_sec, end_sec)
+    if not df_oi.empty: dfs.append(df_oi)
+    
+    df_f = client.funding_rate_daily(symbol, start_sec, end_sec)
+    if not df_f.empty: dfs.append(df_f)
+    
+    df_ls = client.long_short_ratio_daily(symbol, start_sec, end_sec)
+    if not df_ls.empty: dfs.append(df_ls)
+    
+    df_ohlcv = client.ohlcv_daily(symbol, start_sec, end_sec)
+    if not df_ohlcv.empty: dfs.append(df_ohlcv)
 
     if not dfs: return pd.DataFrame()
     
-    # Merge and ensure symbol/exchange
+    # 2. Merge all sources
     df_final = merge_dataframes(dfs)
     if not df_final.empty:
-        df_final['symbol'] = symbol
-        df_final['exchange'] = exchange
-        df_final['base_asset'] = token # Add base_asset for DB upsert
+        df_final['symbol'], df_final['exchange'], df_final['base_asset'] = symbol, exchange, token
+        # 3. Patch missing metrics (L/S ratios, today's candle)
+        df_final = patch_missing_metrics(df_final, token, exchange, symbol)
+        
     return df_final
 
 
-# ==============================================================================
-# Main Execution
-# ==============================================================================
 def main():
     """Main entry point for the Coinalyze data backfill script."""
     parser = argparse.ArgumentParser(
@@ -1483,7 +1514,6 @@ def main():
     
     # Initialize API Clients
     client = CoinalyzeClient(args.coinalyze_key, rate_delay=1.6)
-    native_fetcher = NativeFuturesFetcher()
     db_manager = DatabaseManager()
     
     # Validate API key
@@ -1607,7 +1637,7 @@ def main():
             
             # Fetch Hybrid Data (Smart Sourcing)
             metrics = fetch_hybrid_futures_data(
-                client, native_fetcher, 
+                client, 
                 base, exchange, symbol, 
                 start_sec, end_sec
             )
