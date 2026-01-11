@@ -861,8 +861,10 @@ class SpotScraper:
                 break
 
         if not all_data:
+            print(f"    [Binance] No data returned for {base}")
             return pd.DataFrame()
 
+        print(f"    [Binance] Fetched {len(all_data)} candles from data-api.binance.vision")
         df = pd.DataFrame(all_data)
         cols = ['timestamp', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'close_time', 'volume_usd', 'txn_count', 'buy_volume_base', 'buy_volume_usd', 'ignore']
         df.columns = cols[:len(df.columns)]
