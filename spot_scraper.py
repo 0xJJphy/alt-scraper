@@ -158,7 +158,7 @@ class DatabaseManager:
             if conn:
                 conn.close()
 
-    def upsert_asset_metadata(self, symbol: str, narrative: str, is_filtered: int):
+    def upsert_asset_metadata(self, symbol: str, narrative: str, is_filtered: int, market_cap: Optional[float] = None, market_cap_rank: Optional[int] = None):
         """Upsert asset metadata into asset_metadata table."""
         if not self.enabled: return
         
@@ -166,7 +166,10 @@ class DatabaseManager:
         try:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
-            cur.execute("SELECT upsert_asset_metadata(%s::VARCHAR, %s::VARCHAR, %s::BOOLEAN)", (symbol, narrative, bool(is_filtered)))
+            cur.execute(
+                "SELECT upsert_asset_metadata(%s::VARCHAR, %s::VARCHAR, %s::BOOLEAN, %s::DECIMAL, %s::INTEGER)", 
+                (symbol, narrative, bool(is_filtered), self._sanitize_float(market_cap), self._sanitize_int(market_cap_rank))
+            )
             conn.commit()
             cur.close()
         except Exception as e:
@@ -202,7 +205,7 @@ class DatabaseManager:
         conn = None
         try:
             conn = psycopg2.connect(self.db_url)
-            query = "SELECT symbol, narrative, is_filtered FROM asset_metadata"
+            query = "SELECT symbol, narrative, is_filtered, market_cap, market_cap_rank FROM asset_metadata"
             df = pd.read_sql(query, conn)
             conn.close()
             return df
@@ -346,7 +349,9 @@ def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[st
         for coin in data:
             out.append({
                 "symbol": coin.get("symbol", "").upper(),
-                "id": coin.get("id")
+                "id": coin.get("id"),
+                "market_cap": coin.get("market_cap"),
+                "market_cap_rank": coin.get("market_cap_rank")
             })
             
         # If we asked for specific symbols, we might want to preserve the order or ensure all found
@@ -763,7 +768,13 @@ def main():
     if db_manager.enabled and not meta.df.empty:
         print(f"[DB] Syncing {len(meta.df)} cached assets metadata...")
         for _, row in meta.df.iterrows():
-            db_manager.upsert_asset_metadata(row['symbol'], row['narrative'], row['is_filtered'])
+            db_manager.upsert_asset_metadata(
+                row['symbol'], 
+                row['narrative'], 
+                row['is_filtered'],
+                row.get('market_cap'),
+                row.get('market_cap_rank')
+            )
     
     for exchange in exchanges:
         print(f"\nProcessing EXCHANGE: {exchange.upper()}")
