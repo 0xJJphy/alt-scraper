@@ -30,8 +30,8 @@ on:
         required: false
         default: false
 
-    env:
-      PYTHONUNBUFFERED: "1"
+env:
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   sync-metadata:
@@ -50,62 +50,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Setup Cloudflare WARP
-        run: |
-          # Install Cloudflare WARP
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update && sudo apt-get install -y cloudflare-warp
-
-          # Register and connect
-          echo "[WARP] Registering..."
-          warp-cli --accept-tos registration new
-
-          echo "[WARP] Setting mode to warp..."
-          warp-cli --accept-tos mode warp
-
-          echo "[WARP] Connecting..."
-          warp-cli --accept-tos connect
-
-          # Wait for connection
-          echo "[WARP] Waiting for connection..."
-          sleep 10
-
-          # Verify connection
-          for i in {1..6}; do
-            STATUS=$(warp-cli status 2>/dev/null || echo "Disconnected")
-            echo "[WARP] Status: $STATUS"
-
-            if echo "$STATUS" | grep -q "Connected"; then
-              IP_INFO=$(curl -s --connect-timeout 5 https://ipinfo.io/json || echo '{}')
-              IP=$(echo "$IP_INFO" | grep -oP '"ip":\s*"\K[^"]+' || echo "unknown")
-              COUNTRY=$(echo "$IP_INFO" | grep -oP '"country":\s*"\K[^"]+' || echo "unknown")
-              ORG=$(echo "$IP_INFO" | grep -oP '"org":\s*"\K[^"]+' || echo "unknown")
-              echo "[WARP] Connected! IP: $IP, Country: $COUNTRY, Org: $ORG"
-
-              # WARP uses Cloudflare's network which routes through various countries
-              # The key is that Binance sees Cloudflare IP, not Azure/GitHub IP
-              if echo "$ORG" | grep -qi "cloudflare"; then
-                echo "[WARP] SUCCESS: Traffic routed through Cloudflare"
-                exit 0
-              fi
-            fi
-
-            sleep 5
-          done
-
-          echo "[ERROR] Failed to establish WARP connection"
-          warp-cli status
-          exit 1
-
       - name: Sync Global Metadata
         run: |
           TOP=${{ github.event.inputs.top_n || 50 }}
           python spot_scraper.py --limit $TOP --metadata-only
-
-      - name: Disconnect WARP
-        if: always()
-        run: warp-cli disconnect 2>/dev/null || true
 
   run-scrapers:
     needs: sync-metadata
@@ -133,54 +81,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Setup Cloudflare WARP
-        run: |
-          # Install Cloudflare WARP
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update && sudo apt-get install -y cloudflare-warp
-
-          # Register and connect
-          echo "[WARP] Registering..."
-          warp-cli --accept-tos registration new
-
-          echo "[WARP] Setting mode to warp..."
-          warp-cli --accept-tos mode warp
-
-          echo "[WARP] Connecting..."
-          warp-cli --accept-tos connect
-
-          # Wait for connection
-          echo "[WARP] Waiting for connection..."
-          sleep 10
-
-          # Verify connection
-          for i in {1..6}; do
-            STATUS=$(warp-cli status 2>/dev/null || echo "Disconnected")
-            echo "[WARP] Status: $STATUS"
-
-            if echo "$STATUS" | grep -q "Connected"; then
-              IP_INFO=$(curl -s --connect-timeout 5 https://ipinfo.io/json || echo '{}')
-              IP=$(echo "$IP_INFO" | grep -oP '"ip":\s*"\K[^"]+' || echo "unknown")
-              COUNTRY=$(echo "$IP_INFO" | grep -oP '"country":\s*"\K[^"]+' || echo "unknown")
-              ORG=$(echo "$IP_INFO" | grep -oP '"org":\s*"\K[^"]+' || echo "unknown")
-              echo "[WARP] Connected! IP: $IP, Country: $COUNTRY, Org: $ORG"
-
-              # WARP uses Cloudflare's network which routes through various countries
-              # The key is that Binance sees Cloudflare IP, not Azure/GitHub IP
-              if echo "$ORG" | grep -qi "cloudflare"; then
-                echo "[WARP] SUCCESS: Traffic routed through Cloudflare"
-                exit 0
-              fi
-            fi
-
-            sleep 5
-          done
-
-          echo "[ERROR] Failed to establish WARP connection"
-          warp-cli status
-          exit 1
-
       - name: Run Spot Scraper
         if: matrix.scraper_type == 'spot'
         run: |
@@ -192,7 +92,3 @@ jobs:
         run: |
           TOP=${{ github.event.inputs.top_n || 50 }}
           python alts_scraper.py --limit $TOP --exchanges binance,bybit,okx
-
-      - name: Disconnect WARP
-        if: always()
-        run: warp-cli disconnect 2>/dev/null || true
