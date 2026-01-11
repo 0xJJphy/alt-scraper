@@ -504,29 +504,66 @@ class AssetMetadataManager:
         if self.allow_csv:
             self.df.to_csv(self.file_path, index=False)
 
-def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[str]] = None) -> List[Dict]:
-    """Fetch top N market candidates."""
+def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[str]] = None, max_retries: int = 3) -> List[Dict]:
+    """Fetch top tokens from CoinGecko markets with retry for null market_cap."""
     print(f"[INFO] Fetching market data from CoinGecko (specific={bool(specific_symbols)})...")
-    out = []
+
     url = f"{COINGECKO_BASE}/coins/markets"
     params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": 1, "sparkline": "false"}
     if specific_symbols:
         params["symbols"] = ",".join(specific_symbols).lower()
         params["per_page"] = 100
-    try:
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        for coin in data:
-            out.append({
-                "symbol": coin.get("symbol", "").upper(),
-                "id": coin.get("id"),
-                "market_cap": coin.get("market_cap"),
-                "market_cap_rank": coin.get("market_cap_rank")
-            })
-    except Exception as e:
-        print(f"[ERROR] CG Markets API failed: {e}")
-    return out
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
+
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
+            if resp.status_code == 429:
+                wait_time = int(resp.headers.get("Retry-After", 60))
+                print(f"[CG] Rate limited, waiting {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            out = []
+            null_count = 0
+            for coin in data:
+                mc = coin.get("market_cap")
+                if mc is None:
+                    null_count += 1
+                out.append({
+                    "symbol": coin.get("symbol", "").upper(),
+                    "id": coin.get("id"),
+                    "market_cap": mc,
+                    "market_cap_rank": coin.get("market_cap_rank")
+                })
+
+            # If more than 20% of market caps are null, retry after delay
+            if len(out) > 0 and null_count / len(out) > 0.2:
+                print(f"[CG] Warning: {null_count}/{len(out)} tokens have null market_cap, retrying in 5s...")
+                time.sleep(5)
+                continue
+
+            if null_count > 0:
+                print(f"[CG] Note: {null_count} tokens have null market_cap")
+
+            return out
+
+        except requests.exceptions.Timeout:
+            print(f"[CG] Timeout, attempt {attempt+1}/{max_retries}")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"[ERROR] CG Markets API failed: {e}")
+            time.sleep(2 ** attempt)
+
+    print("[CG] All retries failed, returning empty list")
+    return []
 
 
 # ==============================================================================

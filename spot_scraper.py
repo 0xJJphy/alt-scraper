@@ -375,10 +375,13 @@ def _get_default_narrative(market_cap_rank: Optional[int]) -> str:
         return "Small Cap"
 
 
-def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[str]] = None) -> List[Dict]:
-    """Fetch top tokens from CoinGecko markets (ONE API call = 250 tokens with market_cap)."""
+def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[str]] = None, max_retries: int = 3) -> List[Dict]:
+    """Fetch top tokens from CoinGecko markets with retry for null market_cap.
+
+    ONE API call = 250 tokens with market_cap.
+    Retries if too many market_caps are null (CoinGecko sometimes returns incomplete data).
+    """
     print(f"[INFO] Fetching market data from CoinGecko (specific={bool(specific_symbols)})...")
-    out = []
 
     url = f"{COINGECKO_BASE}/coins/markets"
     params = {
@@ -393,23 +396,57 @@ def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[st
         params["symbols"] = ",".join(specific_symbols).lower()
         params["per_page"] = 100
 
-    try:
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
 
-        for coin in data:
-            out.append({
-                "symbol": coin.get("symbol", "").upper(),
-                "id": coin.get("id"),
-                "market_cap": coin.get("market_cap"),
-                "market_cap_rank": coin.get("market_cap_rank")
-            })
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
 
-    except Exception as e:
-        print(f"[ERROR] CG Markets API failed: {e}")
+            if resp.status_code == 429:
+                wait_time = int(resp.headers.get("Retry-After", 60))
+                print(f"[CG] Rate limited, waiting {wait_time}s...")
+                time.sleep(wait_time)
+                continue
 
-    return out
+            resp.raise_for_status()
+            data = resp.json()
+
+            out = []
+            null_count = 0
+            for coin in data:
+                mc = coin.get("market_cap")
+                if mc is None:
+                    null_count += 1
+                out.append({
+                    "symbol": coin.get("symbol", "").upper(),
+                    "id": coin.get("id"),
+                    "market_cap": mc,
+                    "market_cap_rank": coin.get("market_cap_rank")
+                })
+
+            # If more than 20% of market caps are null, retry after delay
+            if len(out) > 0 and null_count / len(out) > 0.2:
+                print(f"[CG] Warning: {null_count}/{len(out)} tokens have null market_cap, retrying in 5s...")
+                time.sleep(5)
+                continue
+
+            if null_count > 0:
+                print(f"[CG] Note: {null_count} tokens have null market_cap (will use 0)")
+
+            return out
+
+        except requests.exceptions.Timeout:
+            print(f"[CG] Timeout, attempt {attempt+1}/{max_retries}")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"[ERROR] CG Markets API failed: {e}")
+            time.sleep(2 ** attempt)
+
+    print("[CG] All retries failed, returning empty list")
+    return []
 
 class CoinalyzeClient:
     """Minimized client for Coinalyze Spot data."""
@@ -741,36 +778,69 @@ class SpotScraper:
         return default_start_ts
 
     def fetch_binance(self, base: str, start_ts: int, end_ts: int) -> pd.DataFrame:
-        """ Binance Spot Hybrid """
+        """Binance Spot with retry logic and headers."""
         print(f"  [Binance] Fetching {base}...")
         all_data = []
         current_start = start_ts
         limit = 1000
-        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json"
+        }
+
         while current_start < end_ts:
             params = {"symbol": f"{base}USDT", "interval": "1d", "startTime": current_start, "endTime": end_ts, "limit": limit}
-            try:
-                resp = requests.get(BINANCE_SPOT_API, params=params, timeout=10)
-                if resp.status_code == 400: return pd.DataFrame()
-                resp.raise_for_status()
-                data = resp.json()
-                if not data: break
-                all_data.extend(data)
-                current_start = data[-1][0] + 86400000
-                time.sleep(0.3)
-            except: break
-                
-        if not all_data: return pd.DataFrame()
+
+            for attempt in range(3):
+                try:
+                    resp = requests.get(BINANCE_SPOT_API, params=params, headers=headers, timeout=15)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if not data:
+                            break
+                        all_data.extend(data)
+                        current_start = data[-1][0] + 86400000
+                        time.sleep(0.3)
+                        break
+                    elif resp.status_code == 429:
+                        wait_time = int(resp.headers.get("Retry-After", 2 ** attempt))
+                        print(f"    [Binance] Rate limited, waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    elif resp.status_code in (400, 403, 418, 451):
+                        print(f"    [Binance] HTTP {resp.status_code} for {base}, attempt {attempt+1}/3")
+                        time.sleep(2 ** attempt)
+                        if attempt == 2:
+                            return pd.DataFrame()
+                        continue
+                    else:
+                        print(f"    [Binance] Unexpected HTTP {resp.status_code}")
+                        break
+                except requests.exceptions.Timeout:
+                    print(f"    [Binance] Timeout for {base}, attempt {attempt+1}/3")
+                    time.sleep(2 ** attempt)
+                except Exception as e:
+                    print(f"    [Binance] Error: {e}")
+                    break
+            else:
+                break  # All retries failed
+
+            if not all_data or (resp.status_code == 200 and not data):
+                break
+
+        if not all_data:
+            return pd.DataFrame()
+
         df = pd.DataFrame(all_data)
         cols = ['timestamp', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'close_time', 'volume_usd', 'txn_count', 'buy_volume_base', 'buy_volume_usd', 'ignore']
         df.columns = cols[:len(df.columns)]
         df['date'] = pd.to_datetime(pd.to_numeric(df['timestamp']), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
         for col in ['price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base']:
             if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
-        
+
         df['exchange'], df['symbol'] = 'binance', f"{base}USDT"
         df = patch_missing_metrics(df, base, 'binance', f"{base}USDT")
-        
+
         final_cols = ['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count', 'symbol', 'exchange']
         return df[[c for c in final_cols if c in df.columns]]
 
