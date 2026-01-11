@@ -49,10 +49,23 @@ jobs:
       - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Setup VPN
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openvpn
+          python get_vpn_config.py
+          sudo openvpn --config client.ovpn --log vpn.log --daemon
+          sleep 15
+          curl -s https://ipinfo.io/json | grep -E "country|ip"
+          
       - name: Sync Global Metadata
         run: |
           TOP=${{ github.event.inputs.top_n || 50 }}
           python spot_scraper.py --limit $TOP --metadata-only
+
+      - name: Stop VPN
+        if: always()
+        run: sudo killall openvpn || true
 
   run-scrapers:
     needs: sync-metadata
@@ -80,6 +93,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Setup VPN
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openvpn
+          python get_vpn_config.py
+          sudo openvpn --config client.ovpn --log vpn.log --daemon
+          sleep 15
+          curl -s https://ipinfo.io/json | grep -E "country|ip"
+
       - name: Run Spot Scraper
         if: matrix.scraper_type == 'spot'
         run: |
@@ -91,3 +113,7 @@ jobs:
         run: |
           TOP=${{ github.event.inputs.top_n || 50 }}
           python alts_scraper.py --limit $TOP --exchanges binance,bybit,okx
+
+      - name: Stop VPN
+        if: always()
+        run: sudo killall openvpn || true

@@ -57,7 +57,7 @@ COINALYZE_ENDPOINTS = {
 }
 
 # Native Exchange API Endpoints
-BINANCE_FUTURES_API = "https://fapi-gcp.binance.com"
+BINANCE_FUTURES_API = "https://fapi.binance.com"
 BYBIT_V5_API = "https://api.bybit.com/v5"
 OKX_V5_API = "https://www.okx.com/api/v5"
 
@@ -1292,7 +1292,6 @@ def merge_on_date(perp_csv_path: str, metrics: pd.DataFrame) -> None:
 class BinanceFuturesFetcher:
     """Fetcher for Binance USD-M Futures Direct API with mirror rotation."""
     MIRRORS = [
-        "https://fapi-gcp.binance.com",
         "https://fapi.binance.com",
         "https://fapi1.binance.com",
         "https://fapi2.binance.com",
