@@ -24,13 +24,14 @@ STABLES_CATEGORIES = [
 ]
 
 # API Endpoints
+# data-api.binance.vision works from GitHub Actions (not geo-blocked)
 BINANCE_SPOT_MIRRORS = [
+    "https://data-api.binance.vision",  # Primary - works from GHA
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
     "https://api4.binance.com",
-    "https://data.binance.com"
 ]
 BINANCE_SPOT_API = f"{BINANCE_SPOT_MIRRORS[0]}/api/v3/klines"
 BYBIT_SPOT_API = "https://api.bybit.com/v5/market/kline"
@@ -509,7 +510,7 @@ class CoinalyzeClient:
 
 class BinanceSpotFetcher:
     """Fetcher for Binance Spot V3 API."""
-    BASE_URL = "https://api.binance.com/api/v3"
+    BASE_URL = "https://data-api.binance.vision/api/v3"  # Works from GHA
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json"
