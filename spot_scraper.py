@@ -799,7 +799,7 @@ class SpotScraper:
 
             for attempt in range(3):
                 try:
-                    resp = requests.get(BINANCE_SPOT_API, params=params, headers=headers, timeout=15)
+                    resp = requests.get(BINANCE_SPOT_API, params=params, headers=headers, timeout=30)
                     if resp.status_code == 200:
                         data = resp.json()
                         if not data:
@@ -814,8 +814,9 @@ class SpotScraper:
                         time.sleep(wait_time)
                         continue
                     elif resp.status_code in (400, 403, 418, 451):
-                        print(f"    [Binance] HTTP {resp.status_code} for {base}, attempt {attempt+1}/3")
-                        time.sleep(2 ** attempt)
+                        wait_time = 5 ** attempt + 5
+                        print(f"    [Binance] HTTP {resp.status_code} for {base}, retrying in {wait_time}s... (attempt {attempt+1}/3)")
+                        time.sleep(wait_time)
                         if attempt == 2:
                             return pd.DataFrame()
                         continue
@@ -1000,7 +1001,9 @@ def main():
                 
                 dynamic_start = scraper.get_incremental_start(path, start_ts, db_symbol, exchange, db_manager)
                 
-                if exchange == 'binance': df_new = scraper.fetch_binance(base, dynamic_start, end_ts)
+                if exchange == 'binance':
+                    df_new = scraper.fetch_binance(base, dynamic_start, end_ts)
+                    time.sleep(1.0) # Conservative delay for Binance Spot
                 elif exchange == 'bybit': df_new = scraper.fetch_bybit(base, dynamic_start, end_ts)
                 elif exchange == 'okx': df_new = scraper.fetch_okx(base, dynamic_start, end_ts)
                 else: break

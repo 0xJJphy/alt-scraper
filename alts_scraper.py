@@ -1297,7 +1297,7 @@ class BinanceFuturesFetcher:
         "Accept": "application/json"
     }
 
-    def __init__(self, timeout: int = 15, max_retries: int = 3):
+    def __init__(self, timeout: int = 30, max_retries: int = 3):
         self.timeout = timeout
         self.max_retries = max_retries
 
@@ -1318,8 +1318,9 @@ class BinanceFuturesFetcher:
                     time.sleep(wait_time)
                     continue
                 elif resp.status_code in (403, 418, 451):
-                    print(f"    [Binance] IP blocked (HTTP {resp.status_code}), attempt {attempt+1}/{self.max_retries}")
-                    time.sleep(2 ** attempt)
+                    wait_time = 5 ** attempt + 5
+                    print(f"    [Binance] IP blocked (HTTP {resp.status_code}), retrying in {wait_time}s... (attempt {attempt+1}/{self.max_retries})")
+                    time.sleep(wait_time)
                     continue
                 else:
                     print(f"    [Binance] HTTP {resp.status_code} for {endpoint}")
@@ -1917,11 +1918,14 @@ def main():
             else:
                 print(f"  [CSV] Skipping local save (use --csv to enable)")
             
-            # Optionally merge into existing perp file
             if not args.skip_merge:
                 perp_csv = os.path.join(args.perp_dir, exchange, f"{base}USDT_1d.csv")
                 if os.path.exists(perp_csv):
                     merge_on_date(perp_csv, metrics.drop(columns=["symbol", "exchange"]))
+            
+            # Additional safety delay for Binance
+            if exchange.lower() == 'binance':
+                time.sleep(1.0)
                     
             success_count += 1
             
