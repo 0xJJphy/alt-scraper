@@ -52,24 +52,39 @@ jobs:
       - name: Setup VPN
         run: |
           sudo apt-get update
-          sudo apt-get install -y openvpn iproute2
+          sudo apt-get install -y openvpn iproute2 curl
+          
+          # Disable IPv6 to prevent leaks
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
+          
+          # Generate config
           python get_vpn_config.py
+          
           # Start OpenVPN in background
           sudo openvpn --config client.ovpn --log vpn.log --daemon
           
           echo "Waiting for VPN connection to establish..."
-          MAX_RETRIES=10
+          MAX_RETRIES=15
           COUNT=0
           while [ $COUNT -lt $MAX_RETRIES ]; do
             sleep 10
-            # Check exit IP
-            IP_INFO=$(curl -s https://ipinfo.io/json || echo '{"country": "ERROR"}')
+            # Check if process is still running
+            if ! pgrep openvpn > /dev/null; then
+               echo "FATAL: OpenVPN process died!"
+               cat vpn.log
+               exit 1
+            fi
+            
+            # Check exit IP (multi-source for robustness)
+            IP_INFO=$(curl -s --connect-timeout 5 https://ipinfo.io/json || curl -s --connect-timeout 5 https://ifconfig.me/all.json || echo '{"country": "ERROR"}')
             COUNTRY=$(echo $IP_INFO | grep -oP '"country": "\K[^"]+')
             IP=$(echo $IP_INFO | grep -oP '"ip": "\K[^"]+')
             echo "Current IP: $IP ($COUNTRY) [Attempt $((COUNT+1))/$MAX_RETRIES]"
             
-            if [ "$COUNTRY" != "US" ] && [ "$COUNTRY" != "ERROR" ]; then
+            if [ "$COUNTRY" != "" ] && [ "$COUNTRY" != "US" ] && [ "$COUNTRY" != "ERROR" ]; then
               echo "VPN ESTABLISHED: Exit IP is $IP ($COUNTRY)"
+              ip route show
               exit 0
             fi
             COUNT=$((COUNT+1))
@@ -78,8 +93,9 @@ jobs:
           echo "ERROR: Failed to establish non-US VPN connection after $((MAX_RETRIES * 10))s."
           echo "--- VPN LOGS ---"
           cat vpn.log
+          echo "--- ROUTING TABLE ---"
+          ip route show
           exit 1
-          
       - name: Sync Global Metadata
         run: |
           TOP=${{ github.event.inputs.top_n || 50 }}
@@ -118,24 +134,39 @@ jobs:
       - name: Setup VPN
         run: |
           sudo apt-get update
-          sudo apt-get install -y openvpn iproute2
+          sudo apt-get install -y openvpn iproute2 curl
+          
+          # Disable IPv6 to prevent leaks
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
+          
+          # Generate config
           python get_vpn_config.py
+          
           # Start OpenVPN in background
           sudo openvpn --config client.ovpn --log vpn.log --daemon
           
           echo "Waiting for VPN connection to establish..."
-          MAX_RETRIES=10
+          MAX_RETRIES=15
           COUNT=0
           while [ $COUNT -lt $MAX_RETRIES ]; do
             sleep 10
-            # Check exit IP
-            IP_INFO=$(curl -s https://ipinfo.io/json || echo '{"country": "ERROR"}')
+            # Check if process is still running
+            if ! pgrep openvpn > /dev/null; then
+               echo "FATAL: OpenVPN process died!"
+               cat vpn.log
+               exit 1
+            fi
+            
+            # Check exit IP (multi-source for robustness)
+            IP_INFO=$(curl -s --connect-timeout 5 https://ipinfo.io/json || curl -s --connect-timeout 5 https://ifconfig.me/all.json || echo '{"country": "ERROR"}')
             COUNTRY=$(echo $IP_INFO | grep -oP '"country": "\K[^"]+')
             IP=$(echo $IP_INFO | grep -oP '"ip": "\K[^"]+')
             echo "Current IP: $IP ($COUNTRY) [Attempt $((COUNT+1))/$MAX_RETRIES]"
             
-            if [ "$COUNTRY" != "US" ] && [ "$COUNTRY" != "ERROR" ]; then
+            if [ "$COUNTRY" != "" ] && [ "$COUNTRY" != "US" ] && [ "$COUNTRY" != "ERROR" ]; then
               echo "VPN ESTABLISHED: Exit IP is $IP ($COUNTRY)"
+              ip route show
               exit 0
             fi
             COUNT=$((COUNT+1))
@@ -144,6 +175,8 @@ jobs:
           echo "ERROR: Failed to establish non-US VPN connection after $((MAX_RETRIES * 10))s."
           echo "--- VPN LOGS ---"
           cat vpn.log
+          echo "--- ROUTING TABLE ---"
+          ip route show
           exit 1
           
       - name: Run Spot Scraper

@@ -40,32 +40,39 @@ def get_vpn_config():
             print("[ERROR] No suitable non-US servers found.")
             return False
             
-        # Select one of the top 10 servers by score, preferring TCP if available for better GHA compatibility
+        # Select one of the top 20 servers by score
         servers.sort(key=lambda x: x["score"], reverse=True)
-        # Try to find a TCP/443 server in top 10
-        candidates = servers[:10]
-        
-        # We don't have easy info if it's TCP/UDP in this CSV without parsing the config
-        # but usually higher score servers are more stable.
+        candidates = servers[:20]
         best = random.choice(candidates)
         
         print(f"[VPN] Selected server in {best['country']} (IP: {best['ip']})")
         
         config_data = base64.b64decode(best['config_b64']).decode('utf-8')
         
-        # Ensure it has routing directives if missing
+        # Ensure it has routing directives
         if "redirect-gateway def1" not in config_data:
             config_data += "\nredirect-gateway def1\n"
         
+        # Add GHA compatibility and security directives
+        extra_directives = [
+            "auth-nocache",
+            "verb 3",
+            "mute-replay-warnings",
+            "connect-retry 2 5",
+            "resolv-retry infinite",
+            "nobind",
+            "persist-key",
+            "persist-tun",
+            "pull-filter ignore \"auth-token\"", # Avoid some token issues
+            "route-metric 1",
+            "block-outside-dns" # Prevent DNS leaks if on Windows, but helpful for routing logic
+        ]
+        
         with open("client.ovpn", "w") as f:
             f.write(config_data)
-            # Add directive to prevent it from asking for credentials and ignore some errors
-            f.write("\nauth-nocache\n")
-            f.write("verb 3\n")
-            f.write("mute-replay-warnings\n")
-            # For GHA stability
-            f.write("connect-retry 2 5\n")
-            f.write("resolv-retry infinite\n")
+            for d in extra_directives:
+                if d not in config_data:
+                    f.write(f"\n{d}\n")
             
         print("[VPN] client.ovpn generated successfully.")
         return True
