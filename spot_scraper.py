@@ -910,11 +910,6 @@ def main():
     # Initialize Metadata Manager with DB support
     meta = AssetMetadataManager(db_manager=db_manager, allow_csv=args.csv)
     
-    # 1. Update existing metadata first
-    print(f"[DB] Syncing {len(meta.df)} cached assets metadata...")
-    for _, row in meta.df.iterrows():
-        db_manager.upsert_asset_metadata(row['symbol'], row['narrative'], int(row['is_filtered']), row.get('market_cap'), row.get('market_cap_rank'))
-
     target_bases = []
     
     if args.symbols:
@@ -947,6 +942,10 @@ def main():
             target_bases = valid_candidates[:args.limit]
 
     if args.metadata_only:
+        # 1. Update existing metadata first
+        print(f"[DB] Syncing {len(meta.df)} cached assets metadata...")
+        for _, row in meta.df.iterrows():
+            db_manager.upsert_asset_metadata(row['symbol'], row['narrative'], int(row['is_filtered']), row.get('market_cap'), row.get('market_cap_rank'))
         print("[INFO] Metadata sync complete. Exiting (--metadata-only).")
         return
 

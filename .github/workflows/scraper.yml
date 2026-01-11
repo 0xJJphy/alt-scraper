@@ -29,6 +29,9 @@ on:
         type: boolean
         required: false
         default: false
+    
+    env:
+      PYTHONUNBUFFERED: "1"
 
 jobs:
   sync-metadata:
@@ -65,6 +68,7 @@ jobs:
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       COINALYZE_API_KEY: ${{ secrets.COINALYZE_API_KEY }}
+      PYTHONUNBUFFERED: "1"
       
     steps:
       - uses: actions/checkout@v4
