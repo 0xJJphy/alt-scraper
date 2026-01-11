@@ -269,77 +269,117 @@ class AssetMetadataManager:
         return categories[0]
 
     def get_metadata(self, symbol: str, coin_id: str, market_cap: Optional[float] = None, market_cap_rank: Optional[int] = None) -> Dict:
-        """Get narrative and filter status, checking cache first."""
+        """Get narrative and filter status, checking cache first.
+
+        Optimized to avoid slow CoinGecko API calls:
+        1. Check cache (DB/CSV) first
+        2. Use KNOWN_FILTERED_SYMBOLS for instant stablecoin/wrapped detection
+        3. Assign default narrative based on market_cap_rank if not in cache
+        4. Only call CoinGecko API as last resort (with rate limit handling)
+        """
         symbol = symbol.upper()
         cache_row = self.df[self.df['symbol'] == symbol]
 
+        # 1. Check cache first
         if not cache_row.empty:
             row = cache_row.iloc[0]
-            # Update market_cap if provided and different
+            # Update market_cap if provided
             if market_cap is not None:
                 self.df.loc[self.df['symbol'] == symbol, 'market_cap'] = market_cap
                 self.df.loc[self.df['symbol'] == symbol, 'market_cap_rank'] = market_cap_rank
-                # Update DB with new market cap
                 if self.db_manager and self.db_manager.enabled:
                     self.db_manager.upsert_asset_metadata(symbol, row['narrative'], int(row['is_filtered']), market_cap, market_cap_rank)
             return {"narrative": row['narrative'], "is_filtered": int(row['is_filtered'])}
-            
-        # Not in cache, fetch from CoinGecko
-        print(f"  [CG] Fetching detail for {symbol} ({coin_id})...")
-        url = f"{COINGECKO_BASE}/coins/{coin_id}"
+
+        # 2. Check known filtered symbols (instant, no API call)
+        if symbol in KNOWN_FILTERED_SYMBOLS:
+            narrative = "Stablecoin/Wrapped"
+            is_filtered = 1
+            self._save_metadata(symbol, narrative, is_filtered, market_cap, market_cap_rank)
+            return {"narrative": narrative, "is_filtered": is_filtered}
+
+        # 3. For unknown tokens, assign default narrative based on rank (no API call)
+        # This is fast and avoids rate limits. Narratives can be enriched later.
+        narrative = _get_default_narrative(market_cap_rank)
+        is_filtered = 0
+        self._save_metadata(symbol, narrative, is_filtered, market_cap, market_cap_rank)
+        return {"narrative": narrative, "is_filtered": is_filtered}
+
+    def _save_metadata(self, symbol: str, narrative: str, is_filtered: int, market_cap: Optional[float], market_cap_rank: Optional[int]):
+        """Helper to save metadata to cache and DB."""
+        new_row = pd.DataFrame([{
+            'symbol': symbol,
+            'narrative': narrative,
+            'is_filtered': is_filtered,
+            'market_cap': market_cap,
+            'market_cap_rank': market_cap_rank
+        }])
+        self.df = pd.concat([self.df, new_row], ignore_index=True).drop_duplicates('symbol')
+
+        if self.db_manager and self.db_manager.enabled:
+            self.db_manager.upsert_asset_metadata(symbol, narrative, is_filtered, market_cap, market_cap_rank)
+
+        if self.allow_csv:
+            self.df.to_csv(self.file_path, index=False)
+
+    def enrich_narratives_from_api(self, coin_id: str, symbol: str) -> Optional[str]:
+        """Optional: Fetch detailed narrative from CoinGecko API (slow, use sparingly)."""
         try:
-            resp = requests.get(url, params={"localization": "false", "tickers": "false", "market_data": "false", "community_data": "false", "developer_data": "false", "sparkline": "false"})
+            url = f"{COINGECKO_BASE}/coins/{coin_id}"
+            resp = requests.get(url, params={"localization": "false", "tickers": "false", "market_data": "false", "community_data": "false", "developer_data": "false", "sparkline": "false"}, timeout=30)
             if resp.status_code == 429:
-                print("    Rate limit. Waiting 60s...")
-                time.sleep(60)
-                return self.get_metadata(symbol, coin_id)
-            
+                print(f"    [CG] Rate limit hit for {symbol}, skipping enrichment")
+                return None
+
             resp.raise_for_status()
             detail = resp.json()
             categories = detail.get("categories", [])
             cat_ids = [c.lower().replace(" ", "-") for c in categories]
-            
+
             # Check for excluded categories
-            is_filtered = 0
-            narrative = "Unknown"
-            
-            # Use original category names for the narrative column
             excluded_cats_indices = [i for i, cid in enumerate(cat_ids) if any(s_cat in cid for s_cat in STABLES_CATEGORIES)]
             if excluded_cats_indices:
-                is_filtered = 1
-                narrative = categories[excluded_cats_indices[0]]
+                return categories[excluded_cats_indices[0]]
             else:
-                narrative = self._select_best_narrative(categories)
+                return self._select_best_narrative(categories)
 
-            # Update cache
-            new_row = pd.DataFrame([{
-                'symbol': symbol,
-                'narrative': narrative,
-                'is_filtered': is_filtered,
-                'market_cap': market_cap,
-                'market_cap_rank': market_cap_rank
-            }])
-            self.df = pd.concat([self.df, new_row], ignore_index=True).drop_duplicates('symbol')
-
-            # Persist to DB immediately
-            if self.db_manager and self.db_manager.enabled:
-                self.db_manager.upsert_asset_metadata(symbol, narrative, is_filtered, market_cap, market_cap_rank)
-            
-            # Persist to CSV if allowed
-            if self.allow_csv:
-                self.df.to_csv(self.file_path, index=False)
-            
-            return {"narrative": narrative, "is_filtered": is_filtered}
-            
         except Exception as e:
-            print(f"    [ERROR] CG Fetch failed for {symbol}: {e}")
-            return {"narrative": "Unknown", "is_filtered": 0}
+            print(f"    [CG] Enrichment failed for {symbol}: {e}")
+            return None
+
+# Known stablecoins and wrapped tokens (to filter without slow API calls)
+KNOWN_FILTERED_SYMBOLS = {
+    # Stablecoins
+    "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "GUSD", "FRAX", "LUSD", "USDD",
+    "PYUSD", "FDUSD", "EURC", "EURT", "XAUT", "PAXG", "GHO", "CRVUSD", "MKUSD",
+    "USDE", "USDX", "USD0", "USDY", "SUSD", "RAI", "FEI", "MIM", "DOLA", "ALUSD",
+    # Wrapped tokens
+    "WBTC", "WETH", "WBNB", "STETH", "WSTETH", "RETH", "CBETH", "FRXETH", "SFRXETH",
+    "MSOL", "BNSOL", "JITOETH", "EZETH", "WEETH", "RSETH", "METH", "SWETH",
+    "TBTC", "HBTC", "RENBTC", "SBTC", "OBTC", "PBTC",
+    # Liquid staking derivatives
+    "STMATIC", "STSOL", "STETHR", "STANEAR",
+}
+
+def _get_default_narrative(market_cap_rank: Optional[int]) -> str:
+    """Assign a default narrative based on market cap rank."""
+    if market_cap_rank is None:
+        return "Cryptocurrency"
+    if market_cap_rank <= 10:
+        return "Blue Chip"
+    elif market_cap_rank <= 50:
+        return "Large Cap"
+    elif market_cap_rank <= 100:
+        return "Mid Cap"
+    else:
+        return "Small Cap"
+
 
 def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[str]] = None) -> List[Dict]:
-    """Fetch top tokens or specific symbols from CoinGecko markets."""
+    """Fetch top tokens from CoinGecko markets (ONE API call = 250 tokens with market_cap)."""
     print(f"[INFO] Fetching market data from CoinGecko (specific={bool(specific_symbols)})...")
     out = []
-    
+
     url = f"{COINGECKO_BASE}/coins/markets"
     params = {
         "vs_currency": "usd",
@@ -348,17 +388,16 @@ def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[st
         "page": 1,
         "sparkline": "false",
     }
-    
+
     if specific_symbols:
-        # Sort and join symbols for the API call
         params["symbols"] = ",".join(specific_symbols).lower()
         params["per_page"] = 100
-    
+
     try:
         resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        
+
         for coin in data:
             out.append({
                 "symbol": coin.get("symbol", "").upper(),
@@ -366,15 +405,10 @@ def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[st
                 "market_cap": coin.get("market_cap"),
                 "market_cap_rank": coin.get("market_cap_rank")
             })
-            
-        # If we asked for specific symbols, we might want to preserve the order or ensure all found
-        if specific_symbols:
-            # Simple re-sorting if needed, though usually not critical
-            pass
-            
+
     except Exception as e:
         print(f"[ERROR] CG Markets API failed: {e}")
-            
+
     return out
 
 class CoinalyzeClient:
