@@ -696,10 +696,13 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
         for cz_sym in syms_to_try:
             temp_df = client.fetch_ohlcv(cz_sym, patch_start_ts, to_unix_ms(datetime.now(timezone.utc)))
             if not temp_df.empty:
-                # Check if we got the critical metrics
-                if 'buy_txn_count' in temp_df.columns and temp_df['buy_txn_count'].notna().any():
+                # Check if we got any of the critical metrics (more permissive)
+                has_tx = 'txn_count' in temp_df.columns and temp_df['txn_count'].notna().any() and (temp_df['txn_count'] > 0).any()
+                has_btv = 'buy_volume_base' in temp_df.columns and temp_df['buy_volume_base'].notna().any()
+                
+                if has_tx or has_btv:
                     df_cz = temp_df
-                    print(f"    [Hybrid] Using Coinalyze symbol: {cz_sym}")
+                    print(f"    [Hybrid] Using Coinalyze symbol: {cz_sym} (tx={has_tx}, btv={has_btv})")
                     break
         
         if not df_cz.empty:
@@ -708,8 +711,10 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
             for col in target_cols:
                 new_col = f"{col}_new"
                 if new_col in df.columns:
-                    df[col] = df[col].fillna(df[new_col])
+                    # Fill if current is 0 or NaN, and new is not NaN
+                    df[col] = df[col].replace(0, pd.NA).fillna(df[new_col])
                     df.drop(columns=[new_col], inplace=True)
+            print(f"    [Hybrid] Patched {base} with Coinalyze depth data.")
 
     # 3. Special Case: OKX Rubik Delta
     if exchange.lower() == "okx":
@@ -764,12 +769,13 @@ class SpotScraper:
             except: pass
 
         if last_date:
-            fast_forward_ts = to_unix_ms(last_date - timedelta(days=7))
+            # Re-fetch the last 14 days to ensure completeness (Coinalyze/OKX lag fix)
+            fast_forward_ts = to_unix_ms(last_date - timedelta(days=14))
             
             # If the user didn't specify a start date (it's the 2017 default), 
             # or if the requested start is newer than our fast_forward, we use incremental.
-            # Convert 1483228800000 (2017-01-01) to compare
             if default_start_ts <= 1483228800000:
+                print(f"    [Start] Incremental mode (14d overlap): {datetime.fromtimestamp(fast_forward_ts/1000, tz=timezone.utc).date()}")
                 return fast_forward_ts
                 
             # If user provided a custom start date newer than 2017, respect it
@@ -894,6 +900,7 @@ def main():
     parser.add_argument("--exchanges", type=str, default="binance,bybit,okx", help="Exchanges to fetch")
     parser.add_argument("--start", type=str, default="2017-01-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--output-dir", type=str, default="data/spot", help="Output directory")
+    parser.add_argument("--metadata-only", action="store_true", help="Only sync metadata and exit")
     args = parser.parse_args()
     
     scraper = SpotScraper(args.output_dir)
@@ -901,6 +908,12 @@ def main():
     
     # Initialize Metadata Manager with DB support
     meta = AssetMetadataManager(db_manager=db_manager, allow_csv=args.csv)
+    
+    # 1. Update existing metadata first
+    print(f"[DB] Syncing {len(meta.df)} cached assets metadata...")
+    for _, row in meta.df.iterrows():
+        db_manager.upsert_asset_metadata(row['symbol'], row['narrative'], int(row['is_filtered']), row.get('market_cap'), row.get('market_cap_rank'))
+
     target_bases = []
     
     if args.symbols:
@@ -931,6 +944,10 @@ def main():
             target_bases = valid_candidates[start_rank-1:end_rank]
         else:
             target_bases = valid_candidates[:args.limit]
+
+    if args.metadata_only:
+        print("[INFO] Metadata sync complete. Exiting (--metadata-only).")
+        return
 
     exchanges = [e.strip().lower() for e in args.exchanges.split(",")]
     start_dt = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)

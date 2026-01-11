@@ -14,8 +14,6 @@ on:
     # 3. Pre-Close/Evening: 7 PM Madrid = 18:00 UTC (Winter) / 17:00 UTC (Summer)
     #    Target: 18:00 UTC
     - cron: '0 18 * * *'
-
-  # Allow manual trigger from GitHub UI
   workflow_dispatch:
     inputs:
       lookback_days:
@@ -26,42 +24,66 @@ on:
         description: 'Number of top tokens (default: 50)'
         required: false
         default: '50'
+      parallel_execution:
+        description: 'Run Spot and Futures in parallel (default: false)'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
-  run-scraper:
+  sync-metadata:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 15
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       COINALYZE_API_KEY: ${{ secrets.COINALYZE_API_KEY }}
-      # Optional: COINGECKO_API_KEY if you add it later
-      
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
-
-      - name: Install dependencies
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Sync Global Metadata
         run: |
+          TOP=${{ github.event.inputs.top_n || 50 }}
+          python spot_scraper.py --limit $TOP --metadata-only
+
+  run-scrapers:
+    needs: sync-metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # Sequential by default, parallel if input is true
+      max-parallel: ${{ github.event.inputs.parallel_execution == 'true' && 2 || 1 }}
+      matrix:
+        scraper_type: [spot, futures]
+    
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      COINALYZE_API_KEY: ${{ secrets.COINALYZE_API_KEY }}
+      
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Spot Scraper (Top 50)
+      - name: Run Spot Scraper
+        if: matrix.scraper_type == 'spot'
         run: |
-          # Use input if manual, otherwise default to 50
-          TOP=${{ inputs.top_n || 50 }}
-          python spot_scraper.py --top $TOP
-        continue-on-error: true
+          TOP=${{ github.event.inputs.top_n || 50 }}
+          python spot_scraper.py --limit $TOP
 
-      - name: Run Futures Scraper (Top 50 + Exchanges)
+      - name: Run Futures Scraper
+        if: matrix.scraper_type == 'futures'
         run: |
-          # Use input if manual, otherwise default to 50
-          TOP=${{ inputs.top_n || 50 }}
+          TOP=${{ github.event.inputs.top_n || 50 }}
           python alts_scraper.py --limit $TOP --exchanges binance,bybit,okx
-        continue-on-error: true

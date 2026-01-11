@@ -337,7 +337,7 @@ class DatabaseManager:
         conn = None
         try:
             conn = psycopg2.connect(self.db_url)
-            query = "SELECT symbol, narrative, is_filtered FROM asset_metadata"
+            query = "SELECT symbol, narrative, is_filtered, market_cap, market_cap_rank FROM asset_metadata"
             df = pd.read_sql(query, conn)
             return df
         except Exception as e:
@@ -394,13 +394,13 @@ def get_incremental_start(path: str, default_start_sec: int, symbol: str, exchan
 
     # Return logic
     if last_date:
-        # Re-fetch the last 7 days to ensure completeness (Hybrid patching)
-        fast_forward_sec = to_unix_seconds(last_date - timedelta(days=7))
+        # Re-fetch the last 14 days to ensure completeness (Coinalyze lag fix)
+        fast_forward_sec = to_unix_seconds(last_date - timedelta(days=14))
         
         # If the user didn't specify a start date (it's the 2017 default), 
         # or if the requested start is newer than our fast_forward, we use incremental.
-        # Threshold: 1483228800 is 2017-01-01 00:00:00 UTC.
         if default_start_sec <= 1483228800:
+            print(f"    [Start] Incremental mode (14d overlap): {datetime.fromtimestamp(fast_forward_sec, tz=UTC).date()}")
             return fast_forward_sec
             
         # If user provided a custom start date newer than 2017, respect it
@@ -1654,12 +1654,19 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
         df_history = fetcher.fetch_ls_ratios(symbol, limit=limit)
         
         if not df_history.empty:
+            print(f"    [Hybrid] Found {len(df_history)} L/S history records.")
             df = df.merge(df_history, on='date', how='left', suffixes=('', '_new'))
+            patched_count = 0
             for col in ls_cols:
                 new_col = f"{col}_new"
                 if new_col in df.columns:
+                    patched_rows = df[new_col].notna().sum()
                     df[col] = df[col].fillna(df[new_col])
                     df.drop(columns=[new_col], inplace=True)
+                    patched_count = max(patched_count, patched_rows)
+            print(f"    [Hybrid] Successfully patched L/S metrics for ~{patched_count} days.")
+        else:
+            print(f"    [Hybrid WARNING] No L/S history returned from native API.")
     
     # 4. Final Consistency Fix (Calculate Sell/Delta if components exist)
     if 'volume_base' in df.columns and 'buy_volume_base' in df.columns:
@@ -1744,6 +1751,7 @@ def main():
     parser.add_argument("--csv", action="store_true", help="Save results to local CSV files (default: False)")
     parser.add_argument("--exchanges", type=str, default="binance,bybit,okx",
                        help=f"Comma-separated list of exchanges, or 'all' for all (default: binance,bybit,okx). Available: {','.join(EXCHANGE_CODES.keys())}")
+    parser.add_argument("--metadata-only", action="store_true", help="Only sync metadata and exit")
     args = parser.parse_args()
     
     # Initialize API Clients
@@ -1777,9 +1785,14 @@ def main():
     default_start_sec = to_unix_seconds(start_dt)
     end_sec = to_unix_seconds(end_dt)
     
-    # Determine target tokens (base assets)
-    # Pass db_manager and respect --csv flag for metadata storage
+    # Initialize Metadata Manager with DB support
     meta = AssetMetadataManager(db_manager=db_manager, allow_csv=args.csv)
+    
+    # 1. Update existing metadata first
+    print(f"[DB] Syncing {len(meta.df)} cached assets metadata...")
+    for _, row in meta.df.iterrows():
+        db_manager.upsert_asset_metadata(row['symbol'], row['narrative'], int(row['is_filtered']), row.get('market_cap'), row.get('market_cap_rank'))
+
     target_bases = []
     
     if args.symbols:
@@ -1817,9 +1830,12 @@ def main():
             except Exception as e:
                 target_bases = valid_candidates[:args.top]
                 selection_desc = f"Top Tokens: {len(target_bases)}"
-        else:
             target_bases = valid_candidates[:args.top]
             selection_desc = f"Top Tokens: {len(target_bases)}"
+
+    if args.metadata_only:
+        print("[INFO] Metadata sync complete. Exiting (--metadata-only).")
+        return
 
     bases = target_bases
 
