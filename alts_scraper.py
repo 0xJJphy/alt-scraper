@@ -1840,6 +1840,7 @@ def main():
             except Exception as e:
                 target_bases = valid_candidates[:args.top]
                 selection_desc = f"Top Tokens: {len(target_bases)}"
+        else:
             target_bases = valid_candidates[:args.top]
             selection_desc = f"Top Tokens: {len(target_bases)}"
 
