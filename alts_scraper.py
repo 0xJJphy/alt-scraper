@@ -1418,6 +1418,7 @@ class BybitFuturesFetcher:
     }
 
     def __init__(self, timeout: int = 15, max_retries: int = 3):
+        self.base_url = self.BASE_URL
         self.timeout = timeout
         self.max_retries = max_retries
 
@@ -1511,6 +1512,7 @@ class OKXFuturesFetcher:
     }
 
     def __init__(self, timeout: int = 15, max_retries: int = 3):
+        self.base_url = self.BASE_URL
         self.timeout = timeout
         self.max_retries = max_retries
 
