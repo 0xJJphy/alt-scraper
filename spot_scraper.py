@@ -688,42 +688,48 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
         patch_start_dt = datetime.strptime(first_date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
         patch_start_ts = int(patch_start_dt.timestamp() * 1000)
         
-        print(f"    [Hybrid] Patching metrics via Coinalyze bulk history (from {first_date_str})...")
-        client = CoinalyzeClient(api_key)
         # Mapping for Coinalyze Spot symbols
-        # Note: Bybit uses prefix 's', but OKX and Binance usually don't for main Spot pairs.
-        cz_map = {"binance": ".A", "bybit": ".6", "okx": ".3"}
+        # Note: Coinalyze .3 suffix is for OKX FUTURES, not spot.
+        # OKX Spot txn_count is NOT available from Coinalyze or native OKX API.
+        cz_map = {"binance": ".A", "bybit": ".6"}  # OKX excluded - no spot txn_count data
         suffix = cz_map.get(exchange.lower(), '')
         prefix = "s" if exchange.lower() == "bybit" else ""
-        
-        # Binance Spot mapping is tricky on Coinalyze. Fallback sequence: USDT -> FDUSD -> USDC
-        syms_to_try = [f"{prefix}{base}USDT{suffix}"]
-        if exchange.lower() == "binance":
-            syms_to_try.extend([f"{base}FDUSD.A", f"{base}USDC.A"])
 
-        df_cz = pd.DataFrame()
-        for cz_sym in syms_to_try:
-            temp_df = client.fetch_ohlcv(cz_sym, patch_start_ts, to_unix_ms(datetime.now(timezone.utc)))
-            if not temp_df.empty:
-                # Check if we got any of the critical metrics (more permissive)
-                has_tx = 'txn_count' in temp_df.columns and temp_df['txn_count'].notna().any() and (temp_df['txn_count'] > 0).any()
-                has_btv = 'buy_volume_base' in temp_df.columns and temp_df['buy_volume_base'].notna().any()
-                
-                if has_tx or has_btv:
-                    df_cz = temp_df
-                    print(f"    [Hybrid] Using Coinalyze symbol: {cz_sym} (tx={has_tx}, btv={has_btv})")
-                    break
-        
-        if not df_cz.empty:
-            target_cols = ['buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count']
-            df = df.merge(df_cz[['date'] + [c for c in target_cols if c in df_cz.columns]], on='date', how='left', suffixes=('', '_new'))
-            for col in target_cols:
-                new_col = f"{col}_new"
-                if new_col in df.columns:
-                    # Fill if current is 0 or NaN, and new is not NaN
-                    df[col] = df[col].replace(0, pd.NA).fillna(df[new_col])
-                    df.drop(columns=[new_col], inplace=True)
-            print(f"    [Hybrid] Patched {base} with Coinalyze depth data.")
+        # Only patch from Coinalyze for exchanges that have spot data (Binance, Bybit)
+        if suffix:
+            print(f"    [Hybrid] Patching metrics via Coinalyze bulk history (from {first_date_str})...")
+            client = CoinalyzeClient(api_key)
+
+            # Binance Spot mapping is tricky on Coinalyze. Fallback sequence: USDT -> FDUSD -> USDC
+            syms_to_try = [f"{prefix}{base}USDT{suffix}"]
+            if exchange.lower() == "binance":
+                syms_to_try.extend([f"{base}FDUSD.A", f"{base}USDC.A"])
+
+            df_cz = pd.DataFrame()
+            for cz_sym in syms_to_try:
+                temp_df = client.fetch_ohlcv(cz_sym, patch_start_ts, to_unix_ms(datetime.now(timezone.utc)))
+                if not temp_df.empty:
+                    # Check if we got any of the critical metrics (more permissive)
+                    has_tx = 'txn_count' in temp_df.columns and temp_df['txn_count'].notna().any() and (temp_df['txn_count'] > 0).any()
+                    has_btv = 'buy_volume_base' in temp_df.columns and temp_df['buy_volume_base'].notna().any()
+
+                    if has_tx or has_btv:
+                        df_cz = temp_df
+                        print(f"    [Hybrid] Using Coinalyze symbol: {cz_sym} (tx={has_tx}, btv={has_btv})")
+                        break
+
+            if not df_cz.empty:
+                target_cols = ['buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count']
+                df = df.merge(df_cz[['date'] + [c for c in target_cols if c in df_cz.columns]], on='date', how='left', suffixes=('', '_new'))
+                for col in target_cols:
+                    new_col = f"{col}_new"
+                    if new_col in df.columns:
+                        # Fill if current is 0 or NaN, and new is not NaN
+                        df[col] = df[col].replace(0, pd.NA).fillna(df[new_col])
+                        df.drop(columns=[new_col], inplace=True)
+                print(f"    [Hybrid] Patched {base} with Coinalyze depth data.")
+        elif exchange.lower() == "okx":
+            print(f"    [Hybrid] Note: OKX Spot txn_count not available (Coinalyze has no OKX spot data)")
 
     # 3. Special Case: OKX Rubik Delta
     if exchange.lower() == "okx":
