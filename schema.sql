@@ -506,7 +506,8 @@ CREATE TRIGGER trigger_update_timestamp_symbols
 -- ==============================================================================
 
 -- View: Latest data per symbol
-CREATE OR REPLACE VIEW v_latest_metrics AS
+CREATE OR REPLACE VIEW v_latest_metrics 
+WITH (security_invoker = on) AS
 SELECT DISTINCT ON (symbol, exchange)
     date,
     symbol,
@@ -522,7 +523,8 @@ FROM futures_daily_metrics
 ORDER BY symbol, exchange, date DESC;
 
 -- View: Daily summary across all exchanges
-CREATE OR REPLACE VIEW v_daily_summary AS
+CREATE OR REPLACE VIEW v_daily_summary 
+WITH (security_invoker = on) AS
 SELECT 
     date,
     COUNT(DISTINCT base_asset) as asset_count,
@@ -808,6 +810,7 @@ Can be scheduled via pg_cron or called from Python after data import.';
 ALTER TABLE futures_daily_metrics ENABLE ROW LEVEL SECURITY;
 ALTER TABLE exchanges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE symbols ENABLE ROW LEVEL SECURITY;
+ALTER TABLE futures_daily_metrics_staging ENABLE ROW LEVEL SECURITY;
 
 -- Policy: Allow read access to all authenticated users
 CREATE POLICY "Allow read access to authenticated users"
@@ -828,6 +831,13 @@ ON exchanges FOR SELECT TO authenticated USING (true);
 
 CREATE POLICY "Allow read symbols"
 ON symbols FOR SELECT TO authenticated USING (true);
+
+-- Policy: Allow full access for service role on staging table
+CREATE POLICY "Allow service_role full access to staging"
+ON futures_daily_metrics_staging FOR ALL
+TO service_role
+USING (true)
+WITH CHECK (true);
 
 -- ==============================================================================
 -- UTILITY FUNCTIONS
