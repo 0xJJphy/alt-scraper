@@ -35,7 +35,7 @@ env:
 
 jobs:
   sync-metadata:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, jjphy-vps]
     timeout-minutes: 20
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
