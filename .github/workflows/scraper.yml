@@ -92,3 +92,19 @@ jobs:
         run: |
           TOP=${{ github.event.inputs.top_n || 50 }}
           python alts_scraper.py --limit $TOP --exchanges binance,bybit,okx
+
+  refresh-views:
+    needs: run-scrapers
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - name: Refresh Materialized Views
+        run: |
+          sudo apt-get install -y postgresql-client -q
+          psql "$DATABASE_URL" <<-SQL
+            REFRESH MATERIALIZED VIEW mv_aggregated_by_asset;
+            REFRESH MATERIALIZED VIEW mv_global_market;
+            REFRESH MATERIALIZED VIEW mv_trading_metrics;
+          SQL
