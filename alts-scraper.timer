@@ -1,0 +1,15 @@
+[Unit]
+Description=Run Alts Scraper 3 times daily
+
+[Timer]
+# 1. Daily Close: 00:15 UTC
+OnCalendar=*-*-* 00:15:00 UTC
+# 2. US Session Open: 14:00 UTC
+OnCalendar=*-*-* 14:00:00 UTC
+# 3. Pre-Close: 18:00 UTC
+OnCalendar=*-*-* 18:00:00 UTC
+
+Persistent=true
+
+[Install]
+WantedBy=timers.target

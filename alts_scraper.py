@@ -607,7 +607,7 @@ class CoinalyzeClient:
         params = dict(params or {})
         params["api_key"] = self.api_key
         
-        for attempt in range(5):
+        for attempt in range(3):
             time.sleep(self.rate_delay)
             try:
                 resp = requests.get(url, params=params, timeout=60)
@@ -616,23 +616,27 @@ class CoinalyzeClient:
                     return resp.json()
                     
                 if resp.status_code == 429:
-                    # Rate limited - wait for Retry-After header
-                    retry_after = int(resp.headers.get("Retry-After", "30"))
-                    print(f"[WARN] Rate limited, waiting {retry_after}s...")
-                    time.sleep(retry_after + 1)
+                    # Rate limited - honor Retry-After or default to 10s as requested
+                    retry_after = int(resp.headers.get("Retry-After", "10"))
+                    print(f"    [Coinalyze Retry] Rate limited, waiting {retry_after}s (attempt {attempt+1}/3)...")
+                    time.sleep(retry_after)
                     continue
                     
                 if resp.status_code in (400, 401, 403, 404):
-                    # Client error - symbol not supported or invalid request
+                    # Client error
                     return None
                     
-                # Server error - exponential backoff
-                time.sleep(2 ** attempt)
+                # Server error - 10s backoff
+                print(f"    [Coinalyze Retry] Server error {resp.status_code}, retrying in 10s...")
+                time.sleep(10)
                 
             except requests.RequestException as e:
-                print(f"[ERROR] Request failed: {e}")
-                time.sleep(2 ** attempt)
-                
+                print(f"    [Coinalyze Error] Request failed: {e}")
+                if attempt < 2:
+                    time.sleep(10)
+                else:
+                    return None
+                    
         return None
     
     def load_future_symbols(self) -> dict:

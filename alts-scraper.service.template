@@ -1,0 +1,16 @@
+[Unit]
+Description=Alts Scraper Pipeline
+After=network.target
+OnFailure=alts-scraper-notify@%n.service
+
+[Service]
+Type=simple
+User={{USER}}
+WorkingDirectory={{INSTALL_DIR}}
+EnvironmentFile={{INSTALL_DIR}}/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/bash {{INSTALL_DIR}}/vps_run.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

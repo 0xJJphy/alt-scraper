@@ -1,0 +1,10 @@
+[Unit]
+Description=Failure notification for %i
+After=network.target
+
+[Service]
+Type=oneshot
+# We run as the repo owner to access scripts and .env
+User={{USER}}
+WorkingDirectory={{INSTALL_DIR}}
+ExecStart=/usr/bin/bash {{INSTALL_DIR}}/notify_vps.sh FAILURE %i

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add .github/workflows/scraper.yml)",
+      "Bash(git commit:*)"
+    ]
+  }
+}

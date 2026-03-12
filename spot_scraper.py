@@ -463,7 +463,7 @@ class CoinalyzeClient:
         self.api_key = api_key
         self.headers = {"api-key": api_key}
 
-    def fetch_ohlcv(self, symbol: str, start_ts: int, end_ts: int) -> pd.DataFrame:
+    def fetch_ohlcv(self, symbol: str, start_ts: int, end_ts: int, max_retries: int = 3) -> pd.DataFrame:
         url = f"{COINALYZE_BASE}/ohlcv-history"
         params = {
             "symbols": symbol,
@@ -471,38 +471,56 @@ class CoinalyzeClient:
             "from": start_ts // 1000,
             "to": end_ts // 1000
         }
-        try:
-            resp = requests.get(url, params=params, headers=self.headers)
-            resp.raise_for_status()
-            data = resp.json()
-            if not data or not data[0].get('history'): return pd.DataFrame()
-            
-            history = data[0]['history']
-            df = pd.DataFrame(history)
-            df.rename(columns={
-                't': 'timestamp', 'o': 'price_open', 'h': 'price_high', 
-                'l': 'price_low', 'c': 'price_close', 'v': 'volume_base', 
-                'bv': 'buy_volume_base', 'tx': 'txn_count', 'btx': 'buy_txn_count'
-            }, inplace=True)
-            
-            df['date'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.strftime('%Y-%m-%d')
-            df['volume_usd'] = df['volume_base'] * df['price_close']
-            
-            # Derived metrics
-            if 'buy_volume_base' in df.columns:
-                df['sell_volume_base'] = df['volume_base'] - df['buy_volume_base']
-                df['volume_delta'] = df['buy_volume_base'] - df['sell_volume_base']
-            
-            if 'txn_count' in df.columns and 'buy_txn_count' in df.columns:
-                df['sell_txn_count'] = df['txn_count'] - df['buy_txn_count']
-            
-            for col in ['txn_count', 'buy_txn_count', 'sell_txn_count']:
-                if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(url, params=params, headers=self.headers, timeout=30)
                 
-            return df
-        except Exception as e:
-            print(f"    [Coinalyze Error] {e}")
-            return pd.DataFrame()
+                if resp.status_code == 429:
+                    print(f"    [Coinalyze Retry] Rate limited for {symbol}, waiting 10s (attempt {attempt+1}/{max_retries})...")
+                    time.sleep(10)
+                    continue
+                
+                resp.raise_for_status()
+                data = resp.json()
+                if not data or not data[0].get('history'): return pd.DataFrame()
+                
+                history = data[0]['history']
+                df = pd.DataFrame(history)
+                df.rename(columns={
+                    't': 'timestamp', 'o': 'price_open', 'h': 'price_high', 
+                    'l': 'price_low', 'c': 'price_close', 'v': 'volume_base', 
+                    'bv': 'buy_volume_base', 'tx': 'txn_count', 'btx': 'buy_txn_count'
+                }, inplace=True)
+                
+                df['date'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.strftime('%Y-%m-%d')
+                df['volume_usd'] = df['volume_base'] * df['price_close']
+                
+                # Derived metrics
+                if 'buy_volume_base' in df.columns:
+                    df['sell_volume_base'] = df['volume_base'] - df['buy_volume_base']
+                    df['volume_delta'] = df['buy_volume_base'] - df['sell_volume_base']
+                
+                if 'txn_count' in df.columns and 'buy_txn_count' in df.columns:
+                    df['sell_txn_count'] = df['txn_count'] - df['buy_txn_count']
+                
+                for col in ['txn_count', 'buy_txn_count', 'sell_txn_count']:
+                    if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+                    
+                return df
+                
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    print(f"    [Coinalyze Retry] Request failed for {symbol}: {e}. Retrying in 10s...")
+                    time.sleep(10)
+                else:
+                    print(f"    [Coinalyze Error] {e}")
+                    return pd.DataFrame()
+            except Exception as e:
+                print(f"    [Coinalyze Error] Unexpected error: {e}")
+                return pd.DataFrame()
+                
+        return pd.DataFrame()
 
 # ==============================================================================
 # Exchange Fetchers (Standardized)
