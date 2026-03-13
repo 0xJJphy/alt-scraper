@@ -1,5 +1,5 @@
 #!/bin/bash
-# setup_vps.sh - Automates the deployment of alts-scraper systemd units
+# setup_vps.sh - Automates the deployment of alt-scraper systemd units
 
 # --- Configuration ---
 INSTALL_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
@@ -16,23 +16,23 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo "--- Alts-Scraper VPS Setup ---"
+echo "--- Alt-Scraper VPS Setup ---"
 echo "Installation Directory: $INSTALL_DIR"
 echo "Execution User: $EXEC_USER"
 
 # 1. Generate Service File from Template
-echo "Generating alts-scraper.service..."
+echo "Generating alt-scraper.service..."
 sed -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
     -e "s|{{USER}}|$EXEC_USER|g" \
-    alts-scraper.service.template > alts-scraper.service
+    alt-scraper.service.template > alt-scraper.service
 
 # 2. Copy to systemd directory
 echo "Installing systemd units..."
 # Main service and timer
-cp alts-scraper.service /etc/systemd/system/
-cp alts-scraper.timer /etc/systemd/system/
+cp alt-scraper.service /etc/systemd/system/
+cp alt-scraper.timer /etc/systemd/system/
 # Notification service
-sed "s|{{INSTALL_DIR}}|$INSTALL_DIR|g; s|{{USER}}|$EXEC_USER|g" alts-scraper-notify@.service.template > /etc/systemd/system/alts-scraper-notify@.service
+sed "s|{{INSTALL_DIR}}|$INSTALL_DIR|g; s|{{USER}}|$EXEC_USER|g" alt-scraper-notify@.service.template > /etc/systemd/system/alt-scraper-notify@.service
 
 # 3. Set Permissions for vps_run.sh and Directories
 echo "Setting permissions for execution user: $EXEC_USER..."
@@ -55,12 +55,12 @@ chmod 755 "$INSTALL_DIR"
 # 4. Reload systemd
 echo "Reloading systemd and enabling timer..."
 systemctl daemon-reload
-systemctl enable alts-scraper.timer
-systemctl restart alts-scraper.timer
+systemctl enable alt-scraper.timer
+systemctl restart alt-scraper.timer
 
 echo ""
 echo "Setup complete!"
 echo "Timer status:"
-systemctl status alts-scraper.timer --no-pager
+systemctl status alt-scraper.timer --no-pager
 echo ""
-echo "To view logs, run: journalctl -u alts-scraper.service -f"
+echo "To view logs, run: journalctl -u alt-scraper.service -f"

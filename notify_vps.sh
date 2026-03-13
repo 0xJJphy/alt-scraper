@@ -3,7 +3,7 @@
 # Usage: ./notify_vps.sh <START|SUCCESS|FAILURE> <SERVICE_NAME> [DURATION]
 
 EVENT_TYPE=${1:-"FAILURE"}
-UNIT=${2:-"alts-scraper.service"}
+UNIT=${2:-"alt-scraper.service"}
 DURATION=${3:-""}
 
 # Load environment variables

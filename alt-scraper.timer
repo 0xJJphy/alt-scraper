@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Alts Scraper 3 times daily
+Description=Run Alt Scraper 3 times daily
 
 [Timer]
 # 1. Daily Close: 00:15 UTC

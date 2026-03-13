@@ -17,7 +17,7 @@ def main():
     # Get absolute paths to scripts
     base_dir = os.path.dirname(os.path.abspath(__file__))
     spot_script = os.path.join(base_dir, "spot_scraper.py")
-    alts_script = os.path.join(base_dir, "alts_scraper.py")
+    alts_script = os.path.join(base_dir, "alt_scraper.py")
     
     top_n = os.getenv("TOP_N", "50")
     db_url = os.getenv("DATABASE_URL")

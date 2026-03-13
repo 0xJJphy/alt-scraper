@@ -1,7 +1,7 @@
 [Unit]
-Description=Alts Scraper Pipeline
+Description=Alt Scraper Pipeline
 After=network.target
-OnFailure=alts-scraper-notify@%n.service
+OnFailure=alt-scraper-notify@%n.service
 
 [Service]
 Type=simple

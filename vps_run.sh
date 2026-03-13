@@ -17,7 +17,7 @@ fi
 
 # Ensure logs directory exists
 mkdir -p "$DIR/logs"
-LOG_FILE="$DIR/logs/alts-scraper_$(date +%Y%m%d).log"
+LOG_FILE="$DIR/logs/alt-scraper_$(date +%Y%m%d).log"
 
 # Cleanup logs older than 3 days
 echo "[$(date)] 🧹 Cleaning up logs older than 3 days..."
@@ -27,9 +27,9 @@ find "$DIR/logs" -name "*.log" -mtime +3 -delete 2>/dev/null || true
 run_scraper() {
     # Capture Start Time
     START_TIME=$(date +%s)
-    bash "$DIR/notify_vps.sh" START "alts-scraper.service"
+    bash "$DIR/notify_vps.sh" START "alt-scraper.service"
 
-    echo "[$(date)] Starting Alts Scraper Pipeline from $DIR"
+    echo "[$(date)] Starting Alt Scraper Pipeline from $DIR"
     $PYTHON_EXEC -u run_pipeline.py
     LOCAL_EXIT_CODE=$?
 
@@ -41,7 +41,7 @@ run_scraper() {
     echo "[$(date)] Pipeline Execution Finished (Exit Code: $LOCAL_EXIT_CODE, Duration: $DURATION_HUMAN)"
 
     if [ $LOCAL_EXIT_CODE -eq 0 ]; then
-        bash "$DIR/notify_vps.sh" SUCCESS "alts-scraper.service" "$DURATION_HUMAN"
+        bash "$DIR/notify_vps.sh" SUCCESS "alt-scraper.service" "$DURATION_HUMAN"
     fi
     
     return $LOCAL_EXIT_CODE
