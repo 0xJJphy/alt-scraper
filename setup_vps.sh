@@ -38,10 +38,10 @@ sed "s|{{INSTALL_DIR}}|$INSTALL_DIR|g; s|{{USER}}|$EXEC_USER|g" alts-scraper-not
 echo "Setting permissions for execution user: $EXEC_USER..."
 chmod +x "$INSTALL_DIR/vps_run.sh"
 
-# Ensure data directory exists and is owned by the repo owner
-mkdir -p "$INSTALL_DIR/data"
-chown -R "$EXEC_USER:$EXEC_USER" "$INSTALL_DIR/data"
-chmod -R 755 "$INSTALL_DIR/data"
+# Ensure data and logs directories exist and are owned by the repo owner
+mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
+chown -R "$EXEC_USER:$EXEC_USER" "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
+chmod -R 755 "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
 
 # Ensure venv is owned by the repo owner if it exists
 if [ -d "$INSTALL_DIR/venv" ]; then
