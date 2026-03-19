@@ -364,6 +364,45 @@ class DatabaseManager:
         finally:
             if conn: conn.close()
 
+    def bulk_upsert_asset_metadata(self, df: pd.DataFrame):
+        """Efficiently upsert multiple metadata records in a single connection."""
+        if not self.enabled or df.empty: return
+        
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+            
+            records = []
+            for _, row in df.iterrows():
+                # Extract columns safely
+                m_cap = row.get('market_cap')
+                m_rank = row.get('market_cap_rank')
+                
+                records.append((
+                    self._to_python(row['symbol']),
+                    self._to_python(row['narrative']),
+                    bool(row['is_filtered']),
+                    self._sanitize_float(m_cap),
+                    self._sanitize_int(m_rank)
+                ))
+            
+            sql = """
+                SELECT upsert_asset_metadata(
+                    v.symbol, v.narrative, v.is_filtered, v.market_cap, v.market_cap_rank
+                )
+                FROM (VALUES %s) AS v(symbol, narrative, is_filtered, market_cap, market_cap_rank)
+            """
+            execute_values(cur, sql, records, page_size=100)
+            conn.commit()
+            cur.close()
+            print(f"    [DB] Bulk synced {len(records)} metadata records.")
+        except Exception as e:
+            print(f"    [DB ERROR] Bulk metadata sync failed: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+
 
 def get_incremental_start(path: str, default_start_sec: int, symbol: str, exchange: str, db_manager: Optional[DatabaseManager] = None) -> int:
     """
@@ -414,34 +453,44 @@ class AssetMetadataManager:
         self.file_path = file_path
         self.db_manager = db_manager
         self.allow_csv = allow_csv
+        self.df = pd.DataFrame(columns=['symbol', 'narrative', 'is_filtered', 'market_cap', 'market_cap_rank'])
         
-        # Load from DB first if enabled
-        db_loaded = False
+        # 1. Load from CSV first (if exists)
+        csv_df = pd.DataFrame()
+        if os.path.exists(file_path):
+            try:
+                csv_df = pd.read_csv(file_path)
+                print(f"  [Meta] Loaded {len(csv_df)} assets from CSV")
+            except Exception as e:
+                print(f"  [Meta Check] Could not read CSV: {e}")
+
+        # 2. Load from DB (if enabled)
+        db_df = pd.DataFrame()
         if self.db_manager and self.db_manager.enabled:
             print("  [Meta] Loading from Database...")
             db_df = self.db_manager.get_all_asset_metadata()
             if not db_df.empty:
-                self.df = db_df
-                db_loaded = True
-                print(f"  [Meta] Loaded {len(self.df)} assets from DB")
+                print(f"  [Meta] Loaded {len(db_df)} assets from DB")
 
-        # Fallback to CSV or create new
-        if not db_loaded:
-             if os.path.exists(file_path):
-                try:
-                    self.df = pd.read_csv(file_path)
-                    if 'is_filtered' in self.df.columns:
-                        self.df['is_filtered'] = self.df['is_filtered'].astype(int)
-                except:
-                     self.df = pd.DataFrame(columns=['symbol', 'narrative', 'is_filtered'])
-             else:
-                self.df = pd.DataFrame(columns=['symbol', 'narrative', 'is_filtered'])
+        # 3. Merge (CSV takes priority for narrative/filter if both exist)
+        if not csv_df.empty and not db_df.empty:
+            # Union of symbols
+            self.df = pd.concat([csv_df, db_df], ignore_index=True).drop_duplicates('symbol', keep='first')
+        elif not csv_df.empty:
+            self.df = csv_df
+        elif not db_df.empty:
+            self.df = db_df
+        
+        # Ensure correct types
+        if not self.df.empty:
+            if 'is_filtered' in self.df.columns:
+                self.df['is_filtered'] = pd.to_numeric(self.df['is_filtered'], errors='coerce').fillna(0).astype(int)
+            self.df['symbol'] = self.df['symbol'].str.upper()
 
-        # Create/Touch CSV if allowed
-        if self.allow_csv:
+        # Create/Touch CSV if allowed and not exists
+        if self.allow_csv and not os.path.exists(file_path):
              os.makedirs(os.path.dirname(file_path), exist_ok=True)
-             if not os.path.exists(file_path) or not db_loaded: # Only write if new or not from DB
-                 self.df.to_csv(file_path, index=False)
+             self.df.to_csv(file_path, index=False)
 
     def _select_best_narrative(self, categories: List[str]) -> str:
         """Pick the most significant narrative from a list of categories."""
@@ -1820,41 +1869,48 @@ def main():
                 target_bases.append(c['symbol'])
         selection_desc = f"Specific Symbols: {len(target_bases)}"
     else:
-        limit = 50
+        limit = args.top
         if args.top_range:
             try:
                 start_rank, end_rank = map(int, args.top_range.split("-"))
                 limit = end_rank
             except ValueError:
                 limit = args.top
-        else:
-            limit = args.top
 
+        # A. Start with all non-filtered tokens already in our metadata (DB-first continuity)
+        # This keeps updating tokens that drop out of the top 50
+        tracked_active = meta.df[meta.df['is_filtered'] == 0]['symbol'].tolist()
+        target_bases = [s for s in tracked_active if s not in ['BTC', 'ETH']] # Filter main pairs if desired, though usually kept
+        
+        # B. Add current top candidates from CoinGecko
         candidates = coingecko_get_top_candidates(n=limit)
-        valid_candidates = []
+        new_top_symbols = []
         for c in candidates:
             res = meta.get_metadata(c['symbol'], c['id'], c.get('market_cap'), c.get('market_cap_rank'))
             if res['is_filtered'] == 0:
-                valid_candidates.append(c['symbol'])
-            if len(valid_candidates) >= limit: break
+                new_top_symbols.append(c['symbol'])
+            if len(new_top_symbols) >= limit: break
             
+        # Combine lists
+        target_bases = list(dict.fromkeys(target_bases + new_top_symbols)) # Preserve uniqueness and order
+        
         if args.top_range:
             try:
                 start_rank, end_rank = map(int, args.top_range.split("-"))
-                target_bases = valid_candidates[start_rank-1:end_rank]
+                target_bases = target_bases[start_rank-1:end_rank]
                 selection_desc = f"Top Range: {start_rank}-{start_rank + len(target_bases) - 1}"
             except Exception as e:
-                target_bases = valid_candidates[:args.top]
+                target_bases = target_bases[:args.top]
                 selection_desc = f"Top Tokens: {len(target_bases)}"
         else:
-            target_bases = valid_candidates[:args.top]
+            target_bases = target_bases[:max(len(target_bases), args.top)]
             selection_desc = f"Top Tokens: {len(target_bases)}"
 
     if args.metadata_only:
-        # 1. Update existing metadata first
-        print(f"[DB] Syncing {len(meta.df)} cached assets metadata...")
-        for _, row in meta.df.iterrows():
-            db_manager.upsert_asset_metadata(row['symbol'], row['narrative'], int(row['is_filtered']), row.get('market_cap'), row.get('market_cap_rank'))
+        # 1. Update existing metadata first (Efficient bulk sync)
+        if db_manager.enabled and not meta.df.empty:
+            print(f"[DB] Bulk syncing {len(meta.df)} cached assets metadata...")
+            db_manager.bulk_upsert_asset_metadata(meta.df)
         print("[INFO] Metadata sync complete. Exiting (--metadata-only).")
         return
 
