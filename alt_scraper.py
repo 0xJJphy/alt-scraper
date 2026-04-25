@@ -20,12 +20,14 @@ Date: 2026-01-10
 
 import os
 import time
+import threading
 import argparse
 import requests
 import pandas as pd
 import psycopg2
 import warnings
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from psycopg2.extras import execute_values
 from datetime import datetime, timedelta, timezone, time as dtime
 
@@ -42,6 +44,7 @@ load_dotenv()
 # ==============================================================================
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
+COINALYZE_BATCH_SIZE = 10  # symbols per batch request (confirmed working)
 
 # Coinalyze API Endpoints
 COINALYZE_ENDPOINTS = {
@@ -572,7 +575,7 @@ def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[st
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=30)
             if resp.status_code == 429:
-                wait_time = int(resp.headers.get("Retry-After", 60))
+                wait_time = int(float(resp.headers.get("Retry-After", 60)))
                 print(f"[CG] Rate limited, waiting {wait_time}s...")
                 time.sleep(wait_time)
                 continue
@@ -616,6 +619,25 @@ def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[st
 
 
 # ==============================================================================
+# Shared Rate Limiter (thread-safe — enforces global call budget across threads)
+# ==============================================================================
+class ThreadSafeRateLimiter:
+    """Ensures a minimum interval between API calls across all parallel threads."""
+    def __init__(self, min_interval: float):
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+        self._min_interval = min_interval
+
+    def wait(self):
+        with self._lock:
+            now = time.time()
+            gap = self._min_interval - (now - self._last_call)
+            if gap > 0:
+                time.sleep(gap)
+            self._last_call = time.time()
+
+
+# ==============================================================================
 # Coinalyze API Client
 # ==============================================================================
 class CoinalyzeClient:
@@ -626,16 +648,18 @@ class CoinalyzeClient:
     See: https://coinalyze.net/api-docs/
     """
     
-    def __init__(self, api_key: str, rate_delay: float = 1.6):
+    def __init__(self, api_key: str, rate_delay: float = 1.6, rate_limiter: Optional['ThreadSafeRateLimiter'] = None):
         """
         Initialize Coinalyze client.
-        
+
         Args:
             api_key: Coinalyze API key
             rate_delay: Delay between API calls in seconds (default 1.6s = ~37 calls/min)
+            rate_limiter: Optional shared ThreadSafeRateLimiter for parallel execution
         """
         self.api_key = api_key
         self.rate_delay = rate_delay
+        self._rate_limiter = rate_limiter
         self._future_symbols_cache: Optional[set] = None
         
     def _get(self, url: str, params: dict) -> Optional[dict]:
@@ -657,7 +681,10 @@ class CoinalyzeClient:
         params["api_key"] = self.api_key
         
         for attempt in range(3):
-            time.sleep(self.rate_delay)
+            if self._rate_limiter:
+                self._rate_limiter.wait()
+            else:
+                time.sleep(self.rate_delay)
             try:
                 resp = requests.get(url, params=params, timeout=60)
                 
@@ -666,7 +693,7 @@ class CoinalyzeClient:
                     
                 if resp.status_code == 429:
                     # Rate limited - honor Retry-After or default to 10s as requested
-                    retry_after = int(resp.headers.get("Retry-After", "10"))
+                    retry_after = int(float(resp.headers.get("Retry-After", "10")))
                     print(f"    [Coinalyze Retry] Rate limited, waiting {retry_after}s (attempt {attempt+1}/3)...")
                     time.sleep(retry_after)
                     continue
@@ -687,7 +714,110 @@ class CoinalyzeClient:
                     return None
                     
         return None
-    
+
+    def _get_batch(self, url: str, symbols: List[str], params: dict) -> Dict[str, List]:
+        """Single API call for multiple symbols. Returns {symbol: history_list}."""
+        if not symbols:
+            return {}
+        p = dict(params or {})
+        p["symbols"] = ",".join(symbols)
+        p["api_key"] = self.api_key
+
+        for attempt in range(3):
+            if self._rate_limiter:
+                self._rate_limiter.wait()
+            else:
+                time.sleep(self.rate_delay)
+            try:
+                resp = requests.get(url, params=p, timeout=60)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        return {item["symbol"]: item.get("history", []) for item in data}
+                    return {}
+                if resp.status_code == 429:
+                    retry_after = int(float(resp.headers.get("Retry-After", "10")))
+                    print(f"    [Coinalyze Retry] Rate limited, waiting {retry_after}s (attempt {attempt+1}/3)...")
+                    time.sleep(retry_after)
+                    continue
+                if resp.status_code in (400, 401, 403, 404):
+                    return {}
+                print(f"    [Coinalyze Retry] Server error {resp.status_code}, retrying in 10s...")
+                time.sleep(10)
+            except requests.RequestException as e:
+                print(f"    [Coinalyze Error] Batch request failed: {e}")
+                if attempt < 2:
+                    time.sleep(10)
+                else:
+                    return {}
+        return {}
+
+    def _parse_ohlc_batch(self, raw: Dict[str, List], col_map: Dict[str, str], numeric_cols: List[str]) -> Dict[str, pd.DataFrame]:
+        """Parse batch history response using a column rename map. Returns {symbol: DataFrame}."""
+        result = {}
+        for sym, history in raw.items():
+            if not history:
+                continue
+            df = pd.DataFrame(history).rename(columns=col_map)
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+            df["date"] = df["timestamp"].dt.strftime("%Y-%m-%d")
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            out_cols = ["date"] + [c for c in numeric_cols if c in df.columns]
+            result[sym] = df[out_cols].drop_duplicates("date").sort_values("date")
+        return result
+
+    def open_interest_daily_batch(self, symbols: List[str], start_sec: int, end_sec: int, convert_to_usd: bool = True) -> Dict[str, pd.DataFrame]:
+        params = {"interval": "daily", "from": start_sec, "to": end_sec, "convert_to_usd": "true" if convert_to_usd else "false"}
+        raw = self._get_batch(COINALYZE_ENDPOINTS["open_interest_history"], symbols, params)
+        return self._parse_ohlc_batch(raw, {"t": "timestamp", "o": "oi_usd_open", "h": "oi_usd_high", "l": "oi_usd_low", "c": "oi_usd_close"},
+                                      ["oi_usd_open", "oi_usd_high", "oi_usd_low", "oi_usd_close"])
+
+    def funding_rate_daily_batch(self, symbols: List[str], start_sec: int, end_sec: int) -> Dict[str, pd.DataFrame]:
+        params = {"interval": "daily", "from": start_sec, "to": end_sec}
+        raw = self._get_batch(COINALYZE_ENDPOINTS["funding_rate_history"], symbols, params)
+        return self._parse_ohlc_batch(raw, {"t": "timestamp", "o": "funding_open", "h": "funding_high", "l": "funding_low", "c": "funding_close"},
+                                      ["funding_open", "funding_high", "funding_low", "funding_close"])
+
+    def predicted_funding_rate_daily_batch(self, symbols: List[str], start_sec: int, end_sec: int) -> Dict[str, pd.DataFrame]:
+        params = {"interval": "daily", "from": start_sec, "to": end_sec}
+        raw = self._get_batch(COINALYZE_ENDPOINTS["predicted_funding_rate_history"], symbols, params)
+        return self._parse_ohlc_batch(raw, {"t": "timestamp", "o": "pred_funding_open", "h": "pred_funding_high", "l": "pred_funding_low", "c": "pred_funding_close"},
+                                      ["pred_funding_open", "pred_funding_high", "pred_funding_low", "pred_funding_close"])
+
+    def long_short_ratio_daily_batch(self, symbols: List[str], start_sec: int, end_sec: int) -> Dict[str, pd.DataFrame]:
+        params = {"interval": "daily", "from": start_sec, "to": end_sec}
+        raw = self._get_batch(COINALYZE_ENDPOINTS["long_short_ratio_history"], symbols, params)
+        return self._parse_ohlc_batch(raw, {"t": "timestamp", "r": "ls_ratio", "l": "longs_qty", "s": "shorts_qty"},
+                                      ["ls_ratio", "longs_qty", "shorts_qty"])
+
+    def liquidation_daily_batch(self, symbols: List[str], start_sec: int, end_sec: int) -> Dict[str, pd.DataFrame]:
+        params = {"interval": "daily", "from": start_sec, "to": end_sec}
+        raw = self._get_batch(COINALYZE_ENDPOINTS["liquidation_history"], symbols, params)
+        result = self._parse_ohlc_batch(raw, {"t": "timestamp", "l": "liq_longs", "s": "liq_shorts"},
+                                        ["liq_longs", "liq_shorts"])
+        for sym, df in result.items():
+            df["liq_total"] = df["liq_longs"].fillna(0) + df["liq_shorts"].fillna(0)
+        return result
+
+    def ohlcv_daily_batch(self, symbols: List[str], start_sec: int, end_sec: int) -> Dict[str, pd.DataFrame]:
+        params = {"interval": "daily", "from": start_sec, "to": end_sec}
+        raw = self._get_batch(COINALYZE_ENDPOINTS["ohlcv_history"], symbols, params)
+        numeric = ["price_open", "price_high", "price_low", "price_close", "volume_base", "buy_volume_base", "txn_count", "buy_txn_count"]
+        result = self._parse_ohlc_batch(raw, {"t": "timestamp", "o": "price_open", "h": "price_high", "l": "price_low",
+                                               "c": "price_close", "v": "volume_base", "bv": "buy_volume_base",
+                                               "tx": "txn_count", "btx": "buy_txn_count"}, numeric)
+        for sym, df in result.items():
+            if "volume_base" in df.columns and "buy_volume_base" in df.columns:
+                df["sell_volume_base"] = df["volume_base"] - df["buy_volume_base"]
+                df["volume_delta"] = df["buy_volume_base"] - df["sell_volume_base"]
+            if "txn_count" in df.columns and "buy_txn_count" in df.columns:
+                df["sell_txn_count"] = df["txn_count"] - df["buy_txn_count"]
+            if "volume_base" in df.columns and "price_close" in df.columns:
+                df["volume_usd"] = df["volume_base"] * df["price_close"]
+        return result
+
     def load_future_symbols(self) -> dict:
         """
         Load all available futures symbols from Coinalyze and organize by exchange.
@@ -1377,7 +1507,7 @@ class BinanceFuturesFetcher:
                 if resp.status_code == 200:
                     return resp.json()
                 elif resp.status_code == 429:
-                    wait_time = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    wait_time = int(float(resp.headers.get("Retry-After", 2 ** attempt)))
                     print(f"    [Binance] Rate limited, waiting {wait_time}s...")
                     time.sleep(wait_time)
                     continue
@@ -1487,7 +1617,7 @@ class BybitFuturesFetcher:
                 if resp.status_code == 200:
                     return resp.json()
                 elif resp.status_code == 429:
-                    wait_time = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    wait_time = int(float(resp.headers.get("Retry-After", 2 ** attempt)))
                     print(f"    [Bybit] Rate limited, waiting {wait_time}s...")
                     time.sleep(wait_time)
                     continue
@@ -1584,7 +1714,7 @@ class OKXFuturesFetcher:
                     print(f"    [OKX] API error code: {data.get('code')}, msg: {data.get('msg')}")
                     return None
                 elif resp.status_code == 429:
-                    wait_time = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    wait_time = int(float(resp.headers.get("Retry-After", 2 ** attempt)))
                     print(f"    [OKX] Rate limited, waiting {wait_time}s...")
                     time.sleep(wait_time)
                     continue
@@ -1793,6 +1923,122 @@ def fetch_hybrid_futures_data(client: CoinalyzeClient,
     return df_final
 
 
+def _coinalyze_batch_fetch(client: CoinalyzeClient, symbols: List[str], start_sec: int, end_sec: int) -> Dict[str, List[pd.DataFrame]]:
+    """Fetch all 6 Coinalyze endpoints for a batch of symbols in 6 API calls.
+    Returns {symbol: [df_liq, df_pred, df_oi, df_f, df_ls, df_ohlcv]} (empty DFs for missing data).
+    """
+    oi    = client.open_interest_daily_batch(symbols, start_sec, end_sec)
+    fund  = client.funding_rate_daily_batch(symbols, start_sec, end_sec)
+    pred  = client.predicted_funding_rate_daily_batch(symbols, start_sec, end_sec)
+    ls    = client.long_short_ratio_daily_batch(symbols, start_sec, end_sec)
+    liq   = client.liquidation_daily_batch(symbols, start_sec, end_sec)
+    ohlcv = client.ohlcv_daily_batch(symbols, start_sec, end_sec)
+
+    result = {}
+    for sym in symbols:
+        dfs = []
+        for store in (liq, pred, oi, fund, ls, ohlcv):
+            if sym in store and not store[sym].empty:
+                dfs.append(store[sym])
+        result[sym] = dfs
+    return result
+
+
+def process_exchange(exchange, bases, api_key, rate_limiter, symbols_cache, args, default_start_sec, end_sec):
+    """Process all tokens for a single exchange using batch API calls. Designed to run in a thread."""
+    tag = f"[{exchange.upper()}]"
+    client = CoinalyzeClient(api_key, rate_limiter=rate_limiter)
+    client._future_symbols_cache = symbols_cache  # reuse pre-loaded cache; avoids extra API call
+    db = DatabaseManager()
+
+    print(f"\n{'='*60}\nEXCHANGE: {exchange.upper()}\n{'='*60}", flush=True)
+
+    metrics_root = os.path.join(args.output_dir, "coinalyze", exchange)
+    ensure_dir(metrics_root)
+
+    success_count = 0
+    skip_count = 0
+
+    # Phase 1: resolve symbols and per-symbol start dates (fast, no API calls)
+    valid_tokens = []  # list of (base, symbol, start_sec, out_path)
+    for base in bases:
+        symbol = client.find_symbol_for_base(base, exchange)
+        if not symbol:
+            print(f"{tag} SKIP {base} (not found on {exchange})", flush=True)
+            skip_count += 1
+            continue
+        out_path = os.path.join(metrics_root, f"{symbol}_1d_metrics.csv")
+        token_start = get_incremental_start(out_path, default_start_sec, symbol, exchange, db)
+        valid_tokens.append((base, symbol, token_start, out_path))
+
+    # Phase 2: batch-fetch Coinalyze data (COINALYZE_BATCH_SIZE symbols per API call)
+    # Group by start_sec — for daily runs all tokens share the same window
+    from itertools import groupby
+    valid_tokens.sort(key=lambda x: x[2])
+
+    # Accumulate all fetched data: symbol -> list of DataFrames
+    all_batch_data: Dict[str, List[pd.DataFrame]] = {}
+
+    for start_sec, group in groupby(valid_tokens, key=lambda x: x[2]):
+        group_tokens = list(group)
+        symbols = [sym for _, sym, _, _ in group_tokens]
+        print(f"{tag} Batch-fetching {len(symbols)} symbols from start={start_sec} in chunks of {COINALYZE_BATCH_SIZE}...", flush=True)
+
+        for i in range(0, len(symbols), COINALYZE_BATCH_SIZE):
+            chunk = symbols[i:i + COINALYZE_BATCH_SIZE]
+            chunk_data = _coinalyze_batch_fetch(client, chunk, start_sec, end_sec)
+            all_batch_data.update(chunk_data)
+            print(f"{tag}   chunk {i//COINALYZE_BATCH_SIZE + 1}/{-(-len(symbols)//COINALYZE_BATCH_SIZE)}: {len(chunk)} symbols, 6 API calls", flush=True)
+
+    # Phase 3: merge, patch, and persist per token
+    for i, (base, symbol, token_start, out_path) in enumerate(valid_tokens, 1):
+        print(f"\n{tag} [{i}/{len(valid_tokens)}] {base} ({symbol})", flush=True)
+
+        dfs = all_batch_data.get(symbol, [])
+        if not dfs:
+            print(f"  {tag} [SKIP] No data returned for {symbol}", flush=True)
+            skip_count += 1
+            continue
+
+        df_final = merge_dataframes(dfs)
+        if df_final.empty:
+            print(f"  {tag} [SKIP] Merged DataFrame empty for {symbol}", flush=True)
+            skip_count += 1
+            continue
+
+        df_final['symbol'] = symbol
+        df_final['exchange'] = exchange
+        df_final['base_asset'] = base
+        df_final = patch_missing_metrics(df_final, base, exchange, symbol)
+
+        print(f"    {tag} -> {len(df_final)} rows collected", flush=True)
+
+        if db.enabled:
+            db.upsert_futures_metrics(df_final)
+
+        if args.csv:
+            if os.path.exists(out_path):
+                df_old = pd.read_csv(out_path)
+                metrics_csv = pd.concat([df_old, df_final], ignore_index=True)
+                metrics_csv.drop_duplicates(subset=['date'], keep='last', inplace=True)
+            else:
+                metrics_csv = df_final
+            metrics_csv.sort_values("date").to_csv(out_path, index=False)
+            print(f"  {tag} [CSV] Saved {out_path} ({len(metrics_csv)} total rows)", flush=True)
+        else:
+            print(f"  {tag} [CSV] Skipping local save (use --csv to enable)", flush=True)
+
+        if not args.skip_merge:
+            perp_csv = os.path.join(args.perp_dir, exchange, f"{base}USDT_1d.csv")
+            if os.path.exists(perp_csv):
+                merge_on_date(perp_csv, df_final.drop(columns=["symbol", "exchange"]))
+
+        success_count += 1
+
+    print(f"\n{tag} Processed: {success_count}, Skipped: {skip_count}", flush=True)
+    return success_count, skip_count
+
+
 def main():
     """Main entry point for the Coinalyze data backfill script."""
     parser = argparse.ArgumentParser(
@@ -1927,92 +2173,40 @@ def main():
     
     print(f"\nTarget tokens ({len(bases)}): {bases[:10]} ...")
     
-    # Load supported Coinalyze symbols
-    supported = client.load_future_symbols()
-    
-    # Process each exchange
-    for exchange in exchanges:
-        print(f"\n{'='*60}")
-        print(f"EXCHANGE: {exchange.upper()}")
-        print(f"{'='*60}")
-        
-        # Create output directories per exchange
-        metrics_root = os.path.join(args.output_dir, "coinalyze", exchange)
-        ensure_dir(metrics_root)
-        
-        # Process each token for this exchange
-        success_count = 0
-        skip_count = 0
-        
-        for i, base in enumerate(bases, 1):
-            # Find the actual symbol for this base asset on this exchange
-            symbol = client.find_symbol_for_base(base, exchange)
-            
-            if not symbol:
-                print(f"\n[{i}/{len(bases)}] {base}: SKIP (not found on {exchange})")
-                skip_count += 1
-                continue
-                
-            print(f"\n[{i}/{len(bases)}] {base} ({symbol})")
-            print("-" * 40)
-            
-            # Save metrics file path
-            out_path = os.path.join(metrics_root, f"{symbol}_1d_metrics.csv")
-            
-            # Determine start time based on existing data (File or DB)
-            start_sec = get_incremental_start(out_path, default_start_sec, symbol, exchange, db_manager)
-            
-            # Fetch Hybrid Data (Smart Sourcing)
-            metrics = fetch_hybrid_futures_data(
-                client, 
-                base, exchange, symbol, 
-                start_sec, end_sec
-            )
-            
-            if metrics.empty:
-                print(f"  [SKIP] No data available for {symbol}")
-                skip_count += 1
-                continue
-            
-            print(f"    -> {len(metrics)} rows collected")
-            
-            # Save to Database (Supabase)
-            if db_manager.enabled:
-                db_manager.upsert_futures_metrics(metrics)
-            
-            # Save metrics file (Optional CSV)
-            if args.csv:
-                if os.path.exists(out_path):
-                    df_old = pd.read_csv(out_path)
-                    metrics_csv = pd.concat([df_old, metrics], ignore_index=True)
-                    metrics_csv.drop_duplicates(subset=['date'], keep='last', inplace=True)
-                else:
-                    metrics_csv = metrics
-                
-                metrics_csv.sort_values("date").to_csv(out_path, index=False)
-                print(f"  [CSV] Saved {out_path} ({len(metrics_csv)} total rows)")
-            else:
-                print(f"  [CSV] Skipping local save (use --csv to enable)")
-            
-            if not args.skip_merge:
-                perp_csv = os.path.join(args.perp_dir, exchange, f"{base}USDT_1d.csv")
-                if os.path.exists(perp_csv):
-                    merge_on_date(perp_csv, metrics.drop(columns=["symbol", "exchange"]))
-            
-            # Additional safety delay for Binance
-            if exchange.lower() == 'binance':
-                time.sleep(1.0)
-                    
-            success_count += 1
-            
-        # Summary for this exchange
-        print(f"\n[{exchange.upper()}] Processed: {success_count}, Skipped: {skip_count}")
-    
+    # Load supported Coinalyze symbols once (shared across all threads via cache injection)
+    symbols_cache = client.load_future_symbols()
+
+    # Shared rate limiter: all exchange threads share the 40 req/min Coinalyze budget
+    rate_limiter = ThreadSafeRateLimiter(min_interval=1.6)
+
+    # Process exchanges in parallel (one thread per exchange)
+    print(f"\n[INFO] Running {len(exchanges)} exchange(s) in parallel...", flush=True)
+    exchange_errors = []
+
+    with ThreadPoolExecutor(max_workers=len(exchanges)) as executor:
+        futures = {
+            executor.submit(
+                process_exchange,
+                ex, bases, args.coinalyze_key, rate_limiter,
+                symbols_cache, args, default_start_sec, end_sec
+            ): ex
+            for ex in exchanges
+        }
+        for future in as_completed(futures):
+            ex = futures[future]
+            try:
+                success, skip = future.result()
+            except Exception as e:
+                print(f"\n[ERROR] Exchange {ex.upper()} failed: {e}", flush=True)
+                exchange_errors.append(ex)
+
     # Final Summary
     print("\n" + "=" * 60)
     print("COMPLETE")
     print("=" * 60)
     print(f"Exchanges: {exchanges}")
+    if exchange_errors:
+        print(f"Errors in: {exchange_errors}")
     print(f"Output: {args.output_dir}/coinalyze/")
     print("=" * 60)
 

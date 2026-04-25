@@ -140,6 +140,8 @@ CREATE TABLE IF NOT EXISTS asset_metadata (
     symbol          VARCHAR(20) PRIMARY KEY,        -- Base asset (BTC, ETH, etc.)
     narrative       VARCHAR(100),                   -- Selected primary category
     is_filtered     BOOLEAN DEFAULT false,          -- Whether it's a stable/wrapped/staked coin
+    market_cap      DECIMAL(30, 4),                 -- Latest market cap in USD
+    market_cap_rank INTEGER,                        -- CoinGecko market cap rank
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );

@@ -1,5 +1,6 @@
 import os
 import time
+import socket
 import requests
 import pandas as pd
 import psycopg2
@@ -41,6 +42,42 @@ COINALYZE_BASE = "https://api.coinalyze.net/v1"
 
 def to_unix_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
+
+# ==============================================================================
+# Tor Proxy Manager (opt-in via TOR_PROXY env var)
+# ==============================================================================
+
+class TorProxyManager:
+    """Wraps a requests.Session with optional SOCKS5 Tor proxy and circuit rotation.
+    Activated only when TOR_PROXY is set in the environment. Falls back to a
+    plain session otherwise — zero behavior change when Tor is not configured.
+    """
+    def __init__(self):
+        proxy = os.getenv("TOR_PROXY", "").strip()
+        self._control_port = int(os.getenv("TOR_CONTROL_PORT", 9051))
+        self.active = bool(proxy)
+        self.session = requests.Session()
+        if self.active:
+            self.session.proxies = {"http": proxy, "https": proxy}
+            print(f"[Tor] Proxy active ({proxy}) — exchange requests routed via Tor", flush=True)
+
+    def rotate_circuit(self) -> bool:
+        """Request a new Tor exit node via SIGNAL NEWNYM on the ControlPort."""
+        if not self.active:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", self._control_port), timeout=5) as s:
+                s.sendall(b'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT\r\n')
+                s.recv(1024)
+            time.sleep(3)  # allow circuit to establish
+            print("[Tor] Circuit rotated — new exit node assigned", flush=True)
+            return True
+        except Exception as e:
+            print(f"[Tor] Circuit rotation failed: {e}", flush=True)
+            return False
+
+
+_tor = TorProxyManager()
 
 # ==============================================================================
 # Database Management
@@ -584,14 +621,15 @@ class BinanceSpotFetcher:
         for attempt in range(max_retries):
             try:
                 params = {"symbol": f"{symbol}USDT", "interval": "1d", "limit": 1}
-                resp = requests.get(f"{self.BASE_URL}/klines", params=params, headers=self.HEADERS, timeout=15)
+                resp = _tor.session.get(f"{self.BASE_URL}/klines", params=params, headers=self.HEADERS, timeout=15)
                 if resp.status_code == 429:
-                    wait_time = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    wait_time = int(float(resp.headers.get("Retry-After", 2 ** attempt)))
                     print(f"    [Binance Spot] Rate limited, waiting {wait_time}s...")
                     time.sleep(wait_time)
                     continue
                 elif resp.status_code in (403, 418, 451):
                     print(f"    [Binance Spot] IP blocked (HTTP {resp.status_code}), attempt {attempt+1}/{max_retries}")
+                    _tor.rotate_circuit()
                     time.sleep(2 ** attempt)
                     continue
                 data = resp.json()
@@ -623,7 +661,7 @@ class BybitSpotFetcher:
         for attempt in range(max_retries):
             try:
                 params = {"category": "spot", "symbol": f"{symbol}USDT", "interval": "D", "limit": 1}
-                resp = requests.get(f"{self.BASE_URL}/kline", params=params, headers=self.HEADERS, timeout=15)
+                resp = _tor.session.get(f"{self.BASE_URL}/kline", params=params, headers=self.HEADERS, timeout=15)
                 if resp.status_code == 429:
                     print(f"    [Bybit Spot] Rate limited, waiting {2 ** attempt}s...")
                     time.sleep(2 ** attempt)
@@ -656,14 +694,14 @@ class OKXSpotFetcher:
         for attempt in range(max_retries):
             try:
                 params = {"instId": f"{symbol}-USDT", "bar": "1D", "limit": 1}
-                resp = requests.get(f"{self.BASE_URL}/market/candles", params=params, headers=self.HEADERS, timeout=15)
+                resp = _tor.session.get(f"{self.BASE_URL}/market/candles", params=params, headers=self.HEADERS, timeout=15)
                 if resp.status_code == 429:
                     print(f"    [OKX Spot] Rate limited, waiting {2 ** attempt}s...")
                     time.sleep(2 ** attempt)
                     continue
                 elif resp.status_code in (403, 418):
                     print(f"    [OKX Spot] IP blocked (HTTP {resp.status_code}), attempt {attempt+1}/{max_retries}")
-                    time.sleep(2 ** attempt)
+                    _tor.rotate_circuit()
                     continue
                 data = resp.json().get("data", [])
                 if not data: return None
@@ -685,7 +723,7 @@ class OKXSpotFetcher:
         for attempt in range(max_retries):
             try:
                 params = {"ccy": symbol, "period": "1D", "instType": "SPOT"}
-                resp = requests.get(f"{self.BASE_URL}/rubik/stat/taker-volume", params=params, headers=self.HEADERS, timeout=15)
+                resp = _tor.session.get(f"{self.BASE_URL}/rubik/stat/taker-volume", params=params, headers=self.HEADERS, timeout=15)
                 if resp.status_code == 429:
                     print(f"    [OKX Rubik] Rate limited, waiting {2 ** attempt}s...")
                     time.sleep(2 ** attempt)
@@ -873,7 +911,7 @@ class SpotScraper:
 
             for attempt in range(3):
                 try:
-                    resp = requests.get(BINANCE_SPOT_API, params=params, headers=headers, timeout=30)
+                    resp = _tor.session.get(BINANCE_SPOT_API, params=params, headers=headers, timeout=30)
                     if resp.status_code == 200:
                         data = resp.json()
                         if not data:
@@ -883,30 +921,31 @@ class SpotScraper:
                         time.sleep(0.3)
                         break
                     elif resp.status_code == 429:
-                        wait_time = int(resp.headers.get("Retry-After", 2 ** attempt))
+                        wait_time = int(float(resp.headers.get("Retry-After", 2 ** attempt)))
                         print(f"    [Binance] Rate limited, waiting {wait_time}s...")
                         time.sleep(wait_time)
                         continue
                     elif resp.status_code in (400, 403, 418, 451):
-                        mirror_idx = (attempt + 1) % len(BINANCE_SPOT_MIRRORS)
-                        current_api = f"{BINANCE_SPOT_MIRRORS[mirror_idx]}/api/v3/klines"
-                        wait_time = 5 ** attempt + 5
-                        print(f"    [Binance] HTTP {resp.status_code} for {base}, rotating to {BINANCE_SPOT_MIRRORS[mirror_idx]} in {wait_time}s... (attempt {attempt+1}/3)")
-                        time.sleep(wait_time)
-                        if attempt == 2:
-                            return pd.DataFrame()
-                        # Update api for next attempt
-                        params["symbol"] = f"{base}USDT" # Redundant but safe
-                        try:
-                            resp = requests.get(current_api, params=params, headers=headers, timeout=30)
-                            if resp.status_code == 200:
-                                data = resp.json()
-                                if not data: break
-                                all_data.extend(data)
-                                current_start = data[-1][0] + 86400000
-                                time.sleep(0.3)
-                                break
-                        except: pass
+                        print(f"    [Binance] HTTP {resp.status_code} for {base} (attempt {attempt+1}/3)")
+                        if _tor.active:
+                            _tor.rotate_circuit()
+                        else:
+                            mirror_idx = (attempt + 1) % len(BINANCE_SPOT_MIRRORS)
+                            current_api = f"{BINANCE_SPOT_MIRRORS[mirror_idx]}/api/v3/klines"
+                            print(f"    [Binance] Rotating to mirror: {BINANCE_SPOT_MIRRORS[mirror_idx]}")
+                            time.sleep(5 ** attempt + 5)
+                            if attempt == 2:
+                                return pd.DataFrame()
+                            try:
+                                resp = _tor.session.get(current_api, params=params, headers=headers, timeout=30)
+                                if resp.status_code == 200:
+                                    data = resp.json()
+                                    if not data: break
+                                    all_data.extend(data)
+                                    current_start = data[-1][0] + 86400000
+                                    time.sleep(0.3)
+                                    break
+                            except: pass
                         continue
                     else:
                         print(f"    [Binance] Unexpected HTTP {resp.status_code}")
@@ -960,7 +999,11 @@ class SpotScraper:
         while True:
             params = {"instId": f"{base}-USDT", "bar": "1D", "after": current_after, "limit": 100}
             try:
-                resp = requests.get(OKX_SPOT_API, params=params)
+                resp = _tor.session.get(OKX_SPOT_API, params=params, timeout=15)
+                if resp.status_code in (403, 418, 429):
+                    print(f"    [OKX] HTTP {resp.status_code}, rotating circuit...")
+                    _tor.rotate_circuit()
+                    continue
                 data = resp.json().get("data", [])
                 if not data: break
                 all_data.extend(data)
