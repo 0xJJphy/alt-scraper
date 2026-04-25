@@ -540,10 +540,24 @@ def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[st
     return []
 
 class CoinalyzeClient:
-    """Minimized client for Coinalyze Spot data."""
+    """Minimized client for Coinalyze Spot data.
+    Uses COINALYZE_API_KEY_SPOT if set, otherwise falls back to COINALYZE_API_KEY.
+    Keeping spot calls on a dedicated key avoids contention with alt_scraper's
+    futures batch calls when both run in parallel inside run_pipeline.py.
+    """
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.headers = {"api-key": api_key}
+        self._last_call = 0.0
+        self._min_interval = 1.6  # stay under 40 req/min
+
+    def _throttle(self):
+        """Proactive rate limiting — avoids 429s instead of reacting to them."""
+        now = time.time()
+        gap = self._min_interval - (now - self._last_call)
+        if gap > 0:
+            time.sleep(gap)
+        self._last_call = time.time()
 
     def fetch_ohlcv(self, symbol: str, start_ts: int, end_ts: int, max_retries: int = 3) -> pd.DataFrame:
         url = f"{COINALYZE_BASE}/ohlcv-history"
@@ -556,11 +570,13 @@ class CoinalyzeClient:
         
         for attempt in range(max_retries):
             try:
+                self._throttle()
                 resp = requests.get(url, params=params, headers=self.headers, timeout=30)
-                
+
                 if resp.status_code == 429:
-                    print(f"    [Coinalyze Retry] Rate limited for {symbol}, waiting 10s (attempt {attempt+1}/{max_retries})...")
-                    time.sleep(10)
+                    retry_after = int(float(resp.headers.get("Retry-After", "10")))
+                    print(f"    [Coinalyze Retry] Rate limited for {symbol}, waiting {retry_after}s (attempt {attempt+1}/{max_retries})...")
+                    time.sleep(retry_after)
                     continue
                 
                 resp.raise_for_status()
@@ -781,7 +797,8 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
     if df.empty: return df
 
     # 2. Patch missing Metrics (Taker Buy Volume & Txn Counts)
-    api_key = os.getenv("COINALYZE_API_KEY")
+    # Use dedicated spot key to avoid quota contention with alt_scraper futures batch
+    api_key = os.getenv("COINALYZE_API_KEY_SPOT") or os.getenv("COINALYZE_API_KEY")
     if api_key and not df.empty:
         # Determine patch window: from the start of the current dataframe to today
         df_sorted = df.sort_values('date')
@@ -976,7 +993,7 @@ class SpotScraper:
     def fetch_bybit(self, base: str, start_ts: int, end_ts: int) -> pd.DataFrame:
         """ Bybit Spot Hybrid (Coinalyze Primary) """
         print(f"  [Bybit] Sourcing from Coinalyze...")
-        api_key = os.getenv("COINALYZE_API_KEY")
+        api_key = os.getenv("COINALYZE_API_KEY_SPOT") or os.getenv("COINALYZE_API_KEY")
         if not api_key: return pd.DataFrame()
         client = CoinalyzeClient(api_key)
         df = client.fetch_ohlcv(f"s{base}USDT.6", start_ts, end_ts)
