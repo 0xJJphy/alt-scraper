@@ -844,7 +844,7 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
                 new_col = f"{col}_new"
                 if new_col in df.columns:
                     # Fill if current is 0 or NaN, and new is not NaN
-                    df[col] = df[col].replace(0, pd.NA).fillna(df[new_col]).infer_objects(copy=False)
+                    df[col] = df[col].replace(0, pd.NA).fillna(df[new_col])
                     df.drop(columns=[new_col], inplace=True)
             print(f"    [Hybrid] Patched {base} with Coinalyze depth data.")
 

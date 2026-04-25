@@ -2162,20 +2162,22 @@ def main():
                 new_top_symbols.append(c['symbol'])
             if len(new_top_symbols) >= limit: break
             
-        # Combine lists
-        target_bases = list(dict.fromkeys(target_bases + new_top_symbols)) # Preserve uniqueness and order
-        
+        # Combine lists: all DB-tracked first, then new CoinGecko candidates
+        # NOTE: --limit controls how many NEW tokens to add from CoinGecko (step B above),
+        # NOT the total processed. All previously-tracked tokens are always updated
+        # to preserve no-survivor-bias continuity (tokens that drop out of top N
+        # still get daily data updates for historical accuracy).
+        target_bases = list(dict.fromkeys(target_bases + new_top_symbols))
+
         if args.top_range:
             try:
                 start_rank, end_rank = map(int, args.top_range.split("-"))
                 target_bases = target_bases[start_rank-1:end_rank]
                 selection_desc = f"Top Range: {start_rank}-{start_rank + len(target_bases) - 1}"
             except Exception as e:
-                target_bases = target_bases[:args.top]
                 selection_desc = f"Top Tokens: {len(target_bases)}"
         else:
-            target_bases = target_bases[:args.top]
-            selection_desc = f"Top Tokens: {len(target_bases)}"
+            selection_desc = f"Top Tokens: {len(target_bases)} ({len(tracked_active)} tracked + {len(new_top_symbols)} new from CoinGecko top-{limit})"
 
     if args.metadata_only:
         # 1. Update existing metadata first (Efficient bulk sync)
