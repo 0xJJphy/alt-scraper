@@ -1899,7 +1899,21 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
         else:
             print(f"    [Hybrid WARNING] No L/S history returned from native API.")
     
-    # 4. Final Consistency Fix (Calculate Sell/Delta if components exist)
+    # 4. Sync ls_ratio ↔ ls_acc_global (same metric, different sources)
+    # ls_ratio comes from Coinalyze (long history, but missing for OKX)
+    # ls_acc_global comes from native exchange APIs (recent only, but all exchanges have it)
+    # Filling bidirectionally gives OKX a ls_ratio and maximises coverage on all exchanges
+    if 'ls_ratio' in df.columns and 'ls_acc_global' in df.columns:
+        pre_ratio  = df['ls_ratio'].isna().sum()
+        pre_global = df['ls_acc_global'].isna().sum()
+        df['ls_ratio']     = df['ls_ratio'].fillna(df['ls_acc_global']).infer_objects(copy=False)
+        df['ls_acc_global'] = df['ls_acc_global'].fillna(df['ls_ratio']).infer_objects(copy=False)
+        filled_ratio  = pre_ratio  - df['ls_ratio'].isna().sum()
+        filled_global = pre_global - df['ls_acc_global'].isna().sum()
+        if filled_ratio > 0 or filled_global > 0:
+            print(f"    [Sync] ls_ratio←ls_acc_global: +{filled_ratio} rows | ls_acc_global←ls_ratio: +{filled_global} rows")
+
+    # 5. Final Consistency Fix (Calculate Sell/Delta if components exist)
     if 'volume_base' in df.columns and 'buy_volume_base' in df.columns:
         # Fill sell_volume if missing
         df['sell_volume_base'] = df['sell_volume_base'].fillna(df['volume_base'] - df['buy_volume_base'])
