@@ -1884,7 +1884,7 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
                 new_col = f"{col}_new"
                 if new_col in df.columns:
                     patched_rows = df[new_col].notna().sum()
-                    df[col] = df[col].fillna(df[new_col]).infer_objects(copy=False)
+                    df[col] = df[col].fillna(df[new_col])
                     df.drop(columns=[new_col], inplace=True)
                     patched_count = max(patched_count, patched_rows)
             # Report L/S fill coverage so operator can see Bybit's structural limitation
@@ -1906,8 +1906,8 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
     if 'ls_ratio' in df.columns and 'ls_acc_global' in df.columns:
         pre_ratio  = df['ls_ratio'].isna().sum()
         pre_global = df['ls_acc_global'].isna().sum()
-        df['ls_ratio']     = df['ls_ratio'].fillna(df['ls_acc_global']).infer_objects(copy=False)
-        df['ls_acc_global'] = df['ls_acc_global'].fillna(df['ls_ratio']).infer_objects(copy=False)
+        df['ls_ratio']     = df['ls_ratio'].fillna(df['ls_acc_global'])
+        df['ls_acc_global'] = df['ls_acc_global'].fillna(df['ls_ratio'])
         filled_ratio  = pre_ratio  - df['ls_ratio'].isna().sum()
         filled_global = pre_global - df['ls_acc_global'].isna().sum()
         if filled_ratio > 0 or filled_global > 0:
