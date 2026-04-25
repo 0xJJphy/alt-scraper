@@ -1135,7 +1135,7 @@ def main():
                 
                 if exchange == 'binance':
                     df_new = scraper.fetch_binance(base, dynamic_start, end_ts)
-                    time.sleep(1.0) # Conservative delay for Binance Spot
+                    time.sleep(0.3 if _tor.active else 1.0)  # Tor rotates IP → lower 429 risk
                 elif exchange == 'bybit': df_new = scraper.fetch_bybit(base, dynamic_start, end_ts)
                 elif exchange == 'okx': df_new = scraper.fetch_okx(base, dynamic_start, end_ts)
                 else: break
@@ -1161,7 +1161,7 @@ def main():
                         print(f"    [CSV] Skipping local save (use --csv to enable)")
                 else: print(f"    [SKIPPED] {base} (no new data)")
             except Exception as e: print(f"    [FAILED] {base}: {e}")
-            time.sleep(0.5)
+            time.sleep(0.1 if _tor.active else 0.5)  # Tor active → tighter inter-token gap
 
 if __name__ == "__main__":
     main()

@@ -19,6 +19,7 @@ Date: 2026-01-10
 """
 
 import os
+import sys
 import time
 import threading
 import argparse
@@ -619,6 +620,16 @@ def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[st
 
 
 # ==============================================================================
+# Custom Exceptions
+# ==============================================================================
+class CoinalyzeQuotaError(Exception):
+    """Raised when the Coinalyze API rate limit is exhausted after all retries.
+    Distinct from empty/no-data responses — callers must handle this explicitly
+    to avoid silently writing NULL-filled rows to the database."""
+    pass
+
+
+# ==============================================================================
 # Shared Rate Limiter (thread-safe — enforces global call budget across threads)
 # ==============================================================================
 class ThreadSafeRateLimiter:
@@ -697,23 +708,30 @@ class CoinalyzeClient:
                     print(f"    [Coinalyze Retry] Rate limited, waiting {retry_after}s (attempt {attempt+1}/3)...")
                     time.sleep(retry_after)
                     continue
-                    
-                if resp.status_code in (400, 401, 403, 404):
-                    # Client error
+
+                if resp.status_code == 404:
+                    # Endpoint has no data for this symbol — normal for some tokens/exchanges
                     return None
-                    
+
+                if resp.status_code in (400, 401, 403):
+                    # Client error (bad key, forbidden)
+                    print(f"    [Coinalyze Error] HTTP {resp.status_code} — check API key or params")
+                    return None
+
                 # Server error - 10s backoff
                 print(f"    [Coinalyze Retry] Server error {resp.status_code}, retrying in 10s...")
                 time.sleep(10)
-                
+
             except requests.RequestException as e:
                 print(f"    [Coinalyze Error] Request failed: {e}")
                 if attempt < 2:
                     time.sleep(10)
                 else:
                     return None
-                    
-        return None
+
+        # All 3 attempts exhausted — do NOT silently return None like "no data"
+        # Callers must handle CoinalyzeQuotaError explicitly
+        raise CoinalyzeQuotaError("Coinalyze _get: all 3 retries exhausted due to rate limiting")
 
     def _get_batch(self, url: str, symbols: List[str], params: dict) -> Dict[str, List]:
         """Single API call for multiple symbols. Returns {symbol: history_list}."""
@@ -740,7 +758,11 @@ class CoinalyzeClient:
                     print(f"    [Coinalyze Retry] Rate limited, waiting {retry_after}s (attempt {attempt+1}/3)...")
                     time.sleep(retry_after)
                     continue
-                if resp.status_code in (400, 401, 403, 404):
+                if resp.status_code == 404:
+                    # Endpoint has no data for these symbols — return empty (not a quota issue)
+                    return {}
+                if resp.status_code in (400, 401, 403):
+                    print(f"    [Coinalyze Error] HTTP {resp.status_code} on batch — check API key or params")
                     return {}
                 print(f"    [Coinalyze Retry] Server error {resp.status_code}, retrying in 10s...")
                 time.sleep(10)
@@ -750,7 +772,8 @@ class CoinalyzeClient:
                     time.sleep(10)
                 else:
                     return {}
-        return {}
+        # All 3 attempts exhausted due to 429 — raise so callers can handle explicitly
+        raise CoinalyzeQuotaError(f"Coinalyze _get_batch: quota exhausted for {len(symbols)} symbols")
 
     def _parse_ohlc_batch(self, raw: Dict[str, List], col_map: Dict[str, str], numeric_cols: List[str]) -> Dict[str, pd.DataFrame]:
         """Parse batch history response using a column rename map. Returns {symbol: DataFrame}."""
@@ -1864,7 +1887,15 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
                     df[col] = df[col].fillna(df[new_col])
                     df.drop(columns=[new_col], inplace=True)
                     patched_count = max(patched_count, patched_rows)
-            print(f"    [Hybrid] Successfully patched L/S metrics for ~{patched_count} days.")
+            # Report L/S fill coverage so operator can see Bybit's structural limitation
+            filled = {col: int(df[col].notna().sum()) if col in df.columns else 0 for col in ls_cols}
+            total_rows = len(df)
+            summary = ", ".join(f"{c}={n}/{total_rows}" for c, n in filled.items())
+            missing_cols = [c for c, n in filled.items() if n == 0]
+            print(f"    [Hybrid] L/S fill: {summary}")
+            if missing_cols:
+                reason = "exchange limitation (Bybit)" if exchange.lower() == "bybit" else "not available"
+                print(f"    [Hybrid] L/S columns with no data: {missing_cols} ({reason})")
         else:
             print(f"    [Hybrid WARNING] No L/S history returned from native API.")
     
@@ -1885,63 +1916,43 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
         
     return df
 
-def fetch_hybrid_futures_data(client: CoinalyzeClient,
-                             token: str, exchange: str, symbol: str,
-                             start_sec: int, end_sec: int) -> pd.DataFrame:
-    """Manager to fetch data from native APIs or Coinalyze based on Smart Sourcing."""
-    print(f"    [Source] Coinalyze + Native Patches")
-    
-    dfs = []
-    # 1. Fetch bulk history from Coinalyze
-    df_liq = client.liquidation_daily(symbol, start_sec, end_sec)
-    if not df_liq.empty: dfs.append(df_liq)
-    
-    df_pred = client.predicted_funding_rate_daily(symbol, start_sec, end_sec)
-    if not df_pred.empty: dfs.append(df_pred)
-
-    df_oi = client.open_interest_daily(symbol, start_sec, end_sec)
-    if not df_oi.empty: dfs.append(df_oi)
-    
-    df_f = client.funding_rate_daily(symbol, start_sec, end_sec)
-    if not df_f.empty: dfs.append(df_f)
-    
-    df_ls = client.long_short_ratio_daily(symbol, start_sec, end_sec)
-    if not df_ls.empty: dfs.append(df_ls)
-    
-    df_ohlcv = client.ohlcv_daily(symbol, start_sec, end_sec)
-    if not df_ohlcv.empty: dfs.append(df_ohlcv)
-
-    if not dfs: return pd.DataFrame()
-    
-    # 2. Merge all sources
-    df_final = merge_dataframes(dfs)
-    if not df_final.empty:
-        df_final['symbol'], df_final['exchange'], df_final['base_asset'] = symbol, exchange, token
-        # 3. Patch missing metrics (L/S ratios, today's candle)
-        df_final = patch_missing_metrics(df_final, token, exchange, symbol)
-        
-    return df_final
-
-
 def _coinalyze_batch_fetch(client: CoinalyzeClient, symbols: List[str], start_sec: int, end_sec: int) -> Dict[str, List[pd.DataFrame]]:
     """Fetch all 6 Coinalyze endpoints for a batch of symbols in 6 API calls.
     Returns {symbol: [df_liq, df_pred, df_oi, df_f, df_ls, df_ohlcv]} (empty DFs for missing data).
-    """
-    oi    = client.open_interest_daily_batch(symbols, start_sec, end_sec)
-    fund  = client.funding_rate_daily_batch(symbols, start_sec, end_sec)
-    pred  = client.predicted_funding_rate_daily_batch(symbols, start_sec, end_sec)
-    ls    = client.long_short_ratio_daily_batch(symbols, start_sec, end_sec)
-    liq   = client.liquidation_daily_batch(symbols, start_sec, end_sec)
-    ohlcv = client.ohlcv_daily_batch(symbols, start_sec, end_sec)
 
-    result = {}
-    for sym in symbols:
-        dfs = []
-        for store in (liq, pred, oi, fund, ls, ohlcv):
-            if sym in store and not store[sym].empty:
-                dfs.append(store[sym])
-        result[sym] = dfs
-    return result
+    If CoinalyzeQuotaError is raised, sleeps 60s (full rate-limit window reset) and retries once.
+    On second failure, raises RuntimeError to abort this exchange's thread — prevents writing
+    NULL-filled rows to the database.
+    """
+    def _do_fetch():
+        oi    = client.open_interest_daily_batch(symbols, start_sec, end_sec)
+        fund  = client.funding_rate_daily_batch(symbols, start_sec, end_sec)
+        pred  = client.predicted_funding_rate_daily_batch(symbols, start_sec, end_sec)
+        ls    = client.long_short_ratio_daily_batch(symbols, start_sec, end_sec)
+        liq   = client.liquidation_daily_batch(symbols, start_sec, end_sec)
+        ohlcv = client.ohlcv_daily_batch(symbols, start_sec, end_sec)
+        out = {}
+        for sym in symbols:
+            dfs = []
+            for store in (liq, pred, oi, fund, ls, ohlcv):
+                if sym in store and not store[sym].empty:
+                    dfs.append(store[sym])
+            out[sym] = dfs
+        return out
+
+    try:
+        return _do_fetch()
+    except CoinalyzeQuotaError as e:
+        print(f"    [WARN] {e}")
+        print(f"    [WARN] Sleeping 60s to reset rate-limit window, then retrying chunk of {len(symbols)} symbols...")
+        time.sleep(60)
+        try:
+            return _do_fetch()
+        except CoinalyzeQuotaError as e2:
+            raise RuntimeError(
+                f"Coinalyze quota exhausted twice for chunk {symbols[:3]}... "
+                f"Aborting exchange thread to prevent writing partial data. Original: {e2}"
+            ) from e2
 
 
 def process_exchange(exchange, bases, api_key, rate_limiter, symbols_cache, args, default_start_sec, end_sec):
@@ -2174,7 +2185,12 @@ def main():
     print(f"\nTarget tokens ({len(bases)}): {bases[:10]} ...")
     
     # Load supported Coinalyze symbols once (shared across all threads via cache injection)
-    symbols_cache = client.load_future_symbols()
+    try:
+        symbols_cache = client.load_future_symbols()
+    except CoinalyzeQuotaError:
+        print("[ERROR] Cannot load Coinalyze market list: quota exhausted at startup. "
+              "Wait ~1 minute for the rate-limit window to reset, then retry.", flush=True)
+        sys.exit(1)
 
     # Shared rate limiter: all exchange threads share the 40 req/min Coinalyze budget
     rate_limiter = ThreadSafeRateLimiter(min_interval=1.6)
