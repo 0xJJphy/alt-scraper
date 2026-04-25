@@ -1502,9 +1502,9 @@ class BinanceFuturesFetcher:
         "https://fapi1.binance.com",
         "https://fapi2.binance.com",
         "https://fapi3.binance.com",
-        "https://fapi.binance.cc",
-        "https://fapi.binance.me",
-        "https://data.binance.com"
+        "https://fapi.binance.cc",   # CN mirror
+        "https://fapi.binance.me",   # EU/alternative mirror
+        # Note: data.binance.com is a bulk-download portal, NOT a Futures API host
     ]
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

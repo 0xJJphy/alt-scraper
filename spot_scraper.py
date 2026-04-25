@@ -51,15 +51,20 @@ class TorProxyManager:
     """Wraps a requests.Session with optional SOCKS5 Tor proxy and circuit rotation.
     Activated only when TOR_PROXY is set in the environment. Falls back to a
     plain session otherwise — zero behavior change when Tor is not configured.
+
+    Two sessions are always available:
+      self.session  — routed via Tor (OKX, Bybit: geo-blocked without Tor)
+      self.direct   — plain connection, NO proxy (Binance: blocks ALL Tor exit nodes)
     """
     def __init__(self):
         proxy = os.getenv("TOR_PROXY", "").strip()
         self._control_port = int(os.getenv("TOR_CONTROL_PORT", 9051))
         self.active = bool(proxy)
-        self.session = requests.Session()
+        self.direct = requests.Session()   # always plain — for Binance
+        self.session = requests.Session()  # Tor-proxied when active
         if self.active:
             self.session.proxies = {"http": proxy, "https": proxy}
-            print(f"[Tor] Proxy active ({proxy}) — exchange requests routed via Tor", flush=True)
+            print(f"[Tor] Proxy active ({proxy}) — OKX/Bybit via Tor, Binance via direct", flush=True)
 
     def rotate_circuit(self) -> bool:
         """Request a new Tor exit node via SIGNAL NEWNYM on the ControlPort."""
@@ -637,7 +642,7 @@ class BinanceSpotFetcher:
         for attempt in range(max_retries):
             try:
                 params = {"symbol": f"{symbol}USDT", "interval": "1d", "limit": 1}
-                resp = _tor.session.get(f"{self.BASE_URL}/klines", params=params, headers=self.HEADERS, timeout=15)
+                resp = _tor.direct.get(f"{self.BASE_URL}/klines", params=params, headers=self.HEADERS, timeout=15)  # Binance blocks all Tor exit nodes — use direct
                 if resp.status_code == 429:
                     wait_time = int(float(resp.headers.get("Retry-After", 2 ** attempt)))
                     print(f"    [Binance Spot] Rate limited, waiting {wait_time}s...")
@@ -932,7 +937,7 @@ class SpotScraper:
 
             for attempt in range(3):
                 try:
-                    resp = _tor.session.get(current_api, params=params, headers=headers, timeout=30)
+                    resp = _tor.direct.get(current_api, params=params, headers=headers, timeout=30)  # Binance blocks all Tor exit nodes — use direct
                     if resp.status_code == 200:
                         data = resp.json()
                         if not data:
