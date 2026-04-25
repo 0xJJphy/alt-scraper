@@ -822,7 +822,7 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
                 new_col = f"{col}_new"
                 if new_col in df.columns:
                     # Fill if current is 0 or NaN, and new is not NaN
-                    df[col] = df[col].replace(0, pd.NA).fillna(df[new_col])
+                    df[col] = df[col].replace(0, pd.NA).fillna(df[new_col]).infer_objects(copy=False)
                     df.drop(columns=[new_col], inplace=True)
             print(f"    [Hybrid] Patched {base} with Coinalyze depth data.")
 
@@ -906,12 +906,16 @@ class SpotScraper:
             "Referer": "https://www.binance.com/"
         }
 
+        # Track current mirror index — rotate on 403/418 regardless of Tor status
+        current_mirror_idx = 0
+        current_api = BINANCE_SPOT_API  # starts with data-api.binance.vision
+
         while current_start < end_ts:
             params = {"symbol": f"{base}USDT", "interval": "1d", "startTime": current_start, "endTime": end_ts, "limit": limit}
 
             for attempt in range(3):
                 try:
-                    resp = _tor.session.get(BINANCE_SPOT_API, params=params, headers=headers, timeout=30)
+                    resp = _tor.session.get(current_api, params=params, headers=headers, timeout=30)
                     if resp.status_code == 200:
                         data = resp.json()
                         if not data:
@@ -927,25 +931,14 @@ class SpotScraper:
                         continue
                     elif resp.status_code in (400, 403, 418, 451):
                         print(f"    [Binance] HTTP {resp.status_code} for {base} (attempt {attempt+1}/3)")
+                        # Rotate circuit AND switch mirror — data-api.binance.vision blocks Tor exit nodes
+                        current_mirror_idx = (current_mirror_idx + 1) % len(BINANCE_SPOT_MIRRORS)
+                        current_api = f"{BINANCE_SPOT_MIRRORS[current_mirror_idx]}/api/v3/klines"
+                        print(f"    [Binance] Switching to mirror: {BINANCE_SPOT_MIRRORS[current_mirror_idx]}")
                         if _tor.active:
-                            _tor.rotate_circuit()
+                            _tor.rotate_circuit()  # new IP + new mirror
                         else:
-                            mirror_idx = (attempt + 1) % len(BINANCE_SPOT_MIRRORS)
-                            current_api = f"{BINANCE_SPOT_MIRRORS[mirror_idx]}/api/v3/klines"
-                            print(f"    [Binance] Rotating to mirror: {BINANCE_SPOT_MIRRORS[mirror_idx]}")
                             time.sleep(5 ** attempt + 5)
-                            if attempt == 2:
-                                return pd.DataFrame()
-                            try:
-                                resp = _tor.session.get(current_api, params=params, headers=headers, timeout=30)
-                                if resp.status_code == 200:
-                                    data = resp.json()
-                                    if not data: break
-                                    all_data.extend(data)
-                                    current_start = data[-1][0] + 86400000
-                                    time.sleep(0.3)
-                                    break
-                            except: pass
                         continue
                     else:
                         print(f"    [Binance] Unexpected HTTP {resp.status_code}")

@@ -1884,7 +1884,7 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
                 new_col = f"{col}_new"
                 if new_col in df.columns:
                     patched_rows = df[new_col].notna().sum()
-                    df[col] = df[col].fillna(df[new_col])
+                    df[col] = df[col].fillna(df[new_col]).infer_objects(copy=False)
                     df.drop(columns=[new_col], inplace=True)
                     patched_count = max(patched_count, patched_rows)
             # Report L/S fill coverage so operator can see Bybit's structural limitation
@@ -2160,7 +2160,7 @@ def main():
                 target_bases = target_bases[:args.top]
                 selection_desc = f"Top Tokens: {len(target_bases)}"
         else:
-            target_bases = target_bases[:max(len(target_bases), args.top)]
+            target_bases = target_bases[:args.top]
             selection_desc = f"Top Tokens: {len(target_bases)}"
 
     if args.metadata_only:
