@@ -9,7 +9,7 @@ User={{USER}}
 WorkingDirectory={{INSTALL_DIR}}
 EnvironmentFile={{INSTALL_DIR}}/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart={{INSTALL_DIR}}/venv/bin/python3 realtime_daemon.py --top 50
+ExecStart={{INSTALL_DIR}}/venv/bin/python3 realtime_daemon.py
 Restart=always
 RestartSec=60
 StandardOutput=journal
