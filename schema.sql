@@ -806,40 +806,15 @@ COMMENT ON FUNCTION refresh_all_materialized_views() IS
 Can be scheduled via pg_cron or called from Python after data import.';
 
 -- ==============================================================================
--- ROW LEVEL SECURITY (RLS) - Supabase
--- Enable RLS for production security
+-- PERMISSIONS
+-- Permissions for gli_user (self-hosted PostgreSQL — no Supabase roles)
 -- ==============================================================================
-ALTER TABLE futures_daily_metrics ENABLE ROW LEVEL SECURITY;
-ALTER TABLE exchanges ENABLE ROW LEVEL SECURITY;
-ALTER TABLE symbols ENABLE ROW LEVEL SECURITY;
-ALTER TABLE futures_daily_metrics_staging ENABLE ROW LEVEL SECURITY;
+GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO gli_user;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO gli_user;
+GRANT EXECUTE ON ALL FUNCTIONS        IN SCHEMA public TO gli_user;
 
--- Policy: Allow read access to all authenticated users
-CREATE POLICY "Allow read access to authenticated users"
-ON futures_daily_metrics FOR SELECT
-TO authenticated
-USING (true);
-
--- Policy: Allow insert/update for service role only
-CREATE POLICY "Allow write access to service role"
-ON futures_daily_metrics FOR ALL
-TO service_role
-USING (true)
-WITH CHECK (true);
-
--- Similar policies for other tables
-CREATE POLICY "Allow read exchanges"
-ON exchanges FOR SELECT TO authenticated USING (true);
-
-CREATE POLICY "Allow read symbols"
-ON symbols FOR SELECT TO authenticated USING (true);
-
--- Policy: Allow full access for service role on staging table
-CREATE POLICY "Allow service_role full access to staging"
-ON futures_daily_metrics_staging FOR ALL
-TO service_role
-USING (true)
-WITH CHECK (true);
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES    TO gli_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO gli_user;
 
 -- ==============================================================================
 -- UTILITY FUNCTIONS
@@ -976,11 +951,6 @@ CREATE TRIGGER trigger_update_timestamp_spot
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
-ALTER TABLE asset_metadata ENABLE ROW LEVEL SECURITY;
-ALTER TABLE spot_daily_ohlcv ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "Allow read metadata" ON asset_metadata FOR SELECT TO authenticated USING (true);
-CREATE POLICY "Allow read spot" ON spot_daily_ohlcv FOR SELECT TO authenticated USING (true);
 
 -- ==============================================================================
 -- FUTURES SNAPSHOTS
@@ -1064,10 +1034,3 @@ CREATE TRIGGER trigger_update_timestamp_latest
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
-ALTER TABLE futures_latest ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "Allow read futures_latest"
-ON futures_latest FOR SELECT TO authenticated USING (true);
-
-CREATE POLICY "Allow write futures_latest"
-ON futures_latest FOR ALL TO service_role USING (true) WITH CHECK (true);
