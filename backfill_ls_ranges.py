@@ -244,17 +244,25 @@ class OKXLSBackfiller:
 # Database helpers
 # ==============================================================================
 
-def load_assets(db_url: str, top_n: int) -> List[Dict]:
-    """Load top_n non-filtered assets from asset_metadata."""
+def load_assets(db_url: str, top_n: Optional[int]) -> List[Dict]:
+    """Load non-filtered assets from asset_metadata. top_n=None loads all."""
     conn = psycopg2.connect(db_url)
     cur  = conn.cursor()
-    cur.execute("""
-        SELECT symbol AS base_asset
-        FROM asset_metadata
-        WHERE is_filtered = false OR is_filtered IS NULL
-        ORDER BY market_cap_rank ASC NULLS LAST
-        LIMIT %s
-    """, (top_n,))
+    if top_n is None:
+        cur.execute("""
+            SELECT symbol AS base_asset
+            FROM asset_metadata
+            WHERE is_filtered = false OR is_filtered IS NULL
+            ORDER BY market_cap_rank ASC NULLS LAST
+        """)
+    else:
+        cur.execute("""
+            SELECT symbol AS base_asset
+            FROM asset_metadata
+            WHERE is_filtered = false OR is_filtered IS NULL
+            ORDER BY market_cap_rank ASC NULLS LAST
+            LIMIT %s
+        """, (top_n,))
     assets = [{"base_asset": row[0]} for row in cur.fetchall()]
     cur.close()
     conn.close()
@@ -367,7 +375,8 @@ BACKFILLERS = {
 def main():
     parser = argparse.ArgumentParser(description="Backfill L/S daily high/low ranges")
     parser.add_argument("--exchange", required=True, choices=["binance", "bybit", "okx", "all"])
-    parser.add_argument("--top",      type=int, default=50)
+    parser.add_argument("--top",      type=int, default=None,
+                        help="Limit to top N assets by market cap rank (default: all assets in metadata)")
     parser.add_argument("--dry-run",  action="store_true", help="Print what would be updated without writing")
     args = parser.parse_args()
 
