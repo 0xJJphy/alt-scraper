@@ -14,7 +14,9 @@ Usage:
     python realtime_daemon.py [--top N] [--exchanges E1,E2] [--interval SEC] [--once]
 
 Environment variables (from .env):
-    DATABASE_URL         Supabase PostgreSQL connection string (required)
+    DATABASE_URL         PostgreSQL connection string (required)
+    TELEGRAM_BOT_TOKEN   Telegram bot token for error alerts (optional)
+    TELEGRAM_CHAT_ID     Telegram chat ID for error alerts (optional)
 """
 
 import os
@@ -46,10 +48,26 @@ BYBIT_V5_API        = "https://api.bybit.com/v5"
 OKX_V5_API          = "https://www.okx.com/api/v5"
 
 DEFAULT_POLL_INTERVAL = 900   # 15 minutes
-DEFAULT_TOP_N         = 50
 DEFAULT_EXCHANGES     = ["binance", "bybit", "okx"]
 
 HEADERS = {"User-Agent": "alt-scraper/realtime-daemon"}
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+def _telegram(msg: str) -> None:
+    """Send a Telegram message. Silently no-ops if credentials are not set."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+    except Exception:
+        pass
 
 
 # ==============================================================================
@@ -348,21 +366,25 @@ def upsert_rows(db_url: str, rows: List[dict]):
 # Asset loader
 # ==============================================================================
 
-def load_top_assets(db_url: str, top_n: int) -> List[str]:
-    """Return top_n non-filtered base_assets ordered by market_cap_rank."""
+def load_top_assets(db_url: str, top_n: Optional[int]) -> List[str]:
+    """Return non-filtered base_assets ordered by market_cap_rank. top_n=None loads all."""
     conn = None
     try:
         conn = psycopg2.connect(db_url)
         cur  = conn.cursor()
-        cur.execute(
-            """
-            SELECT symbol FROM asset_metadata
-            WHERE is_filtered = false OR is_filtered IS NULL
-            ORDER BY market_cap_rank ASC NULLS LAST
-            LIMIT %s
-            """,
-            (top_n,)
-        )
+        if top_n is None:
+            cur.execute("""
+                SELECT symbol FROM asset_metadata
+                WHERE is_filtered = false OR is_filtered IS NULL
+                ORDER BY market_cap_rank ASC NULLS LAST
+            """)
+        else:
+            cur.execute("""
+                SELECT symbol FROM asset_metadata
+                WHERE is_filtered = false OR is_filtered IS NULL
+                ORDER BY market_cap_rank ASC NULLS LAST
+                LIMIT %s
+            """, (top_n,))
         assets = [row[0] for row in cur.fetchall()]
         log.info("Loaded %d assets from asset_metadata.", len(assets))
         return assets
@@ -385,13 +407,15 @@ FETCHER_MAP = {
 }
 
 
-def run_once(db_url: str, top_n: int, exchanges: List[str]):
+def run_once(db_url: str, top_n: Optional[int], exchanges: List[str]):
     assets = load_top_assets(db_url, top_n)
     if not assets:
         log.warning("No assets loaded — skipping poll cycle.")
+        _telegram("⚠️ *alt-scraper-realtime*: no assets loaded from metadata — poll skipped.")
         return
 
     now = datetime.now(UTC)
+    failed_exchanges: List[str] = []
 
     def _fetch(ex: str) -> List[dict]:
         cls = FETCHER_MAP.get(ex)
@@ -409,9 +433,21 @@ def run_once(db_url: str, top_n: int, exchanges: List[str]):
         for future in as_completed(futures):
             ex = futures[future]
             try:
-                all_rows.extend(future.result())
+                rows = future.result()
+                if not rows:
+                    log.error("  %s returned 0 rows — exchange may be down.", ex)
+                    failed_exchanges.append(ex)
+                all_rows.extend(rows)
             except Exception as e:
                 log.error("  %s fetch error: %s", ex, e)
+                failed_exchanges.append(ex)
+
+    if failed_exchanges:
+        _telegram(
+            f"⚠️ *alt-scraper-realtime*: exchange(s) returned 0 rows\n"
+            f"*Failed:* {', '.join(failed_exchanges)}\n"
+            f"*Time:* {now.strftime('%Y-%m-%d %H:%M UTC')}"
+        )
 
     upsert_rows(db_url, all_rows)
 
@@ -421,7 +457,7 @@ def run_once(db_url: str, top_n: int, exchanges: List[str]):
 
 def main():
     parser = argparse.ArgumentParser(description="Futures latest snapshot daemon")
-    parser.add_argument("--top",       type=int,   default=DEFAULT_TOP_N,       help="Number of top assets to track")
+    parser.add_argument("--top",       type=int,   default=None,                help="Limit to top N assets (default: all assets in metadata)")
     parser.add_argument("--exchanges", type=str,   default=",".join(DEFAULT_EXCHANGES), help="Comma-separated exchange list")
     parser.add_argument("--interval",  type=int,   default=DEFAULT_POLL_INTERVAL, help="Poll interval in seconds (default 900)")
     parser.add_argument("--once",      action="store_true", help="Run one poll cycle then exit (useful for testing)")
@@ -434,7 +470,8 @@ def main():
 
     exchanges = [e.strip().lower() for e in args.exchanges.split(",") if e.strip()]
 
-    log.info("Starting realtime_daemon — exchanges=%s, top=%d, interval=%ds", exchanges, args.top, args.interval)
+    top_label = str(args.top) if args.top else "all"
+    log.info("Starting realtime_daemon — exchanges=%s, top=%s, interval=%ds", exchanges, top_label, args.interval)
 
     if args.once:
         run_once(db_url, args.top, exchanges)
@@ -446,6 +483,7 @@ def main():
             run_once(db_url, args.top, exchanges)
         except Exception as e:
             log.error("Unexpected error in poll cycle: %s", e)
+            _telegram(f"🔴 *alt-scraper-realtime*: unexpected error in poll cycle\n`{e}`")
         elapsed = time.monotonic() - start
         sleep_for = max(0, args.interval - elapsed)
         log.info("Poll cycle done in %.1fs. Next in %.0fs.", elapsed, sleep_for)
