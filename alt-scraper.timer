@@ -1,13 +1,10 @@
 [Unit]
-Description=Run Alt Scraper 3 times daily
+Description=Run Alt Scraper once daily at UTC close
 
 [Timer]
-# 1. Daily Close: 00:15 UTC
+# Daily close: 00:15 UTC — finalizes previous day's candle via Coinalyze
+# Intraday data is now covered by realtime_daemon.py (every 15 min)
 OnCalendar=*-*-* 00:15:00 UTC
-# 2. US Session Open: 14:00 UTC
-OnCalendar=*-*-* 14:00:00 UTC
-# 3. Pre-Close: 18:00 UTC
-OnCalendar=*-*-* 18:00:00 UTC
 
 Persistent=true
 

@@ -26,11 +26,19 @@ sed -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
     -e "s|{{USER}}|$EXEC_USER|g" \
     alt-scraper.service.template > alt-scraper.service
 
-# 2. Copy to systemd directory
+# 2. Generate realtime daemon service from template
+echo "Generating alt-scraper-realtime.service..."
+sed -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
+    -e "s|{{USER}}|$EXEC_USER|g" \
+    alt-scraper-realtime.service.template > alt-scraper-realtime.service
+
+# 3. Copy to systemd directory
 echo "Installing systemd units..."
 # Main service and timer
 cp alt-scraper.service /etc/systemd/system/
 cp alt-scraper.timer /etc/systemd/system/
+# Realtime daemon
+cp alt-scraper-realtime.service /etc/systemd/system/
 # Notification service
 sed "s|{{INSTALL_DIR}}|$INSTALL_DIR|g; s|{{USER}}|$EXEC_USER|g" alt-scraper-notify@.service.template > /etc/systemd/system/alt-scraper-notify@.service
 
@@ -53,14 +61,26 @@ fi
 chmod 755 "$INSTALL_DIR"
 
 # 4. Reload systemd
-echo "Reloading systemd and enabling timer..."
+echo "Reloading systemd and enabling services..."
 systemctl daemon-reload
+
+# Daily pipeline timer (runs at 00:15 UTC via alt-scraper.timer)
 systemctl enable alt-scraper.timer
 systemctl restart alt-scraper.timer
 
+# Realtime daemon (always running, polls every 15 min)
+systemctl enable alt-scraper-realtime.service
+systemctl restart alt-scraper-realtime.service
+
 echo ""
 echo "Setup complete!"
-echo "Timer status:"
+echo ""
+echo "Timer status (daily pipeline):"
 systemctl status alt-scraper.timer --no-pager
 echo ""
-echo "To view logs, run: journalctl -u alt-scraper.service -f"
+echo "Realtime daemon status:"
+systemctl status alt-scraper-realtime.service --no-pager
+echo ""
+echo "Logs:"
+echo "  journalctl -u alt-scraper.service -f          # daily pipeline"
+echo "  journalctl -u alt-scraper-realtime.service -f # realtime daemon"

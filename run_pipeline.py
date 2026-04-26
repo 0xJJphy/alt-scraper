@@ -68,20 +68,57 @@ def main():
     if parallel_results.get("FUTURES", 0) != 0:
         failed_steps.append("Futures Scraper")
 
-    # 4. Refresh Materialized Views
-    print("\n[4/4] Refreshing Materialized Views...", flush=True)
+    # 4. Compute daily L/S high/low from today's snapshots → futures_daily_metrics
+    print("\n[4/5] Computing L/S daily high/low from snapshots...", flush=True)
+    try:
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE futures_daily_metrics fdm
+            SET
+                ls_acc_global_high = s.ls_global_high,
+                ls_acc_global_low  = s.ls_global_low,
+                ls_acc_top_high    = s.ls_top_high,
+                ls_acc_top_low     = s.ls_top_low,
+                ls_pos_top_high    = s.ls_pos_high,
+                ls_pos_top_low     = s.ls_pos_low
+            FROM (
+                SELECT
+                    snapshot_at::date AS day,
+                    symbol, exchange,
+                    MAX(ls_acc_global) AS ls_global_high, MIN(ls_acc_global) AS ls_global_low,
+                    MAX(ls_acc_top)    AS ls_top_high,    MIN(ls_acc_top)    AS ls_top_low,
+                    MAX(ls_pos_top)    AS ls_pos_high,    MIN(ls_pos_top)    AS ls_pos_low
+                FROM futures_snapshots
+                WHERE snapshot_at >= CURRENT_DATE - 1 AND snapshot_at < CURRENT_DATE
+                GROUP BY 1, 2, 3
+            ) s
+            WHERE fdm.date = s.day AND fdm.symbol = s.symbol AND fdm.exchange = s.exchange
+        """)
+        rows_updated = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"  [DB] Updated L/S high/low for {rows_updated} rows.", flush=True)
+    except Exception as e:
+        print(f"  [DB ERROR] L/S high/low update failed: {e}", flush=True)
+        failed_steps.append("L/S High/Low")
+
+    # 5. Purge snapshots older than 90 days
+    print("\n[5/5] Purging old snapshots + Refreshing Materialized Views...", flush=True)
     try:
         conn = psycopg2.connect(db_url)
         conn.autocommit = True
         cur = conn.cursor()
+        cur.execute("SELECT purge_old_snapshots()")
         for view in ["mv_aggregated_by_asset", "mv_global_market", "mv_trading_metrics"]:
             print(f"  Refreshing {view}...", flush=True)
             cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view}")
         cur.close()
         conn.close()
-        print("  [DB] Materialized views refreshed.", flush=True)
+        print("  [DB] Snapshots purged + materialized views refreshed.", flush=True)
     except Exception as e:
-        print(f"  [DB ERROR] Failed to refresh views: {e}", flush=True)
+        print(f"  [DB ERROR] Failed: {e}", flush=True)
         failed_steps.append("DB Refresh")
 
     if failed_steps:

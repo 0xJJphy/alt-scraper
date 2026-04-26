@@ -981,3 +981,93 @@ ALTER TABLE spot_daily_ohlcv ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "Allow read metadata" ON asset_metadata FOR SELECT TO authenticated USING (true);
 CREATE POLICY "Allow read spot" ON spot_daily_ohlcv FOR SELECT TO authenticated USING (true);
+
+-- ==============================================================================
+-- FUTURES SNAPSHOTS
+-- Intraday snapshots written 4x/day (00, 06, 12, 18 UTC) by realtime_daemon.py.
+-- Used by run_pipeline.py to compute ls_acc_global_high/low per day and populate
+-- the new high/low columns in futures_daily_metrics. Purged after 90 days.
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS futures_snapshots (
+    snapshot_at     TIMESTAMPTZ  NOT NULL,
+    symbol          VARCHAR(50)  NOT NULL,
+    exchange        VARCHAR(50)  NOT NULL,
+    base_asset      VARCHAR(20),
+    oi_usd          DECIMAL(24, 4),
+    funding         DECIMAL(18, 10),
+    ls_acc_global   DECIMAL(12, 6),
+    ls_acc_top      DECIMAL(12, 6),
+    ls_pos_top      DECIMAL(12, 6),
+    price           DECIMAL(24, 8),
+    PRIMARY KEY (snapshot_at, symbol, exchange)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fs_symbol_at ON futures_snapshots(symbol, exchange, snapshot_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fs_at        ON futures_snapshots(snapshot_at DESC);
+
+CREATE OR REPLACE FUNCTION purge_old_snapshots() RETURNS void AS $$
+    DELETE FROM futures_snapshots WHERE snapshot_at < NOW() - INTERVAL '90 days';
+$$ LANGUAGE sql;
+
+-- New high/low columns for L/S ratios — populated daily from futures_snapshots
+ALTER TABLE futures_daily_metrics
+    ADD COLUMN IF NOT EXISTS ls_acc_global_high DECIMAL(12,6),
+    ADD COLUMN IF NOT EXISTS ls_acc_global_low  DECIMAL(12,6),
+    ADD COLUMN IF NOT EXISTS ls_acc_top_high    DECIMAL(12,6),
+    ADD COLUMN IF NOT EXISTS ls_acc_top_low     DECIMAL(12,6),
+    ADD COLUMN IF NOT EXISTS ls_pos_top_high    DECIMAL(12,6),
+    ADD COLUMN IF NOT EXISTS ls_pos_top_low     DECIMAL(12,6);
+
+-- ==============================================================================
+-- FUTURES LATEST SNAPSHOT
+-- One row per (symbol, exchange) — updated every ~15 min by realtime_daemon.py.
+-- Solves the "today = 0" problem: provides current intraday values so the frontend
+-- can anchor delta calculations (e.g. OI 7D delta, Vol/OI) on live data instead
+-- of waiting for the nightly batch scraper to populate the current-day row.
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS futures_latest (
+    symbol              VARCHAR(50)  NOT NULL,      -- Exchange-native symbol (e.g. BTCUSDT)
+    exchange            VARCHAR(50)  NOT NULL,      -- binance, bybit, okx
+    base_asset          VARCHAR(20),                -- BTC, ETH, etc.
+
+    -- Open Interest (USD) — point-in-time snapshot
+    oi_usd              DECIMAL(24, 4),
+
+    -- Funding Rate
+    funding             DECIMAL(18, 10),            -- current funding rate
+    pred_funding        DECIMAL(18, 10),            -- predicted next funding rate
+
+    -- Long/Short Ratios
+    ls_acc_global       DECIMAL(12, 6),             -- Global Account L/S Ratio
+    ls_acc_top          DECIMAL(12, 6),             -- Top Trader Account L/S Ratio
+    ls_pos_top          DECIMAL(12, 6),             -- Top Trader Position L/S Ratio
+
+    -- Price (mark price or last traded price)
+    price               DECIMAL(24, 8),
+
+    -- Liquidations accumulated since UTC 00:00 of the current day
+    liq_longs_acc       DECIMAL(24, 4),
+    liq_shorts_acc      DECIMAL(24, 4),
+
+    polled_at           TIMESTAMPTZ  NOT NULL,      -- when the exchange endpoint was queried
+    updated_at          TIMESTAMPTZ  DEFAULT NOW(),
+
+    PRIMARY KEY (symbol, exchange)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fl_base_asset ON futures_latest(base_asset);
+CREATE INDEX IF NOT EXISTS idx_fl_exchange   ON futures_latest(exchange);
+
+DROP TRIGGER IF EXISTS trigger_update_timestamp_latest ON futures_latest;
+CREATE TRIGGER trigger_update_timestamp_latest
+    BEFORE UPDATE ON futures_latest
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+ALTER TABLE futures_latest ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Allow read futures_latest"
+ON futures_latest FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY "Allow write futures_latest"
+ON futures_latest FOR ALL TO service_role USING (true) WITH CHECK (true);

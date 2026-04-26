@@ -216,12 +216,14 @@ erDiagram
 | `asset_metadata` | Asset categorization | Normalized narratives & filtering status. |
 | `futures_daily_metrics` | Hybrid Futures data | 31 columns, Smart Sourcing (Native + Coinalyze). |
 | `spot_daily_ohlcv` | Spot market data | Includes CVD Delta and transaction counts. |
+| `futures_latest` | Intraday snapshot | One row per (symbol, exchange), updated every ~15 min by `realtime_daemon.py`. |
 
 ### Schema Features
 - **Smart Upsert**: Handles incremental updates without duplication via `ON CONFLICT`.
 - **Materialized Views**: Includes `mv_aggregated_by_asset` for cross-exchange analysis.
 - **Trading Analytics**: `mv_trading_metrics` provides derived data like OI Change % and Range %.
 - **Supabase Optimized**: Pre-configured for RLS and authenticated read access.
+- **Intraday Snapshots**: `futures_latest` keeps the current-day anchor fresh for delta calculations.
 
 ---
 
@@ -235,6 +237,109 @@ erDiagram
 | **Liquidations**| `liq_longs`, `liq_shorts`, `liq_total` |
 | **OHLCV** | `price_open`, `price_high`, `price_low`, `price_close`, `volume_base`, `volume_usd` |
 | **Metrics** | `ls_acc_global`, `ls_acc_top`, `ls_pos_top`, `txn_count`, `buy_txn_count`, `sell_txn_count`, **`volume_delta`** (Buy-Sell) |
+
+---
+
+## 🔄 Realtime Daemon
+
+The batch scraper runs 3 times a day, so the current-day row in `futures_daily_metrics` is incomplete until the nightly close. `realtime_daemon.py` solves this by maintaining a live snapshot table (`futures_latest`) updated every 15 minutes using native exchange REST APIs — no Coinalyze quota consumed.
+
+### What it fetches
+
+| Metric | Binance | Bybit | OKX |
+|--------|---------|-------|-----|
+| Open Interest (USD) | `GET /fapi/v1/openInterest` | `GET /v5/market/tickers` | `GET /v5/public/open-interest` |
+| Funding Rate | `GET /fapi/v1/fundingRate` | `GET /v5/market/funding/history` | `GET /v5/public/funding-rate` |
+| Predicted Funding | `GET /fapi/v1/premiumIndex` | `GET /v5/market/tickers` | `GET /v5/public/funding-rate` |
+| Mark Price | `GET /fapi/v1/premiumIndex` | `GET /v5/market/tickers` | `GET /v5/market/ticker` |
+| L/S Ratio (Global) | `GET /futures/data/globalLongShortAccountRatio` | `GET /v5/market/account-ratio` | Rubik API |
+| L/S Ratio (Top Account) | `GET /futures/data/topLongShortAccountRatio` | — | Rubik API |
+| L/S Ratio (Top Position) | `GET /futures/data/topLongShortPositionRatio` | — | Rubik API |
+
+### Usage
+
+```bash
+# Test a single poll cycle
+python realtime_daemon.py --once
+
+# Run continuously (default: every 15 min, top 50 assets, all 3 exchanges)
+python realtime_daemon.py
+
+# Custom options
+python realtime_daemon.py --top 20 --exchanges binance,okx --interval 600
+```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--top N` | `50` | Number of top assets to track |
+| `--exchanges` | `binance,bybit,okx` | Comma-separated exchange list |
+| `--interval SEC` | `900` | Poll interval in seconds |
+| `--once` | — | Run one cycle then exit (for testing) |
+
+### Running as a systemd service (VPS)
+
+Create `/etc/systemd/system/alt-scraper-realtime.service`:
+
+```ini
+[Unit]
+Description=Futures Latest Snapshot Daemon
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/path/to/alt-scraper
+ExecStart=/path/to/venv/bin/python /path/to/alt-scraper/realtime_daemon.py
+Restart=always
+RestartSec=30
+EnvironmentFile=/path/to/alt-scraper/.env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable alt-scraper-realtime
+sudo systemctl start alt-scraper-realtime
+sudo journalctl -u alt-scraper-realtime -f   # follow logs
+```
+
+### Using `futures_latest` in the frontend
+
+**SQL — OI delta 7D with live current value:**
+
+```sql
+SELECT
+    fl.base_asset,
+    fl.oi_usd                                             AS oi_current,
+    f7.oi_usd_close                                       AS oi_7d_ago,
+    (fl.oi_usd - f7.oi_usd_close) / NULLIF(f7.oi_usd_close, 0) AS oi_delta_7d
+FROM futures_latest fl
+JOIN futures_daily_metrics f7
+    ON fl.symbol = f7.symbol AND fl.exchange = f7.exchange
+    AND f7.date = CURRENT_DATE - 7;
+```
+
+**Supabase Realtime (JS) — push updates to the frontend without polling:**
+
+```js
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+supabase
+  .channel('futures-latest')
+  .on('postgres_changes', {
+    event: 'UPDATE',
+    schema: 'public',
+    table: 'futures_latest',
+  }, payload => {
+    updateMetricDisplay(payload.new)
+  })
+  .subscribe()
+```
+
+Supabase broadcasts a push every time the daemon upserts a row — the frontend updates automatically.
 
 ---
 

@@ -1,0 +1,20 @@
+[Unit]
+Description=Alt Scraper — Realtime intraday daemon (15 min polling)
+After=network.target postgresql.service
+OnFailure=alt-scraper-notify@%n.service
+
+[Service]
+Type=simple
+User={{USER}}
+WorkingDirectory={{INSTALL_DIR}}
+EnvironmentFile={{INSTALL_DIR}}/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart={{INSTALL_DIR}}/venv/bin/python3 realtime_daemon.py --top 50
+Restart=always
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alt-scraper-realtime
+
+[Install]
+WantedBy=multi-user.target
