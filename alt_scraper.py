@@ -1611,8 +1611,10 @@ class BinanceFuturesFetcher:
         if o_data:
             oi_val = o_data.get("openInterest")
             val = float(oi_val) if oi_val and oi_val != "" else 0.0
+            # Binance returns OI in base asset (coins), convert to USD
+            val_usd = val * res.get("price_close", 0.0)
             for suffix in ['open', 'high', 'low', 'close']:
-                res[f"oi_usd_{suffix}"] = val
+                res[f"oi_usd_{suffix}"] = val_usd
         return res
 
 class BybitFuturesFetcher:
@@ -1696,7 +1698,7 @@ class BybitFuturesFetcher:
             tick = t_data.get("result", {}).get("list", [])[0]
             fr = tick.get("fundingRate")
             nfr = tick.get("nextFundingRate")
-            oi = tick.get("openInterest")
+            oi = tick.get("openInterestValue")
             
             f_val = float(fr) if fr and fr != "" else 0.0
             nf_val = float(nfr) if nfr and nfr != "" else 0.0
@@ -1820,7 +1822,7 @@ class OKXFuturesFetcher:
             
         if o_data and o_data.get("code") == "0":
             odata = o_data["data"][0]
-            oi = odata.get("oi")
+            oi = odata.get("oiUsd")
             oi_val = float(oi) if oi and oi != "" else 0.0
             for suffix in ['open', 'high', 'low', 'close']:
                 res[f"oi_usd_{suffix}"] = oi_val
