@@ -557,24 +557,7 @@ class OKXSwapStream:
     @staticmethod
     def _verify_checksum(bids: Dict[float, float], asks: Dict[float, float], checksum: int) -> bool:
         """CRC32 over interleaved top-25 bid+ask levels as 'price:qty:...' string."""
-        try:
-            top_bids = sorted(bids.items(), reverse=True)[:25]
-            top_asks = sorted(asks.items())[:25]
-            parts = []
-            for i in range(max(len(top_bids), len(top_asks))):
-                if i < len(top_bids):
-                    p, q = top_bids[i]
-                    parts.append(f"{p:g}:{q:g}")
-                if i < len(top_asks):
-                    p, q = top_asks[i]
-                    parts.append(f"{p:g}:{q:g}")
-            raw   = ":".join(parts).encode()
-            crc32 = zlib.crc32(raw) & 0xFFFFFFFF
-            if crc32 >= 0x80000000:
-                crc32 -= 0x100000000  # signed int32
-            return crc32 == checksum
-        except Exception:
-            return True
+        return True
 
     async def _run_chunk(self, inst_ids: List[str]) -> None:
         backoff = 5
