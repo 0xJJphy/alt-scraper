@@ -379,15 +379,6 @@ def backfill_bybit(
         rows      = []
         snap_days = set()
 
-        try:
-            updates = list(_parse_bybit_orderbook_file(content))
-        except Exception as e:
-            log.warning("bybit parse error %s %d-%02d: %s", symbol, year, month, e)
-            continue
-
-        if not updates:
-            continue
-
         # Determine 4h snapshot boundaries within [start_date, end_date] for this month
         snap_targets = []
         for day in date_range(
@@ -399,27 +390,31 @@ def backfill_bybit(
         snap_targets.sort()
         snap_idx = 0
 
-        for ts, side, price, size in updates:
-            # advance through snapshot targets that this update has passed
-            while snap_idx < len(snap_targets) and ts >= snap_targets[snap_idx]:
-                snap_ts = snap_targets[snap_idx]
-                if snap_ts.date() >= start_date and snap_ts.date() <= end_date:
-                    m = compute_metrics(bids, asks)
-                    if m:
-                        rows.append(_metrics_to_row(snap_ts, symbol, "bybit", base_asset, m))
-                        snap_days.add(snap_ts.date())
-                snap_idx += 1
+        try:
+            for ts, side, price, size in _parse_bybit_orderbook_file(content):
+                # advance through snapshot targets that this update has passed
+                while snap_idx < len(snap_targets) and ts >= snap_targets[snap_idx]:
+                    snap_ts = snap_targets[snap_idx]
+                    if snap_ts.date() >= start_date and snap_ts.date() <= end_date:
+                        m = compute_metrics(bids, asks)
+                        if m:
+                            rows.append(_metrics_to_row(snap_ts, symbol, "bybit", base_asset, m))
+                            snap_days.add(snap_ts.date())
+                    snap_idx += 1
 
-            if side == "Buy":
-                if size == 0:
-                    bids.pop(price, None)
-                else:
-                    bids[price] = size
-            elif side == "Sell":
-                if size == 0:
-                    asks.pop(price, None)
-                else:
-                    asks[price] = size
+                if side == "Buy":
+                    if size == 0:
+                        bids.pop(price, None)
+                    else:
+                        bids[price] = size
+                elif side == "Sell":
+                    if size == 0:
+                        asks.pop(price, None)
+                    else:
+                        asks[price] = size
+        except Exception as e:
+            log.warning("bybit parse error %s %d-%02d: %s", symbol, year, month, e)
+            continue
 
         # flush remaining snapshot targets after last update
         while snap_idx < len(snap_targets):
