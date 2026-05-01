@@ -2211,7 +2211,8 @@ def main():
         sys.exit(1)
 
     # Shared rate limiter: all exchange threads share the 40 req/min Coinalyze budget
-    rate_limiter = ThreadSafeRateLimiter(min_interval=1.6)
+    # Increased to 2.0s (30 req/min) to be more conservative and avoid 429s
+    rate_limiter = ThreadSafeRateLimiter(min_interval=2.0)
 
     # Process exchanges in parallel (one thread per exchange)
     print(f"\n[INFO] Running {len(exchanges)} exchange(s) in parallel...", flush=True)

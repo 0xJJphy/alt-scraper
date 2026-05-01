@@ -104,6 +104,83 @@ def main():
         print(f"  [DB ERROR] L/S high/low update failed: {e}", flush=True)
         failed_steps.append("L/S High/Low")
 
+    # 4b. Aggregate yesterday's orderbook snapshots → orderbook_daily_metrics
+    print("\n[4b/5] Aggregating yesterday's orderbook snapshots into daily metrics...", flush=True)
+    try:
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO orderbook_daily_metrics (
+                date, symbol, exchange, base_asset,
+                spread_bps_open, spread_bps_high, spread_bps_low, spread_bps_close,
+                bid_qty_1pct_close,     ask_qty_1pct_close,
+                bid_qty_2_5pct_close,   ask_qty_2_5pct_close,
+                bid_qty_5pct_close,     ask_qty_5pct_close,
+                bid_qty_10pct_close,    ask_qty_10pct_close,
+                imbalance_1pct_high,    imbalance_1pct_low,
+                imbalance_2_5pct_high,  imbalance_2_5pct_low,
+                imbalance_5pct_high,    imbalance_5pct_low,
+                imbalance_10pct_high,   imbalance_10pct_low,
+                avg_depth_coverage_pct, snapshot_count
+            )
+            SELECT
+                DATE(snapshot_at AT TIME ZONE 'UTC'),
+                symbol, exchange, MAX(base_asset),
+                MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 0  THEN spread_bps END),
+                MAX(spread_bps),
+                MIN(spread_bps),
+                MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 20 THEN spread_bps END),
+                MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 20 THEN bid_qty_1pct  END),
+                MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 20 THEN ask_qty_1pct  END),
+                MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 20 THEN bid_qty_2_5pct END),
+                MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 20 THEN ask_qty_2_5pct END),
+                MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 20 THEN bid_qty_5pct  END),
+                MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 20 THEN ask_qty_5pct  END),
+                MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 20 THEN bid_qty_10pct END),
+                MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 20 THEN ask_qty_10pct END),
+                MAX(imbalance_1pct),   MIN(imbalance_1pct),
+                MAX(imbalance_2_5pct), MIN(imbalance_2_5pct),
+                MAX(imbalance_5pct),   MIN(imbalance_5pct),
+                MAX(imbalance_10pct),  MIN(imbalance_10pct),
+                AVG(depth_coverage_pct), COUNT(*)
+            FROM orderbook_snapshots
+            WHERE snapshot_at >= CURRENT_DATE - 1
+              AND snapshot_at <  CURRENT_DATE
+            GROUP BY DATE(snapshot_at AT TIME ZONE 'UTC'), symbol, exchange
+            ON CONFLICT (date, symbol, exchange) DO UPDATE SET
+                spread_bps_open         = EXCLUDED.spread_bps_open,
+                spread_bps_high         = EXCLUDED.spread_bps_high,
+                spread_bps_low          = EXCLUDED.spread_bps_low,
+                spread_bps_close        = EXCLUDED.spread_bps_close,
+                bid_qty_1pct_close      = EXCLUDED.bid_qty_1pct_close,
+                ask_qty_1pct_close      = EXCLUDED.ask_qty_1pct_close,
+                bid_qty_2_5pct_close    = EXCLUDED.bid_qty_2_5pct_close,
+                ask_qty_2_5pct_close    = EXCLUDED.ask_qty_2_5pct_close,
+                bid_qty_5pct_close      = EXCLUDED.bid_qty_5pct_close,
+                ask_qty_5pct_close      = EXCLUDED.ask_qty_5pct_close,
+                bid_qty_10pct_close     = EXCLUDED.bid_qty_10pct_close,
+                ask_qty_10pct_close     = EXCLUDED.ask_qty_10pct_close,
+                imbalance_1pct_high     = EXCLUDED.imbalance_1pct_high,
+                imbalance_1pct_low      = EXCLUDED.imbalance_1pct_low,
+                imbalance_2_5pct_high   = EXCLUDED.imbalance_2_5pct_high,
+                imbalance_2_5pct_low    = EXCLUDED.imbalance_2_5pct_low,
+                imbalance_5pct_high     = EXCLUDED.imbalance_5pct_high,
+                imbalance_5pct_low      = EXCLUDED.imbalance_5pct_low,
+                imbalance_10pct_high    = EXCLUDED.imbalance_10pct_high,
+                imbalance_10pct_low     = EXCLUDED.imbalance_10pct_low,
+                avg_depth_coverage_pct  = EXCLUDED.avg_depth_coverage_pct,
+                snapshot_count          = EXCLUDED.snapshot_count,
+                updated_at              = NOW()
+        """)
+        rows_updated = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"  [DB] Upserted orderbook daily metrics for {rows_updated} rows.", flush=True)
+    except Exception as e:
+        print(f"  [DB ERROR] Orderbook daily aggregation failed: {e}", flush=True)
+        failed_steps.append("Orderbook Daily Metrics")
+
     # 5. Purge snapshots older than 90 days
     print("\n[5/5] Purging old snapshots + Refreshing Materialized Views...", flush=True)
     try:

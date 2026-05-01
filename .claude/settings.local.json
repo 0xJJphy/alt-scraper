@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "Bash(git add .github/workflows/scraper.yml)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(python -c \"import alt_scraper; print\\('alt_scraper OK'\\)\")",
+      "Bash(python -c \"import spot_scraper; print\\('spot_scraper OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('alt_scraper.py'\\).read\\(\\)\\); print\\('alt_scraper.py: syntax OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('spot_scraper.py'\\).read\\(\\)\\); print\\('spot_scraper.py: syntax OK'\\)\")",
+      "Bash(git add *)",
+      "Bash(pip show *)",
+      "Bash(docker exec gli_postgres psql -U gli_user -d alt_scraper_dev -c ' *)",
+      "Bash(pg_dump --version)"
     ]
   }
 }

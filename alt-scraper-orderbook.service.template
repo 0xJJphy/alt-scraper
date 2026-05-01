@@ -1,0 +1,19 @@
+[Unit]
+Description=Alt-Scraper Order Book WebSocket Daemon
+After=network.target
+
+[Service]
+Type=simple
+User={{USER}}
+WorkingDirectory={{INSTALL_DIR}}
+EnvironmentFile={{INSTALL_DIR}}/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart={{INSTALL_DIR}}/venv/bin/python3 {{INSTALL_DIR}}/orderbook_daemon.py
+Restart=always
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alt-scraper-orderbook
+
+[Install]
+WantedBy=multi-user.target

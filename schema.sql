@@ -1034,3 +1034,163 @@ CREATE TRIGGER trigger_update_timestamp_latest
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+-- ==============================================================================
+-- ORDER BOOK SNAPSHOTS
+-- 6 snapshots/day at 4h intervals (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC).
+-- Covers Binance Futures, Bybit Linear, OKX Swap (perps USDT) + Upbit Spot (KRW).
+-- Permanent — no purge. Upbit prices are KRW→USD converted via USDT-KRW rate.
+-- depth_coverage_pct = min(bid_side_coverage, ask_side_coverage) as % of mid.
+-- Band metrics are NULL when depth_coverage_pct < band threshold.
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS orderbook_snapshots (
+    snapshot_at         TIMESTAMPTZ     NOT NULL,
+    symbol              VARCHAR(50)     NOT NULL,   -- exchange-native (e.g. BTCUSDT, KRW-BTC)
+    exchange            VARCHAR(50)     NOT NULL,   -- binance, bybit, okx, upbit
+    base_asset          VARCHAR(20),                -- BTC, ETH, etc.
+
+    mid_price           DECIMAL(24, 8),
+    best_bid            DECIMAL(24, 8),
+    best_ask            DECIMAL(24, 8),
+    spread_bps          DECIMAL(10, 4),
+    depth_coverage_pct  DECIMAL(8, 4),              -- actual % of mid covered by book
+
+    bid_qty_1pct        DECIMAL(24, 8),
+    ask_qty_1pct        DECIMAL(24, 8),
+    bid_levels_1pct     INTEGER,
+    ask_levels_1pct     INTEGER,
+    imbalance_1pct      DECIMAL(8, 6),              -- (bid-ask)/(bid+ask) ∈ [-1, +1]
+
+    bid_qty_2_5pct      DECIMAL(24, 8),
+    ask_qty_2_5pct      DECIMAL(24, 8),
+    bid_levels_2_5pct   INTEGER,
+    ask_levels_2_5pct   INTEGER,
+    imbalance_2_5pct    DECIMAL(8, 6),
+
+    bid_qty_5pct        DECIMAL(24, 8),
+    ask_qty_5pct        DECIMAL(24, 8),
+    bid_levels_5pct     INTEGER,
+    ask_levels_5pct     INTEGER,
+    imbalance_5pct      DECIMAL(8, 6),
+
+    bid_qty_10pct       DECIMAL(24, 8),
+    ask_qty_10pct       DECIMAL(24, 8),
+    bid_levels_10pct    INTEGER,
+    ask_levels_10pct    INTEGER,
+    imbalance_10pct     DECIMAL(8, 6),
+
+    created_at          TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (snapshot_at, symbol, exchange)
+);
+
+CREATE INDEX IF NOT EXISTS idx_obs_symbol_exchange_time
+    ON orderbook_snapshots (symbol, exchange, snapshot_at DESC);
+CREATE INDEX IF NOT EXISTS idx_obs_base_exchange_time
+    ON orderbook_snapshots (base_asset, exchange, snapshot_at DESC);
+CREATE INDEX IF NOT EXISTS idx_obs_snapshot_at
+    ON orderbook_snapshots (snapshot_at DESC);
+
+-- ==============================================================================
+-- ORDER BOOK DAILY METRICS
+-- One row per (date, symbol, exchange). Aggregated from the 6 daily snapshots.
+-- spread_bps_open = 00:00 snapshot, spread_bps_close = 20:00 snapshot.
+-- *_close depth = 20:00 UTC snapshot values.
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS orderbook_daily_metrics (
+    date                DATE            NOT NULL,
+    symbol              VARCHAR(50)     NOT NULL,
+    exchange            VARCHAR(50)     NOT NULL,
+    base_asset          VARCHAR(20),
+
+    -- Spread OHLC over the 6 daily snapshots
+    spread_bps_open     DECIMAL(10, 4),             -- 00:00 UTC snapshot
+    spread_bps_high     DECIMAL(10, 4),             -- worst spread of the day
+    spread_bps_low      DECIMAL(10, 4),             -- best spread of the day
+    spread_bps_close    DECIMAL(10, 4),             -- 20:00 UTC snapshot
+
+    -- Depth at close (20:00 UTC snapshot)
+    bid_qty_1pct_close      DECIMAL(24, 8),
+    ask_qty_1pct_close      DECIMAL(24, 8),
+    bid_qty_2_5pct_close    DECIMAL(24, 8),
+    ask_qty_2_5pct_close    DECIMAL(24, 8),
+    bid_qty_5pct_close      DECIMAL(24, 8),
+    ask_qty_5pct_close      DECIMAL(24, 8),
+    bid_qty_10pct_close     DECIMAL(24, 8),
+    ask_qty_10pct_close     DECIMAL(24, 8),
+
+    -- Intraday imbalance range (buyer pressure signal)
+    imbalance_1pct_high     DECIMAL(8, 6),
+    imbalance_1pct_low      DECIMAL(8, 6),
+    imbalance_2_5pct_high   DECIMAL(8, 6),
+    imbalance_2_5pct_low    DECIMAL(8, 6),
+    imbalance_5pct_high     DECIMAL(8, 6),
+    imbalance_5pct_low      DECIMAL(8, 6),
+    imbalance_10pct_high    DECIMAL(8, 6),
+    imbalance_10pct_low     DECIMAL(8, 6),
+
+    avg_depth_coverage_pct  DECIMAL(8, 4),
+    snapshot_count          SMALLINT,               -- valid snapshots that day (0-6)
+
+    created_at          TIMESTAMPTZ     DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (date, symbol, exchange)
+);
+
+CREATE INDEX IF NOT EXISTS idx_odm_date
+    ON orderbook_daily_metrics (date DESC);
+CREATE INDEX IF NOT EXISTS idx_odm_symbol_date
+    ON orderbook_daily_metrics (symbol, date DESC);
+CREATE INDEX IF NOT EXISTS idx_odm_base_exchange_date
+    ON orderbook_daily_metrics (base_asset, exchange, date DESC);
+
+DROP TRIGGER IF EXISTS trigger_update_timestamp_odm ON orderbook_daily_metrics;
+CREATE TRIGGER trigger_update_timestamp_odm
+    BEFORE UPDATE ON orderbook_daily_metrics
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- ==============================================================================
+-- ORDER BOOK LATEST
+-- One row per (symbol, exchange) — updated every ~60s by orderbook_daemon.py.
+-- Used by frontend for live display without WebSocket proxy.
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS orderbook_latest (
+    symbol              VARCHAR(50)     NOT NULL,
+    exchange            VARCHAR(50)     NOT NULL,
+    base_asset          VARCHAR(20),
+
+    mid_price           DECIMAL(24, 8),
+    best_bid            DECIMAL(24, 8),
+    best_ask            DECIMAL(24, 8),
+    spread_bps          DECIMAL(10, 4),
+    depth_coverage_pct  DECIMAL(8, 4),
+
+    bid_qty_1pct        DECIMAL(24, 8),
+    ask_qty_1pct        DECIMAL(24, 8),
+    imbalance_1pct      DECIMAL(8, 6),
+
+    bid_qty_2_5pct      DECIMAL(24, 8),
+    ask_qty_2_5pct      DECIMAL(24, 8),
+    imbalance_2_5pct    DECIMAL(8, 6),
+
+    bid_qty_5pct        DECIMAL(24, 8),
+    ask_qty_5pct        DECIMAL(24, 8),
+    imbalance_5pct      DECIMAL(8, 6),
+
+    bid_qty_10pct       DECIMAL(24, 8),
+    ask_qty_10pct       DECIMAL(24, 8),
+    imbalance_10pct     DECIMAL(8, 6),
+
+    polled_at           TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (symbol, exchange)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ol_base_asset ON orderbook_latest (base_asset);
+CREATE INDEX IF NOT EXISTS idx_ol_exchange   ON orderbook_latest (exchange);
+
+DROP TRIGGER IF EXISTS trigger_update_timestamp_ol ON orderbook_latest;
+CREATE TRIGGER trigger_update_timestamp_ol
+    BEFORE UPDATE ON orderbook_latest
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+

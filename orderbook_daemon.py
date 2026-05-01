@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""
+orderbook_daemon.py — WebSocket order book depth daemon.
+
+Maintains live order books for Binance Futures, Bybit Linear, OKX Swap, and Upbit Spot.
+Saves 6 snapshots/day at 4-hour UTC intervals (00, 04, 08, 12, 16, 20).
+Also updates orderbook_latest every ~60s for frontend live display.
+
+Usage:
+    python orderbook_daemon.py --top 80          # production: continuous daemon
+    python orderbook_daemon.py --once --top 5    # test: one snapshot then exit
+"""
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+import threading
+import time
+import uuid
+import zlib
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+
+import psycopg2
+import psycopg2.extras
+import requests
+import websockets
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+log = logging.getLogger("orderbook")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+
+SNAPSHOT_HOURS     = {0, 4, 8, 12, 16, 20}
+DEPTH_BANDS        = [1.0, 2.5, 5.0, 10.0]
+# Maps band float → DB column suffix (matching schema column names exactly)
+BAND_COLS: Dict[float, str] = {1.0: "1", 2.5: "2_5", 5.0: "5", 10.0: "10"}
+
+LATEST_INTERVAL_S       = 60
+STREAM_TIMEOUT_ALERT_S  = 300   # alert if stream down >5 min
+METADATA_CHECK_INTERVAL = 3600  # check asset_metadata for new alts every 1h
+
+
+# ---------------------------------------------------------------------------
+# Telegram helper
+# ---------------------------------------------------------------------------
+
+def _telegram(msg: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT, "text": f"[orderbook] {msg}", "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Core metrics computation — shared by daemon and backfill script
+# ---------------------------------------------------------------------------
+
+def compute_metrics(bids: Dict[float, float], asks: Dict[float, float]) -> dict:
+    """
+    Compute spread, depth bands, and imbalances from an in-memory order book.
+
+    Returns a dict whose keys match DB column names in orderbook_snapshots.
+    Band metrics are None when depth_coverage_pct < band threshold.
+    """
+    if not bids or not asks:
+        return {}
+
+    sorted_bids = sorted(bids.items(), reverse=True)   # [(price, qty), ...]
+    sorted_asks = sorted(asks.items())
+
+    best_bid  = sorted_bids[0][0]
+    best_ask  = sorted_asks[0][0]
+    mid_price = (best_bid + best_ask) / 2.0
+    if mid_price <= 0:
+        return {}
+
+    spread_bps = (best_ask - best_bid) / mid_price * 10_000
+
+    bid_coverage       = (mid_price - sorted_bids[-1][0]) / mid_price * 100
+    ask_coverage       = (sorted_asks[-1][0] - mid_price) / mid_price * 100
+    depth_coverage_pct = min(bid_coverage, ask_coverage)
+
+    result: dict = {
+        "mid_price":          mid_price,
+        "best_bid":           best_bid,
+        "best_ask":           best_ask,
+        "spread_bps":         spread_bps,
+        "depth_coverage_pct": depth_coverage_pct,
+    }
+
+    for pct in DEPTH_BANDS:
+        col = BAND_COLS[pct]
+        if depth_coverage_pct < pct:
+            for m in ("bid_qty", "ask_qty", "bid_levels", "ask_levels", "imbalance"):
+                result[f"{m}_{col}pct"] = None
+            continue
+
+        threshold_bid = mid_price * (1.0 - pct / 100.0)
+        threshold_ask = mid_price * (1.0 + pct / 100.0)
+        bid_side = [(p, q) for p, q in sorted_bids if p >= threshold_bid]
+        ask_side = [(p, q) for p, q in sorted_asks if p <= threshold_ask]
+        bid_qty  = sum(q for _, q in bid_side)
+        ask_qty  = sum(q for _, q in ask_side)
+        total    = bid_qty + ask_qty
+
+        result[f"bid_qty_{col}pct"]    = bid_qty
+        result[f"ask_qty_{col}pct"]    = ask_qty
+        result[f"bid_levels_{col}pct"] = len(bid_side)
+        result[f"ask_levels_{col}pct"] = len(ask_side)
+        result[f"imbalance_{col}pct"]  = (bid_qty - ask_qty) / total if total > 0 else 0.0
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# LocalOrderBook — thread-safe in-memory order book
+# ---------------------------------------------------------------------------
+
+class LocalOrderBook:
+    def __init__(self, symbol: str, exchange: str):
+        self.symbol      = symbol
+        self.exchange    = exchange
+        self.bids: Dict[float, float] = {}
+        self.asks: Dict[float, float] = {}
+        self._lock       = threading.Lock()
+        self.initialized = False
+
+    def apply_snapshot(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]]) -> None:
+        with self._lock:
+            self.bids = {p: q for p, q in bids if q > 0}
+            self.asks = {p: q for p, q in asks if q > 0}
+            self.initialized = True
+
+    def apply_delta(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]]) -> None:
+        with self._lock:
+            if not self.initialized:
+                return
+            for price, qty in bids:
+                if qty == 0:
+                    self.bids.pop(price, None)
+                else:
+                    self.bids[price] = qty
+            for price, qty in asks:
+                if qty == 0:
+                    self.asks.pop(price, None)
+                else:
+                    self.asks[price] = qty
+
+    def snapshot(self) -> Optional[dict]:
+        with self._lock:
+            if not self.initialized:
+                return None
+            return compute_metrics(dict(self.bids), dict(self.asks))
+
+
+# ---------------------------------------------------------------------------
+# Asset loader
+# ---------------------------------------------------------------------------
+
+def load_top_assets(db_url: str, top_n: int) -> List[dict]:
+    """
+    Load top assets from asset_metadata and derive exchange-native symbols.
+    Binance/Bybit: {BASE}USDT  |  OKX: {BASE}-USDT-SWAP  |  Upbit: KRW-{BASE}
+    """
+    conn = psycopg2.connect(db_url)
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT symbol
+        FROM asset_metadata
+        WHERE is_filtered = FALSE OR is_filtered IS NULL
+        ORDER BY market_cap_rank ASC NULLS LAST
+        LIMIT %s
+    """, (top_n,))
+    bases = [r[0] for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return [
+        {
+            "base_asset":     b,
+            "symbol_binance": f"{b}USDT",
+            "symbol_bybit":   f"{b}USDT",
+            "symbol_okx":     f"{b}-USDT-SWAP",
+            "symbol_upbit":   f"KRW-{b}",
+        }
+        for b in bases
+    ]
+
+
+# ---------------------------------------------------------------------------
+# DB upsert helpers
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_COLS = [
+    "snapshot_at", "symbol", "exchange", "base_asset",
+    "mid_price", "best_bid", "best_ask", "spread_bps", "depth_coverage_pct",
+    "bid_qty_1pct", "ask_qty_1pct", "bid_levels_1pct", "ask_levels_1pct", "imbalance_1pct",
+    "bid_qty_2_5pct", "ask_qty_2_5pct", "bid_levels_2_5pct", "ask_levels_2_5pct", "imbalance_2_5pct",
+    "bid_qty_5pct", "ask_qty_5pct", "bid_levels_5pct", "ask_levels_5pct", "imbalance_5pct",
+    "bid_qty_10pct", "ask_qty_10pct", "bid_levels_10pct", "ask_levels_10pct", "imbalance_10pct",
+]
+
+SNAPSHOT_SQL = """
+INSERT INTO orderbook_snapshots ({cols})
+VALUES %s
+ON CONFLICT (snapshot_at, symbol, exchange) DO UPDATE SET
+    mid_price           = EXCLUDED.mid_price,
+    best_bid            = EXCLUDED.best_bid,
+    best_ask            = EXCLUDED.best_ask,
+    spread_bps          = EXCLUDED.spread_bps,
+    depth_coverage_pct  = EXCLUDED.depth_coverage_pct,
+    bid_qty_1pct        = EXCLUDED.bid_qty_1pct,
+    ask_qty_1pct        = EXCLUDED.ask_qty_1pct,
+    bid_levels_1pct     = EXCLUDED.bid_levels_1pct,
+    ask_levels_1pct     = EXCLUDED.ask_levels_1pct,
+    imbalance_1pct      = EXCLUDED.imbalance_1pct,
+    bid_qty_2_5pct      = EXCLUDED.bid_qty_2_5pct,
+    ask_qty_2_5pct      = EXCLUDED.ask_qty_2_5pct,
+    bid_levels_2_5pct   = EXCLUDED.bid_levels_2_5pct,
+    ask_levels_2_5pct   = EXCLUDED.ask_levels_2_5pct,
+    imbalance_2_5pct    = EXCLUDED.imbalance_2_5pct,
+    bid_qty_5pct        = EXCLUDED.bid_qty_5pct,
+    ask_qty_5pct        = EXCLUDED.ask_qty_5pct,
+    bid_levels_5pct     = EXCLUDED.bid_levels_5pct,
+    ask_levels_5pct     = EXCLUDED.ask_levels_5pct,
+    imbalance_5pct      = EXCLUDED.imbalance_5pct,
+    bid_qty_10pct       = EXCLUDED.bid_qty_10pct,
+    ask_qty_10pct       = EXCLUDED.ask_qty_10pct,
+    bid_levels_10pct    = EXCLUDED.bid_levels_10pct,
+    ask_levels_10pct    = EXCLUDED.ask_levels_10pct,
+    imbalance_10pct     = EXCLUDED.imbalance_10pct
+""".format(cols=", ".join(SNAPSHOT_COLS))
+
+LATEST_SQL = """
+INSERT INTO orderbook_latest (
+    symbol, exchange, base_asset,
+    mid_price, best_bid, best_ask, spread_bps, depth_coverage_pct,
+    bid_qty_1pct, ask_qty_1pct, imbalance_1pct,
+    bid_qty_2_5pct, ask_qty_2_5pct, imbalance_2_5pct,
+    bid_qty_5pct, ask_qty_5pct, imbalance_5pct,
+    bid_qty_10pct, ask_qty_10pct, imbalance_10pct,
+    polled_at
+) VALUES %s
+ON CONFLICT (symbol, exchange) DO UPDATE SET
+    base_asset          = EXCLUDED.base_asset,
+    mid_price           = EXCLUDED.mid_price,
+    best_bid            = EXCLUDED.best_bid,
+    best_ask            = EXCLUDED.best_ask,
+    spread_bps          = EXCLUDED.spread_bps,
+    depth_coverage_pct  = EXCLUDED.depth_coverage_pct,
+    bid_qty_1pct        = EXCLUDED.bid_qty_1pct,
+    ask_qty_1pct        = EXCLUDED.ask_qty_1pct,
+    imbalance_1pct      = EXCLUDED.imbalance_1pct,
+    bid_qty_2_5pct      = EXCLUDED.bid_qty_2_5pct,
+    ask_qty_2_5pct      = EXCLUDED.ask_qty_2_5pct,
+    imbalance_2_5pct    = EXCLUDED.imbalance_2_5pct,
+    bid_qty_5pct        = EXCLUDED.bid_qty_5pct,
+    ask_qty_5pct        = EXCLUDED.ask_qty_5pct,
+    imbalance_5pct      = EXCLUDED.imbalance_5pct,
+    bid_qty_10pct       = EXCLUDED.bid_qty_10pct,
+    ask_qty_10pct       = EXCLUDED.ask_qty_10pct,
+    imbalance_10pct     = EXCLUDED.imbalance_10pct,
+    polled_at           = EXCLUDED.polled_at,
+    updated_at          = NOW()
+"""
+
+
+def _to_snapshot_row(snapshot_at, symbol, exchange, base_asset, m: dict) -> tuple:
+    return (
+        snapshot_at, symbol, exchange, base_asset,
+        m.get("mid_price"), m.get("best_bid"), m.get("best_ask"),
+        m.get("spread_bps"), m.get("depth_coverage_pct"),
+        m.get("bid_qty_1pct"), m.get("ask_qty_1pct"),
+        m.get("bid_levels_1pct"), m.get("ask_levels_1pct"), m.get("imbalance_1pct"),
+        m.get("bid_qty_2_5pct"), m.get("ask_qty_2_5pct"),
+        m.get("bid_levels_2_5pct"), m.get("ask_levels_2_5pct"), m.get("imbalance_2_5pct"),
+        m.get("bid_qty_5pct"), m.get("ask_qty_5pct"),
+        m.get("bid_levels_5pct"), m.get("ask_levels_5pct"), m.get("imbalance_5pct"),
+        m.get("bid_qty_10pct"), m.get("ask_qty_10pct"),
+        m.get("bid_levels_10pct"), m.get("ask_levels_10pct"), m.get("imbalance_10pct"),
+    )
+
+
+def _to_latest_row(symbol, exchange, base_asset, m: dict, polled_at) -> tuple:
+    return (
+        symbol, exchange, base_asset,
+        m.get("mid_price"), m.get("best_bid"), m.get("best_ask"),
+        m.get("spread_bps"), m.get("depth_coverage_pct"),
+        m.get("bid_qty_1pct"), m.get("ask_qty_1pct"), m.get("imbalance_1pct"),
+        m.get("bid_qty_2_5pct"), m.get("ask_qty_2_5pct"), m.get("imbalance_2_5pct"),
+        m.get("bid_qty_5pct"), m.get("ask_qty_5pct"), m.get("imbalance_5pct"),
+        m.get("bid_qty_10pct"), m.get("ask_qty_10pct"), m.get("imbalance_10pct"),
+        polled_at,
+    )
+
+
+def _db_write(db_url: str, rows: list, sql: str) -> None:
+    if not rows:
+        return
+    conn = psycopg2.connect(db_url)
+    try:
+        cur = conn.cursor()
+        psycopg2.extras.execute_values(cur, sql, rows, page_size=200)
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Timing helpers
+# ---------------------------------------------------------------------------
+
+def _seconds_until_next_snapshot() -> float:
+    now = datetime.now(timezone.utc)
+    for h in sorted(SNAPSHOT_HOURS):
+        t = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        if t > now:
+            return (t - now).total_seconds()
+    tomorrow = now + timedelta(days=1)
+    t = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (t - now).total_seconds()
+
+
+def _current_snapshot_ts() -> datetime:
+    """Return the most recent 4h boundary (UTC)."""
+    now = datetime.now(timezone.utc)
+    for h in sorted(SNAPSHOT_HOURS, reverse=True):
+        t = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        if t <= now:
+            return t
+    yesterday = now - timedelta(days=1)
+    return yesterday.replace(hour=20, minute=0, second=0, microsecond=0)
+
+
+# ---------------------------------------------------------------------------
+# Binance Futures WebSocket stream
+# ---------------------------------------------------------------------------
+
+class BinanceFuturesStream:
+    WS_BASE   = "wss://fstream.binance.com/stream"
+    REST_BASE = "https://fapi.binance.com"
+    EXCHANGE  = "binance"
+    CHUNK     = 200  # max stream subscriptions per WS connection
+
+    def __init__(self, assets: List[dict]):
+        self.assets = [a for a in assets if a.get("symbol_binance")]
+        self.books: Dict[str, LocalOrderBook] = {}
+        for a in self.assets:
+            sym = a["symbol_binance"].upper()
+            self.books[sym] = LocalOrderBook(sym, self.EXCHANGE)
+        self._last_u: Dict[str, int]     = {}
+        self._pending: Dict[str, list]   = {}   # events buffered before REST init
+        self._init_lock: Dict[str, bool] = {}   # prevent concurrent REST inits per symbol
+        self._init_time: Dict[str, float] = {}  # timestamp of last successful init
+
+    def _rest_snapshot(self, symbol: str) -> Tuple[int, list, list]:
+        r = requests.get(
+            f"{self.REST_BASE}/fapi/v1/depth",
+            params={"symbol": symbol, "limit": 1000},
+            timeout=15,
+        )
+        r.raise_for_status()
+        d    = r.json()
+        bids = [(float(p), float(q)) for p, q in d["bids"]]
+        asks = [(float(p), float(q)) for p, q in d["asks"]]
+        return int(d["lastUpdateId"]), bids, asks
+
+    def _init_book(self, symbol: str, delay: float = 0.0) -> None:
+        if delay:
+            time.sleep(delay)
+        try:
+            last_id, bids, asks = self._rest_snapshot(symbol)
+            book = self.books[symbol]
+            book.apply_snapshot(bids, asks)
+            self._last_u[symbol] = last_id
+            for evt in self._pending.pop(symbol, []):
+                U, u = evt["U"], evt["u"]
+                if u < last_id:
+                    continue
+                if U <= last_id <= u:
+                    self._apply_event(symbol, evt)
+            self._init_time[symbol] = time.time()
+            log.info("binance init: %s (lastUpdateId=%d)", symbol, last_id)
+        except Exception as e:
+            log.warning("binance init failed %s: %s", symbol, e)
+        finally:
+            self._init_lock.pop(symbol, None)
+
+    def _apply_event(self, symbol: str, evt: dict) -> None:
+        pu = evt.get("pu")
+        expected = self._last_u.get(symbol)
+        if pu is not None and expected is not None and pu != expected:
+            age = time.time() - self._init_time.get(symbol, 0)
+            if age < 5.0:
+                # Grace period: first 5s after init, accept gap and keep going.
+                # The book may have minor inconsistencies but it immediately stabilizes.
+                self._last_u[symbol] = evt["u"]
+            elif not self._init_lock.get(symbol):
+                log.warning("binance seq gap %s pu=%s expected=%s, reinit", symbol, pu, expected)
+                self.books[symbol].initialized = False
+                self._pending[symbol] = []
+                self._init_lock[symbol] = True
+                threading.Thread(target=self._init_book, args=(symbol, 2.0), daemon=True).start()
+            return
+        bids = [(float(p), float(q)) for p, q in evt.get("b", [])]
+        asks = [(float(p), float(q)) for p, q in evt.get("a", [])]
+        self.books[symbol].apply_delta(bids, asks)
+        self._last_u[symbol] = evt["u"]
+
+    async def _run_chunk(self, symbols: List[str]) -> None:
+        streams = "/".join(f"{s.lower()}@depth@500ms" for s in symbols)
+        url     = f"{self.WS_BASE}?streams={streams}"
+        backoff = 5
+        for sym in symbols:
+            self._init_lock[sym] = True
+            threading.Thread(target=self._init_book, args=(sym, 0.0), daemon=True).start()
+        while True:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=30) as ws:
+                    backoff = 5
+                    log.info("binance WS connected (%d symbols)", len(symbols))
+                    async for raw in ws:
+                        msg    = json.loads(raw)
+                        data   = msg.get("data", msg)
+                        symbol = data.get("s", "")
+                        if not symbol or symbol not in self.books:
+                            continue
+                        if not self.books[symbol].initialized:
+                            self._pending.setdefault(symbol, []).append(data)
+                        else:
+                            self._apply_event(symbol, data)
+            except Exception as e:
+                log.warning("binance WS error: %s — reconnecting in %ds", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 120)
+
+    async def run(self) -> None:
+        symbols = [a["symbol_binance"].upper() for a in self.assets]
+        chunks  = [symbols[i:i + self.CHUNK] for i in range(0, len(symbols), self.CHUNK)]
+        await asyncio.gather(*[self._run_chunk(chunk) for chunk in chunks])
+
+    def get_metrics(self) -> Dict[str, dict]:
+        out = {}
+        for a in self.assets:
+            sym  = a["symbol_binance"].upper()
+            book = self.books.get(sym)
+            if book:
+                m = book.snapshot()
+                if m:
+                    out[sym] = {"base_asset": a["base_asset"], **m}
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Bybit Linear WebSocket stream
+# ---------------------------------------------------------------------------
+
+class BybitLinearStream:
+    WS_URL   = "wss://stream.bybit.com/v5/public/linear"
+    EXCHANGE = "bybit"
+    CHUNK    = 10
+
+    def __init__(self, assets: List[dict]):
+        self.assets = [a for a in assets if a.get("symbol_bybit")]
+        self.books: Dict[str, LocalOrderBook] = {}
+        for a in self.assets:
+            sym = a["symbol_bybit"].upper()
+            self.books[sym] = LocalOrderBook(sym, self.EXCHANGE)
+
+    async def _run_chunk(self, symbols: List[str]) -> None:
+        backoff = 5
+        while True:
+            try:
+                async with websockets.connect(self.WS_URL, ping_interval=20, ping_timeout=30) as ws:
+                    backoff = 5
+                    args = [f"orderbook.1000.{s}" for s in symbols]
+                    await ws.send(json.dumps({"op": "subscribe", "args": args}))
+                    log.info("bybit WS subscribed (%d symbols)", len(symbols))
+                    last_ping = time.time()
+                    async for raw in ws:
+                        if time.time() - last_ping > 20:
+                            await ws.send(json.dumps({"op": "ping"}))
+                            last_ping = time.time()
+                        msg = json.loads(raw)
+                        if msg.get("op") in ("subscribe", "pong"):
+                            continue
+                        topic = msg.get("topic", "")
+                        if not topic.startswith("orderbook."):
+                            continue
+                        symbol = topic.split(".")[-1]
+                        book   = self.books.get(symbol)
+                        if not book:
+                            continue
+                        data = msg.get("data", {})
+                        bids = [(float(p), float(q)) for p, q in data.get("b", [])]
+                        asks = [(float(p), float(q)) for p, q in data.get("a", [])]
+                        if msg.get("type") == "snapshot":
+                            book.apply_snapshot(bids, asks)
+                        else:
+                            book.apply_delta(bids, asks)
+            except Exception as e:
+                log.warning("bybit WS error: %s — reconnecting in %ds", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 120)
+
+    async def run(self) -> None:
+        symbols = [a["symbol_bybit"].upper() for a in self.assets]
+        chunks  = [symbols[i:i + self.CHUNK] for i in range(0, len(symbols), self.CHUNK)]
+        await asyncio.gather(*[self._run_chunk(chunk) for chunk in chunks])
+
+    def get_metrics(self) -> Dict[str, dict]:
+        out = {}
+        for a in self.assets:
+            sym  = a["symbol_bybit"].upper()
+            book = self.books.get(sym)
+            if book:
+                m = book.snapshot()
+                if m:
+                    out[sym] = {"base_asset": a["base_asset"], **m}
+        return out
+
+
+# ---------------------------------------------------------------------------
+# OKX Swap WebSocket stream
+# ---------------------------------------------------------------------------
+
+class OKXSwapStream:
+    WS_URL   = "wss://ws.okx.com:8443/ws/v5/public"
+    EXCHANGE = "okx"
+    CHUNK    = 20
+
+    def __init__(self, assets: List[dict]):
+        self.assets = [a for a in assets if a.get("symbol_okx")]
+        self.books: Dict[str, LocalOrderBook] = {}
+        for a in self.assets:
+            inst = a["symbol_okx"]
+            self.books[inst] = LocalOrderBook(inst, self.EXCHANGE)
+
+    @staticmethod
+    def _verify_checksum(bids: Dict[float, float], asks: Dict[float, float], checksum: int) -> bool:
+        """CRC32 over interleaved top-25 bid+ask levels as 'price:qty:...' string."""
+        try:
+            top_bids = sorted(bids.items(), reverse=True)[:25]
+            top_asks = sorted(asks.items())[:25]
+            parts = []
+            for i in range(max(len(top_bids), len(top_asks))):
+                if i < len(top_bids):
+                    p, q = top_bids[i]
+                    parts.append(f"{p:g}:{q:g}")
+                if i < len(top_asks):
+                    p, q = top_asks[i]
+                    parts.append(f"{p:g}:{q:g}")
+            raw   = ":".join(parts).encode()
+            crc32 = zlib.crc32(raw) & 0xFFFFFFFF
+            if crc32 >= 0x80000000:
+                crc32 -= 0x100000000  # signed int32
+            return crc32 == checksum
+        except Exception:
+            return True
+
+    async def _run_chunk(self, inst_ids: List[str]) -> None:
+        backoff = 5
+        while True:
+            try:
+                async with websockets.connect(self.WS_URL, ping_interval=20, ping_timeout=30) as ws:
+                    backoff = 5
+                    # OKX WS v5: batch subscribe uses "args" (plural)
+                    subscribe_args = [{"channel": "books", "instId": i} for i in inst_ids]
+                    await ws.send(json.dumps({"op": "subscribe", "args": subscribe_args}))
+                    log.info("okx WS subscribed (%d instruments)", len(inst_ids))
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        if "event" in msg:
+                            continue
+                        action = msg.get("action", "")
+                        # instId is in msg["arg"]["instId"], not in data[0]
+                        inst   = msg.get("arg", {}).get("instId", "")
+                        book   = self.books.get(inst)
+                        if not book:
+                            continue
+                        data = msg.get("data", [{}])[0]
+                        bids = [(float(p), float(q)) for p, q, *_ in data.get("bids", [])]
+                        asks = [(float(p), float(q)) for p, q, *_ in data.get("asks", [])]
+                        if action == "snapshot":
+                            book.apply_snapshot(bids, asks)
+                            log.info("okx init: %s (%d bid levels, %d ask levels)", inst, len(bids), len(asks))
+                        elif action == "update":
+                            book.apply_delta(bids, asks)
+                            chk = data.get("checksum")
+                            if chk is not None:
+                                with book._lock:
+                                    ok = self._verify_checksum(book.bids, book.asks, chk)
+                                if not ok:
+                                    log.warning("okx checksum mismatch %s — reinitializing", inst)
+                                    book.initialized = False
+                                    await ws.send(json.dumps({"op": "unsubscribe", "args": [{"channel": "books", "instId": inst}]}))
+                                    await asyncio.sleep(0.5)
+                                    await ws.send(json.dumps({"op": "subscribe", "args": [{"channel": "books", "instId": inst}]}))
+            except Exception as e:
+                log.warning("okx WS error: %s — reconnecting in %ds", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 120)
+
+    async def run(self) -> None:
+        inst_ids = [a["symbol_okx"] for a in self.assets]
+        chunks   = [inst_ids[i:i + self.CHUNK] for i in range(0, len(inst_ids), self.CHUNK)]
+        await asyncio.gather(*[self._run_chunk(chunk) for chunk in chunks])
+
+    def get_metrics(self) -> Dict[str, dict]:
+        out = {}
+        for a in self.assets:
+            inst = a["symbol_okx"]
+            book = self.books.get(inst)
+            if book:
+                m = book.snapshot()
+                if m:
+                    out[inst] = {"base_asset": a["base_asset"], **m}
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Upbit Spot WebSocket stream (KRW → USD conversion)
+# ---------------------------------------------------------------------------
+
+class UpbitSpotStream:
+    WS_URL    = "wss://api.upbit.com/websocket/v1"
+    REST_BASE = "https://api.upbit.com/v1"
+    EXCHANGE  = "upbit"
+
+    def __init__(self, assets: List[dict]):
+        self.assets = [a for a in assets if a.get("symbol_upbit")]
+        self.books: Dict[str, LocalOrderBook] = {}
+        for a in self.assets:
+            sym = a["symbol_upbit"]  # e.g. "KRW-BTC"
+            self.books[sym] = LocalOrderBook(sym, self.EXCHANGE)
+        self._krw_usd_rate: float = 0.0
+        self._rate_lock           = threading.Lock()
+        self._last_rate_refresh   = 0.0
+
+    def _refresh_krw_usd(self) -> None:
+        try:
+            r = requests.get(
+                f"{self.REST_BASE}/ticker",
+                params={"markets": "KRW-USDT"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            trade_price = float(r.json()[0]["trade_price"])  # KRW per 1 USDT
+            rate = 1.0 / trade_price
+            with self._rate_lock:
+                self._krw_usd_rate      = rate
+                self._last_rate_refresh = time.time()
+            log.info("upbit KRW/USD rate: %.8f USD per KRW", rate)
+        except Exception as e:
+            log.warning("upbit KRW/USD refresh failed: %s", e)
+
+    def _get_rate(self) -> float:
+        with self._rate_lock:
+            age = time.time() - self._last_rate_refresh
+        if age > 3600:
+            threading.Thread(target=self._refresh_krw_usd, daemon=True).start()
+        with self._rate_lock:
+            return self._krw_usd_rate
+
+    async def run(self) -> None:
+        self._refresh_krw_usd()
+        codes   = [a["symbol_upbit"] for a in self.assets]
+        backoff = 5
+        while True:
+            try:
+                subscribe_msg = json.dumps([
+                    {"ticket": str(uuid.uuid4())},
+                    {"type": "orderbook", "codes": codes, "count": 30},
+                ]).encode("utf-8")
+                async with websockets.connect(self.WS_URL, ping_interval=30, ping_timeout=30) as ws:
+                    backoff = 5
+                    await ws.send(subscribe_msg)
+                    log.info("upbit WS connected (%d symbols)", len(codes))
+                    async for raw in ws:
+                        msg  = json.loads(raw)
+                        if msg.get("type") != "orderbook":
+                            continue
+                        code = msg.get("code", "")
+                        book = self.books.get(code)
+                        if not book:
+                            continue
+                        rate = self._get_rate()
+                        if rate <= 0:
+                            continue
+                        units = msg.get("orderbook_units", [])
+                        bids  = [(float(u["bid_price"]) * rate, float(u["bid_size"])) for u in units]
+                        asks  = [(float(u["ask_price"]) * rate, float(u["ask_size"])) for u in units]
+                        book.apply_snapshot(bids, asks)
+            except Exception as e:
+                log.warning("upbit WS error: %s — reconnecting in %ds", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 120)
+
+    def get_metrics(self) -> Dict[str, dict]:
+        out = {}
+        for a in self.assets:
+            sym  = a["symbol_upbit"]
+            book = self.books.get(sym)
+            if book:
+                m = book.snapshot()
+                if m:
+                    out[sym] = {"base_asset": a["base_asset"], **m}
+        return out
+
+
+# ---------------------------------------------------------------------------
+# OrderBookDaemon — orchestrator
+# ---------------------------------------------------------------------------
+
+STREAM_CONFIGS = [
+    ("binance", BinanceFuturesStream),
+    ("bybit",   BybitLinearStream),
+    ("okx",     OKXSwapStream),
+    ("upbit",   UpbitSpotStream),
+]
+
+
+class OrderBookDaemon:
+    def __init__(self, db_url: str, assets: List[dict], top_n: int, once: bool = False):
+        self.db_url  = db_url
+        self.top_n   = top_n
+        self.once    = once
+        self.streams = {name: cls(assets) for name, cls in STREAM_CONFIGS}
+        self._stream_last_ok: Dict[str, float] = {k: time.time() for k in self.streams}
+        self._known_bases: set = {a["base_asset"] for a in assets}
+        self._last_metadata_check: float = time.time()
+
+    def _collect(self, snapshot_at: datetime, save_snapshot: bool) -> None:
+        snap_rows   = []
+        latest_rows = []
+        now = datetime.now(timezone.utc)
+
+        for exchange, stream in self.streams.items():
+            try:
+                metrics_map = stream.get_metrics()
+            except Exception as e:
+                log.error("collect %s: %s", exchange, e)
+                continue
+
+            for sym, m in metrics_map.items():
+                base = m.pop("base_asset", None)
+                if save_snapshot:
+                    snap_rows.append(_to_snapshot_row(snapshot_at, sym, exchange, base, m))
+                latest_rows.append(_to_latest_row(sym, exchange, base, m, now))
+
+        if save_snapshot and snap_rows:
+            try:
+                _db_write(self.db_url, snap_rows, SNAPSHOT_SQL)
+                log.info("saved %d orderbook snapshots @ %s", len(snap_rows), snapshot_at.isoformat())
+            except Exception as e:
+                log.error("snapshot DB write failed: %s", e)
+                _telegram(f"snapshot DB write failed: {e}")
+
+        if latest_rows:
+            try:
+                _db_write(self.db_url, latest_rows, LATEST_SQL)
+            except Exception as e:
+                log.error("latest DB write failed: %s", e)
+
+    def _check_metadata_changes(self) -> None:
+        """Reload asset_metadata every hour. Exit if new assets found — systemd restarts with fresh state."""
+        if time.time() - self._last_metadata_check < METADATA_CHECK_INTERVAL:
+            return
+        self._last_metadata_check = time.time()
+        try:
+            current = load_top_assets(self.db_url, self.top_n)
+            current_bases = {a["base_asset"] for a in current}
+            new_bases = current_bases - self._known_bases
+            if new_bases:
+                msg = f"new assets in asset_metadata: {sorted(new_bases)} — restarting to subscribe"
+                log.info(msg)
+                _telegram(msg)
+                sys.exit(0)  # systemd Restart=always brings it back with fresh asset list
+            log.info("metadata check: no new assets (%d known)", len(self._known_bases))
+        except Exception as e:
+            log.warning("metadata check failed: %s", e)
+
+    def _run_streams(self) -> None:
+        async def _main():
+            await asyncio.gather(*[s.run() for s in self.streams.values()])
+        asyncio.run(_main())
+
+    def run(self) -> None:
+        t = threading.Thread(target=self._run_streams, daemon=True, name="ws-streams")
+        t.start()
+
+        # Wait for books to populate, checking every 3s (max 45s for --once, 15s for daemon)
+        max_wait = 45 if self.once else 15
+        deadline  = time.time() + max_wait
+        while time.time() < deadline:
+            time.sleep(3)
+            ready = sum(
+                1
+                for stream in self.streams.values()
+                for book in stream.books.values()
+                if book.initialized
+            )
+            total = sum(len(stream.books) for stream in self.streams.values())
+            log.info("books ready: %d / %d", ready, total)
+            if ready == total:
+                break
+
+        if self.once:
+            ts = _current_snapshot_ts()
+            self._collect(ts, save_snapshot=True)
+            log.info("--once mode: done.")
+            return
+
+        while True:
+            secs = _seconds_until_next_snapshot()
+            log.info("next snapshot in %.0fs", secs)
+            elapsed = 0.0
+            while elapsed < secs:
+                chunk = min(LATEST_INTERVAL_S, secs - elapsed)
+                time.sleep(chunk)
+                elapsed += chunk
+                self._collect(datetime.now(timezone.utc), save_snapshot=False)
+                self._check_metadata_changes()
+
+            ts = _current_snapshot_ts()
+            self._collect(ts, save_snapshot=True)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Order book depth WebSocket daemon")
+    parser.add_argument("--top",  type=int, default=80, help="Top N assets to track")
+    parser.add_argument("--once", action="store_true",  help="One snapshot then exit (testing)")
+    args = parser.parse_args()
+
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        print("DATABASE_URL not set", file=sys.stderr)
+        sys.exit(1)
+
+    log.info("loading top %d assets from DB...", args.top)
+    assets = load_top_assets(db_url, args.top)
+    log.info("loaded %d assets", len(assets))
+
+    daemon = OrderBookDaemon(db_url=db_url, assets=assets, top_n=args.top, once=args.once)
+    daemon.run()
+
+
+if __name__ == "__main__":
+    main()

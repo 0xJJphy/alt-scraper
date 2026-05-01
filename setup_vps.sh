@@ -32,6 +32,12 @@ sed -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
     -e "s|{{USER}}|$EXEC_USER|g" \
     alt-scraper-realtime.service.template > alt-scraper-realtime.service
 
+# 2b. Generate orderbook daemon service from template
+echo "Generating alt-scraper-orderbook.service..."
+sed -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
+    -e "s|{{USER}}|$EXEC_USER|g" \
+    alt-scraper-orderbook.service.template > alt-scraper-orderbook.service
+
 # 3. Copy to systemd directory
 echo "Installing systemd units..."
 # Main service and timer
@@ -39,6 +45,8 @@ cp alt-scraper.service /etc/systemd/system/
 cp alt-scraper.timer /etc/systemd/system/
 # Realtime daemon
 cp alt-scraper-realtime.service /etc/systemd/system/
+# Orderbook daemon
+cp alt-scraper-orderbook.service /etc/systemd/system/
 # Notification service
 sed "s|{{INSTALL_DIR}}|$INSTALL_DIR|g; s|{{USER}}|$EXEC_USER|g" alt-scraper-notify@.service.template > /etc/systemd/system/alt-scraper-notify@.service
 
@@ -72,6 +80,10 @@ systemctl restart alt-scraper.timer
 systemctl enable alt-scraper-realtime.service
 systemctl restart alt-scraper-realtime.service
 
+# Orderbook daemon (always running, WebSocket + 6 snapshots/day)
+systemctl enable alt-scraper-orderbook.service
+systemctl restart alt-scraper-orderbook.service
+
 echo ""
 echo "Setup complete!"
 echo ""
@@ -81,6 +93,10 @@ echo ""
 echo "Realtime daemon status:"
 systemctl status alt-scraper-realtime.service --no-pager
 echo ""
+echo "Orderbook daemon status:"
+systemctl status alt-scraper-orderbook.service --no-pager
+echo ""
 echo "Logs:"
-echo "  journalctl -u alt-scraper.service -f          # daily pipeline"
-echo "  journalctl -u alt-scraper-realtime.service -f # realtime daemon"
+echo "  journalctl -u alt-scraper.service -f           # daily pipeline"
+echo "  journalctl -u alt-scraper-realtime.service -f  # realtime daemon"
+echo "  journalctl -u alt-scraper-orderbook.service -f # orderbook daemon"
