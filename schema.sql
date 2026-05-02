@@ -1047,6 +1047,7 @@ CREATE TABLE IF NOT EXISTS orderbook_snapshots (
     symbol              VARCHAR(50)     NOT NULL,   -- exchange-native (e.g. BTCUSDT, KRW-BTC)
     exchange            VARCHAR(50)     NOT NULL,   -- binance, bybit, okx, upbit
     base_asset          VARCHAR(20),                -- BTC, ETH, etc.
+    market_type         VARCHAR(10)     NOT NULL DEFAULT 'futures',  -- futures or spot
 
     mid_price           DECIMAL(24, 8),
     best_bid            DECIMAL(24, 8),
@@ -1079,7 +1080,7 @@ CREATE TABLE IF NOT EXISTS orderbook_snapshots (
     imbalance_10pct     DECIMAL(8, 6),
 
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (snapshot_at, symbol, exchange)
+    PRIMARY KEY (snapshot_at, symbol, exchange, market_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_obs_symbol_exchange_time
@@ -1088,6 +1089,8 @@ CREATE INDEX IF NOT EXISTS idx_obs_base_exchange_time
     ON orderbook_snapshots (base_asset, exchange, snapshot_at DESC);
 CREATE INDEX IF NOT EXISTS idx_obs_snapshot_at
     ON orderbook_snapshots (snapshot_at DESC);
+CREATE INDEX IF NOT EXISTS idx_obs_base_market
+    ON orderbook_snapshots (base_asset, market_type, snapshot_at DESC);
 
 -- ==============================================================================
 -- ORDER BOOK DAILY METRICS
@@ -1099,6 +1102,7 @@ CREATE TABLE IF NOT EXISTS orderbook_daily_metrics (
     date                DATE            NOT NULL,
     symbol              VARCHAR(50)     NOT NULL,
     exchange            VARCHAR(50)     NOT NULL,
+    market_type         VARCHAR(10)     NOT NULL DEFAULT 'futures',
     base_asset          VARCHAR(20),
 
     -- Spread OHLC over the 6 daily snapshots
@@ -1132,7 +1136,7 @@ CREATE TABLE IF NOT EXISTS orderbook_daily_metrics (
 
     created_at          TIMESTAMPTZ     DEFAULT NOW(),
     updated_at          TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (date, symbol, exchange)
+    PRIMARY KEY (date, symbol, exchange, market_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_odm_date
@@ -1156,6 +1160,7 @@ CREATE TRIGGER trigger_update_timestamp_odm
 CREATE TABLE IF NOT EXISTS orderbook_latest (
     symbol              VARCHAR(50)     NOT NULL,
     exchange            VARCHAR(50)     NOT NULL,
+    market_type         VARCHAR(10)     NOT NULL DEFAULT 'futures',
     base_asset          VARCHAR(20),
 
     mid_price           DECIMAL(24, 8),
@@ -1182,7 +1187,7 @@ CREATE TABLE IF NOT EXISTS orderbook_latest (
 
     polled_at           TIMESTAMPTZ,
     updated_at          TIMESTAMPTZ     DEFAULT NOW(),
-    PRIMARY KEY (symbol, exchange)
+    PRIMARY KEY (symbol, exchange, market_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_ol_base_asset ON orderbook_latest (base_asset);

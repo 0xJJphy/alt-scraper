@@ -343,6 +343,50 @@ Supabase broadcasts a push every time the daemon upserts a row — the frontend 
 
 ---
 
+## 📈 Orderbook WebSocket Daemon & Backfill
+
+The system includes a real-time order book depth scraper (`orderbook_daemon.py`) that captures the top 80 assets in live markets from Binance, Bybit, OKX, and Upbit using WebSockets. This minimizes API consumption and provides continuous, high-fidelity order book data.
+
+### Features
+- **Exchanges**: Binance Futures, Bybit Linear, OKX Swap, Upbit Spot.
+- **WebSocket Streaming**: Maintains book state in real time and takes periodic snapshots to sync to the DB.
+- **Backfill Tool**: Includes `orderbook_backfill.py` for downloading available historical snapshots.
+
+### Usage
+
+#### Orderbook Daemon
+```bash
+# Run the daemon continuously
+python orderbook_daemon.py
+
+# Custom options
+python orderbook_daemon.py --top 50 --exchanges binance,bybit
+```
+
+#### Orderbook Backfill
+```bash
+# Download and import historical snapshots from Binance
+python orderbook_backfill.py --exchange binance --start 2024-01-01
+
+# Download and import historical snapshots from Bybit
+python orderbook_backfill.py --exchange bybit --start 2024-01-01
+```
+
+### Database Structures
+
+The following tables are added to support the Orderbook pipeline:
+
+#### `orderbook_snapshots`
+Contains individual 4-hour snapshots of the order book for each symbol, including depth at 1%, 2.5%, 5%, and 10% distance from mid price, best bid/ask, spread in BPS, and order book imbalance.
+
+#### `orderbook_daily_metrics`
+Aggregated daily metrics computed from the snapshots for tracking daily high/low imbalance and open/high/low/close spread.
+
+#### `orderbook_latest`
+Stores the latest real-time snapshot for rapid frontend querying.
+
+---
+
 ## 🔧 Troubleshooting
 
 ### Common Issues

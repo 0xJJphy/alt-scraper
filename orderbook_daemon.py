@@ -2,7 +2,7 @@
 """
 orderbook_daemon.py — WebSocket order book depth daemon.
 
-Maintains live order books for Binance Futures, Bybit Linear, OKX Swap, and Upbit Spot.
+Maintains live order books for Binance Futures/Spot, Bybit Linear/Spot, OKX Swap, and Upbit Spot.
 Saves 6 snapshots/day at 4-hour UTC intervals (00, 04, 08, 12, 16, 20).
 Also updates orderbook_latest every ~60s for frontend live display.
 
@@ -175,11 +175,79 @@ class LocalOrderBook:
 # Asset loader
 # ---------------------------------------------------------------------------
 
+def resolve_exchange_symbols(bases: List[str]) -> List[dict]:
+    """
+    Resolve correct exchange-native symbols for each base asset by querying
+    each exchange's instruments API. Handles 1000x variants automatically.
+    Returns None for symbols not listed on a given exchange (filtered out by stream classes).
+    """
+    def _fetch(url, timeout=15):
+        try:
+            return requests.get(url, timeout=timeout).json()
+        except Exception:
+            return None
+
+    # Binance Futures — try {BASE}USDT then 1000{BASE}USDT
+    bf_data = _fetch("https://fapi.binance.com/fapi/v1/exchangeInfo")
+    bf_syms = {s["symbol"] for s in (bf_data or {}).get("symbols", [])
+               if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"}
+
+    # Bybit Linear — try {BASE}USDT then 1000{BASE}USDT  (limit max=1000; >1000 returns 0)
+    bb_data = _fetch("https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000")
+    bb_syms = {s["symbol"] for s in (bb_data or {}).get("result", {}).get("list", [])
+               if s.get("quoteCoin") == "USDT" and s.get("status") == "Trading"}
+
+    # OKX Swap — uses {BASE}-USDT-SWAP format, no 1000x variants
+    okx_data = _fetch("https://www.okx.com/api/v5/public/instruments?instType=SWAP")
+    okx_syms = {s["ctValCcy"]: s["instId"] for s in (okx_data or {}).get("data", [])
+                if s.get("settleCcy") == "USDT" and s.get("state") == "live"}
+
+    # Upbit KRW markets
+    upbit_data = _fetch("https://api.upbit.com/v1/market/all?isDetails=false")
+    upbit_syms = {m["market"].replace("KRW-", "") for m in (upbit_data or [])
+                  if isinstance(m, dict) and m.get("market", "").startswith("KRW-")}
+
+    # Binance Spot — simple {BASE}USDT (no 1000x on spot), validate against API
+    bns_data = _fetch("https://api.binance.com/api/v3/exchangeInfo")
+    bns_syms = {s["symbol"] for s in (bns_data or {}).get("symbols", [])
+                if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"}
+
+    # Bybit Spot — simple {BASE}USDT, validate against API  (limit max=1000; >1000 returns 0)
+    bbs_data = _fetch("https://api.bybit.com/v5/market/instruments-info?category=spot&limit=1000")
+    bbs_syms = {s["symbol"] for s in (bbs_data or {}).get("result", {}).get("list", [])
+                if s.get("quoteCoin") == "USDT" and s.get("status") == "Trading"}
+
+    def bf_sym(base):
+        for pfx in ("", "1000"):
+            s = f"{pfx}{base}USDT"
+            if s in bf_syms:
+                return s
+        return None
+
+    def bb_sym(base):
+        for pfx in ("", "1000"):
+            s = f"{pfx}{base}USDT"
+            if s in bb_syms:
+                return s
+        return None
+
+    result = []
+    for b in bases:
+        spot_sym = f"{b}USDT"
+        result.append({
+            "base_asset":          b,
+            "symbol_binance":      bf_sym(b),
+            "symbol_bybit":        bb_sym(b),
+            "symbol_okx":          okx_syms.get(b),
+            "symbol_upbit":        f"KRW-{b}" if b in upbit_syms else None,
+            "symbol_binance_spot": spot_sym if spot_sym in bns_syms else None,
+            "symbol_bybit_spot":   spot_sym if spot_sym in bbs_syms else None,
+        })
+    return result
+
+
 def load_top_assets(db_url: str, top_n: int) -> List[dict]:
-    """
-    Load top assets from asset_metadata and derive exchange-native symbols.
-    Binance/Bybit: {BASE}USDT  |  OKX: {BASE}-USDT-SWAP  |  Upbit: KRW-{BASE}
-    """
+    """Load top assets from asset_metadata with resolved exchange-native symbols."""
     conn = psycopg2.connect(db_url)
     cur  = conn.cursor()
     cur.execute("""
@@ -192,16 +260,8 @@ def load_top_assets(db_url: str, top_n: int) -> List[dict]:
     bases = [r[0] for r in cur.fetchall()]
     cur.close()
     conn.close()
-    return [
-        {
-            "base_asset":     b,
-            "symbol_binance": f"{b}USDT",
-            "symbol_bybit":   f"{b}USDT",
-            "symbol_okx":     f"{b}-USDT-SWAP",
-            "symbol_upbit":   f"KRW-{b}",
-        }
-        for b in bases
-    ]
+    log.info("resolving exchange symbols for %d assets…", len(bases))
+    return resolve_exchange_symbols(bases)
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +269,7 @@ def load_top_assets(db_url: str, top_n: int) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 SNAPSHOT_COLS = [
-    "snapshot_at", "symbol", "exchange", "base_asset",
+    "snapshot_at", "symbol", "exchange", "base_asset", "market_type",
     "mid_price", "best_bid", "best_ask", "spread_bps", "depth_coverage_pct",
     "bid_qty_1pct", "ask_qty_1pct", "bid_levels_1pct", "ask_levels_1pct", "imbalance_1pct",
     "bid_qty_2_5pct", "ask_qty_2_5pct", "bid_levels_2_5pct", "ask_levels_2_5pct", "imbalance_2_5pct",
@@ -220,7 +280,7 @@ SNAPSHOT_COLS = [
 SNAPSHOT_SQL = """
 INSERT INTO orderbook_snapshots ({cols})
 VALUES %s
-ON CONFLICT (snapshot_at, symbol, exchange) DO UPDATE SET
+ON CONFLICT (snapshot_at, symbol, exchange, market_type) DO UPDATE SET
     mid_price           = EXCLUDED.mid_price,
     best_bid            = EXCLUDED.best_bid,
     best_ask            = EXCLUDED.best_ask,
@@ -250,7 +310,7 @@ ON CONFLICT (snapshot_at, symbol, exchange) DO UPDATE SET
 
 LATEST_SQL = """
 INSERT INTO orderbook_latest (
-    symbol, exchange, base_asset,
+    symbol, exchange, base_asset, market_type,
     mid_price, best_bid, best_ask, spread_bps, depth_coverage_pct,
     bid_qty_1pct, ask_qty_1pct, imbalance_1pct,
     bid_qty_2_5pct, ask_qty_2_5pct, imbalance_2_5pct,
@@ -258,7 +318,7 @@ INSERT INTO orderbook_latest (
     bid_qty_10pct, ask_qty_10pct, imbalance_10pct,
     polled_at
 ) VALUES %s
-ON CONFLICT (symbol, exchange) DO UPDATE SET
+ON CONFLICT (symbol, exchange, market_type) DO UPDATE SET
     base_asset          = EXCLUDED.base_asset,
     mid_price           = EXCLUDED.mid_price,
     best_bid            = EXCLUDED.best_bid,
@@ -282,9 +342,9 @@ ON CONFLICT (symbol, exchange) DO UPDATE SET
 """
 
 
-def _to_snapshot_row(snapshot_at, symbol, exchange, base_asset, m: dict) -> tuple:
+def _to_snapshot_row(snapshot_at, symbol, exchange, base_asset, market_type, m: dict) -> tuple:
     return (
-        snapshot_at, symbol, exchange, base_asset,
+        snapshot_at, symbol, exchange, base_asset, market_type,
         m.get("mid_price"), m.get("best_bid"), m.get("best_ask"),
         m.get("spread_bps"), m.get("depth_coverage_pct"),
         m.get("bid_qty_1pct"), m.get("ask_qty_1pct"),
@@ -298,9 +358,9 @@ def _to_snapshot_row(snapshot_at, symbol, exchange, base_asset, m: dict) -> tupl
     )
 
 
-def _to_latest_row(symbol, exchange, base_asset, m: dict, polled_at) -> tuple:
+def _to_latest_row(symbol, exchange, base_asset, market_type, m: dict, polled_at) -> tuple:
     return (
-        symbol, exchange, base_asset,
+        symbol, exchange, base_asset, market_type,
         m.get("mid_price"), m.get("best_bid"), m.get("best_ask"),
         m.get("spread_bps"), m.get("depth_coverage_pct"),
         m.get("bid_qty_1pct"), m.get("ask_qty_1pct"), m.get("imbalance_1pct"),
@@ -355,16 +415,19 @@ def _current_snapshot_ts() -> datetime:
 # ---------------------------------------------------------------------------
 
 class BinanceFuturesStream:
-    WS_BASE   = "wss://fstream.binance.com/stream"
-    REST_BASE = "https://fapi.binance.com"
-    EXCHANGE  = "binance"
-    CHUNK     = 200  # max stream subscriptions per WS connection
+    WS_BASE     = "wss://fstream.binance.com/stream"
+    REST_BASE   = "https://fapi.binance.com"
+    REST_DEPTH  = "/fapi/v1/depth"
+    EXCHANGE    = "binance"
+    MARKET_TYPE = "futures"
+    SYM_KEY     = "symbol_binance"
+    CHUNK       = 200  # max stream subscriptions per WS connection
 
     def __init__(self, assets: List[dict]):
-        self.assets = [a for a in assets if a.get("symbol_binance")]
+        self.assets = [a for a in assets if a.get(self.SYM_KEY)]
         self.books: Dict[str, LocalOrderBook] = {}
         for a in self.assets:
-            sym = a["symbol_binance"].upper()
+            sym = a[self.SYM_KEY].upper()
             self.books[sym] = LocalOrderBook(sym, self.EXCHANGE)
         self._last_u: Dict[str, int]     = {}
         self._pending: Dict[str, list]   = {}   # events buffered before REST init
@@ -373,7 +436,7 @@ class BinanceFuturesStream:
 
     def _rest_snapshot(self, symbol: str) -> Tuple[int, list, list]:
         r = requests.get(
-            f"{self.REST_BASE}/fapi/v1/depth",
+            f"{self.REST_BASE}{self.REST_DEPTH}",
             params={"symbol": symbol, "limit": 1000},
             timeout=15,
         )
@@ -453,14 +516,14 @@ class BinanceFuturesStream:
                 backoff = min(backoff * 2, 120)
 
     async def run(self) -> None:
-        symbols = [a["symbol_binance"].upper() for a in self.assets]
+        symbols = [a[self.SYM_KEY].upper() for a in self.assets]
         chunks  = [symbols[i:i + self.CHUNK] for i in range(0, len(symbols), self.CHUNK)]
         await asyncio.gather(*[self._run_chunk(chunk) for chunk in chunks])
 
     def get_metrics(self) -> Dict[str, dict]:
         out = {}
         for a in self.assets:
-            sym  = a["symbol_binance"].upper()
+            sym  = a[self.SYM_KEY].upper()
             book = self.books.get(sym)
             if book:
                 m = book.snapshot()
@@ -474,15 +537,17 @@ class BinanceFuturesStream:
 # ---------------------------------------------------------------------------
 
 class BybitLinearStream:
-    WS_URL   = "wss://stream.bybit.com/v5/public/linear"
-    EXCHANGE = "bybit"
-    CHUNK    = 10
+    WS_URL      = "wss://stream.bybit.com/v5/public/linear"
+    EXCHANGE    = "bybit"
+    MARKET_TYPE = "futures"
+    SYM_KEY     = "symbol_bybit"
+    CHUNK       = 10
 
     def __init__(self, assets: List[dict]):
-        self.assets = [a for a in assets if a.get("symbol_bybit")]
+        self.assets = [a for a in assets if a.get(self.SYM_KEY)]
         self.books: Dict[str, LocalOrderBook] = {}
         for a in self.assets:
-            sym = a["symbol_bybit"].upper()
+            sym = a[self.SYM_KEY].upper()
             self.books[sym] = LocalOrderBook(sym, self.EXCHANGE)
 
     async def _run_chunk(self, symbols: List[str]) -> None:
@@ -522,14 +587,14 @@ class BybitLinearStream:
                 backoff = min(backoff * 2, 120)
 
     async def run(self) -> None:
-        symbols = [a["symbol_bybit"].upper() for a in self.assets]
+        symbols = [a[self.SYM_KEY].upper() for a in self.assets]
         chunks  = [symbols[i:i + self.CHUNK] for i in range(0, len(symbols), self.CHUNK)]
         await asyncio.gather(*[self._run_chunk(chunk) for chunk in chunks])
 
     def get_metrics(self) -> Dict[str, dict]:
         out = {}
         for a in self.assets:
-            sym  = a["symbol_bybit"].upper()
+            sym  = a[self.SYM_KEY].upper()
             book = self.books.get(sym)
             if book:
                 m = book.snapshot()
@@ -543,9 +608,10 @@ class BybitLinearStream:
 # ---------------------------------------------------------------------------
 
 class OKXSwapStream:
-    WS_URL   = "wss://ws.okx.com:8443/ws/v5/public"
-    EXCHANGE = "okx"
-    CHUNK    = 20
+    WS_URL      = "wss://ws.okx.com:8443/ws/v5/public"
+    EXCHANGE    = "okx"
+    MARKET_TYPE = "futures"
+    CHUNK       = 20
 
     def __init__(self, assets: List[dict]):
         self.assets = [a for a in assets if a.get("symbol_okx")]
@@ -624,9 +690,10 @@ class OKXSwapStream:
 # ---------------------------------------------------------------------------
 
 class UpbitSpotStream:
-    WS_URL    = "wss://api.upbit.com/websocket/v1"
-    REST_BASE = "https://api.upbit.com/v1"
-    EXCHANGE  = "upbit"
+    WS_URL      = "wss://api.upbit.com/websocket/v1"
+    REST_BASE   = "https://api.upbit.com/v1"
+    EXCHANGE    = "upbit"
+    MARKET_TYPE = "spot"
 
     def __init__(self, assets: List[dict]):
         self.assets = [a for a in assets if a.get("symbol_upbit")]
@@ -710,14 +777,59 @@ class UpbitSpotStream:
 
 
 # ---------------------------------------------------------------------------
+# Binance Spot WebSocket stream (same depth protocol as futures, different URLs)
+# ---------------------------------------------------------------------------
+
+class BinanceSpotStream(BinanceFuturesStream):
+    WS_BASE     = "wss://stream.binance.com:9443/stream"
+    REST_BASE   = "https://api.binance.com"
+    REST_DEPTH  = "/api/v3/depth"
+    EXCHANGE    = "binance"
+    MARKET_TYPE = "spot"
+    SYM_KEY     = "symbol_binance_spot"
+
+    def _apply_event(self, symbol: str, evt: dict) -> None:
+        # Spot diff depth stream uses U/u/b/a — same as futures but no pu field
+        U = evt.get("U", 0)
+        u = evt.get("u", 0)
+        expected = self._last_u.get(symbol)
+        if expected is not None and U > expected + 1:
+            age = time.time() - self._init_time.get(symbol, 0)
+            if age >= 5.0 and not self._init_lock.get(symbol):
+                log.warning("binance spot seq gap %s U=%s expected=%s+1, reinit", symbol, U, expected)
+                self.books[symbol].initialized = False
+                self._pending[symbol] = []
+                self._init_lock[symbol] = True
+                threading.Thread(target=self._init_book, args=(symbol, 2.0), daemon=True).start()
+            return
+        bids = [(float(p), float(q)) for p, q in evt.get("b", [])]
+        asks = [(float(p), float(q)) for p, q in evt.get("a", [])]
+        self.books[symbol].apply_delta(bids, asks)
+        self._last_u[symbol] = u
+
+
+# ---------------------------------------------------------------------------
+# Bybit Spot WebSocket stream (same protocol as linear, different WS URL)
+# ---------------------------------------------------------------------------
+
+class BybitSpotStream(BybitLinearStream):
+    WS_URL      = "wss://stream.bybit.com/v5/public/spot"
+    EXCHANGE    = "bybit"
+    MARKET_TYPE = "spot"
+    SYM_KEY     = "symbol_bybit_spot"
+
+
+# ---------------------------------------------------------------------------
 # OrderBookDaemon — orchestrator
 # ---------------------------------------------------------------------------
 
 STREAM_CONFIGS = [
-    ("binance", BinanceFuturesStream),
-    ("bybit",   BybitLinearStream),
-    ("okx",     OKXSwapStream),
-    ("upbit",   UpbitSpotStream),
+    ("binance_futures", BinanceFuturesStream),
+    ("bybit_futures",   BybitLinearStream),
+    ("okx_futures",     OKXSwapStream),
+    ("upbit_spot",      UpbitSpotStream),
+    ("binance_spot",    BinanceSpotStream),
+    ("bybit_spot",      BybitSpotStream),
 ]
 
 
@@ -736,18 +848,20 @@ class OrderBookDaemon:
         latest_rows = []
         now = datetime.now(timezone.utc)
 
-        for exchange, stream in self.streams.items():
+        for stream_key, stream in self.streams.items():
+            exchange    = stream.EXCHANGE
+            market_type = stream.MARKET_TYPE
             try:
                 metrics_map = stream.get_metrics()
             except Exception as e:
-                log.error("collect %s: %s", exchange, e)
+                log.error("collect %s: %s", stream_key, e)
                 continue
 
             for sym, m in metrics_map.items():
                 base = m.pop("base_asset", None)
                 if save_snapshot:
-                    snap_rows.append(_to_snapshot_row(snapshot_at, sym, exchange, base, m))
-                latest_rows.append(_to_latest_row(sym, exchange, base, m, now))
+                    snap_rows.append(_to_snapshot_row(snapshot_at, sym, exchange, base, market_type, m))
+                latest_rows.append(_to_latest_row(sym, exchange, base, market_type, m, now))
 
         if save_snapshot and snap_rows:
             try:
