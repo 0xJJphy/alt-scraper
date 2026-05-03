@@ -111,7 +111,7 @@ def main():
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO orderbook_daily_metrics (
-                date, symbol, exchange, base_asset,
+                date, symbol, exchange, market_type, base_asset,
                 spread_bps_open, spread_bps_high, spread_bps_low, spread_bps_close,
                 bid_qty_1pct_close,     ask_qty_1pct_close,
                 bid_qty_2_5pct_close,   ask_qty_2_5pct_close,
@@ -125,7 +125,7 @@ def main():
             )
             SELECT
                 DATE(snapshot_at AT TIME ZONE 'UTC'),
-                symbol, exchange, MAX(base_asset),
+                symbol, exchange, market_type, MAX(base_asset),
                 MIN(CASE WHEN EXTRACT(HOUR FROM snapshot_at AT TIME ZONE 'UTC') = 0  THEN spread_bps END),
                 MAX(spread_bps),
                 MIN(spread_bps),
@@ -146,8 +146,8 @@ def main():
             FROM orderbook_snapshots
             WHERE snapshot_at >= CURRENT_DATE - 1
               AND snapshot_at <  CURRENT_DATE
-            GROUP BY DATE(snapshot_at AT TIME ZONE 'UTC'), symbol, exchange
-            ON CONFLICT (date, symbol, exchange) DO UPDATE SET
+            GROUP BY DATE(snapshot_at AT TIME ZONE 'UTC'), symbol, exchange, market_type
+            ON CONFLICT (date, symbol, exchange, market_type) DO UPDATE SET
                 spread_bps_open         = EXCLUDED.spread_bps_open,
                 spread_bps_high         = EXCLUDED.spread_bps_high,
                 spread_bps_low          = EXCLUDED.spread_bps_low,
