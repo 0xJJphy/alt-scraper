@@ -315,6 +315,24 @@ SNAPSHOT_TEMPLATE = "(%(snapshot_at)s, %(symbol)s, %(exchange)s, %(base_asset)s,
 SNAPSHOT_KEYS = ["snapshot_at", "symbol", "exchange", "base_asset",
                  "oi_usd", "funding", "ls_acc_global", "ls_acc_top", "ls_pos_top", "price"]
 
+INTRADAY_SNAPSHOT_SQL = """
+INSERT INTO futures_intraday_snapshots (
+    snapshot_at, symbol, exchange, base_asset,
+    oi_usd, funding, pred_funding, ls_acc_global, ls_acc_top, ls_pos_top,
+    price, polled_at
+)
+VALUES %s
+ON CONFLICT DO NOTHING
+"""
+
+INTRADAY_SNAPSHOT_TEMPLATE = "(%(snapshot_at)s, %(symbol)s, %(exchange)s, %(base_asset)s, %(oi_usd)s, %(funding)s, %(pred_funding)s, %(ls_acc_global)s, %(ls_acc_top)s, %(ls_pos_top)s, %(price)s, %(polled_at)s)"
+
+INTRADAY_SNAPSHOT_KEYS = [
+    "snapshot_at", "symbol", "exchange", "base_asset", "oi_usd",
+    "funding", "pred_funding", "ls_acc_global", "ls_acc_top",
+    "ls_pos_top", "price", "polled_at",
+]
+
 SNAPSHOT_HOURS = {0, 6, 12, 18}
 
 
@@ -331,6 +349,28 @@ def write_snapshots(db_url: str, rows: List[dict], snapshot_at: datetime):
         log.info("Wrote %d rows to futures_snapshots (slot %02d:00 UTC).", len(records), snapshot_at.hour)
     except Exception as e:
         log.error("Snapshot write failed: %s", e)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+
+def write_intraday_snapshots(db_url: str, rows: List[dict], snapshot_at: datetime):
+    """Persist every realtime poll for the last-48h Paper Live execution audit."""
+    if not rows:
+        return
+    conn = None
+    try:
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        records = [{**{k: r.get(k) for k in INTRADAY_SNAPSHOT_KEYS}, "snapshot_at": snapshot_at} for r in rows]
+        execute_values(cur, INTRADAY_SNAPSHOT_SQL, records, template=INTRADAY_SNAPSHOT_TEMPLATE, page_size=500)
+        cur.execute("DELETE FROM futures_intraday_snapshots WHERE snapshot_at < NOW() - INTERVAL '48 hours'")
+        conn.commit()
+        log.info("Wrote %d rows to futures_intraday_snapshots (48h retention).", len(records))
+    except Exception as e:
+        log.error("Intraday snapshot write failed: %s", e)
         if conn:
             conn.rollback()
     finally:
@@ -450,6 +490,7 @@ def run_once(db_url: str, top_n: Optional[int], exchanges: List[str]):
         )
 
     upsert_rows(db_url, all_rows)
+    write_intraday_snapshots(db_url, all_rows, now.replace(second=0, microsecond=0))
 
     if now.hour in SNAPSHOT_HOURS:
         write_snapshots(db_url, all_rows, now.replace(minute=0, second=0, microsecond=0))
