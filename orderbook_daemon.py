@@ -891,6 +891,25 @@ STREAM_CONFIGS = [
 ]
 
 
+def _has_live_symbol(asset: dict) -> bool:
+    """Return True if the asset has at least one currently-listed orderbook venue."""
+    return any(
+        asset.get(key)
+        for key in (
+            "symbol_binance",
+            "symbol_bybit",
+            "symbol_okx",
+            "symbol_upbit",
+            "symbol_binance_spot",
+            "symbol_bybit_spot",
+        )
+    )
+
+
+def _subscribable_bases(assets: List[dict]) -> set:
+    return {a["base_asset"] for a in assets if _has_live_symbol(a)}
+
+
 class OrderBookDaemon:
     def __init__(self, db_url: str, assets: List[dict], top_n: int,
                  top_active: Optional[int] = None, once: bool = False):
@@ -900,7 +919,7 @@ class OrderBookDaemon:
         self.once       = once
         self.streams = {name: cls(assets) for name, cls in STREAM_CONFIGS}
         self._stream_last_ok: Dict[str, float] = {k: time.time() for k in self.streams}
-        self._known_bases: set = {a["base_asset"] for a in assets}
+        self._known_bases: set = _subscribable_bases(assets)
         self._last_metadata_check: float = time.time()
 
     def _collect(self, snapshot_at: datetime, save_snapshot: bool) -> None:
@@ -938,20 +957,20 @@ class OrderBookDaemon:
                 log.error("latest DB write failed: %s", e)
 
     def _check_metadata_changes(self) -> None:
-        """Reload asset_metadata every hour. Exit if new assets found — systemd restarts with fresh state."""
+        """Reload metadata hourly. Restart only when a new asset has a live orderbook venue."""
         if time.time() - self._last_metadata_check < METADATA_CHECK_INTERVAL:
             return
         self._last_metadata_check = time.time()
         try:
             current = load_top_assets(self.db_url, top_n=self.top_n, top_active=self.top_active)
-            current_bases = {a["base_asset"] for a in current}
+            current_bases = _subscribable_bases(current)
             new_bases = current_bases - self._known_bases
             if new_bases:
-                msg = f"new assets in asset_metadata: {sorted(new_bases)} — restarting to subscribe"
+                msg = f"new subscribable assets in asset_metadata: {sorted(new_bases)} — restarting to subscribe"
                 log.info(msg)
                 _telegram(msg)
                 sys.exit(0)  # systemd Restart=always brings it back with fresh asset list
-            log.info("metadata check: no new assets (%d known)", len(self._known_bases))
+            log.info("metadata check: no new subscribable assets (%d known)", len(self._known_bases))
         except Exception as e:
             log.warning("metadata check failed: %s", e)
 
