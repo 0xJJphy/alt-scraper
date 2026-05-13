@@ -27,7 +27,7 @@ import logging
 import requests
 import psycopg2
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple, Union
 from psycopg2.extras import execute_values
@@ -50,6 +50,9 @@ OKX_V5_API          = "https://www.okx.com/api/v5"
 
 DEFAULT_POLL_INTERVAL = 900   # 15 minutes
 DEFAULT_EXCHANGES     = ["binance", "bybit", "okx"]
+KLINE_INTERVAL_MS     = 15 * 60 * 1000
+KLINE_SETTLE_DELAY_MS = 5_000
+KLINE_SETTLE_DELAY_S  = KLINE_SETTLE_DELAY_MS / 1000
 
 HEADERS = {"User-Agent": "alt-scraper/realtime-daemon"}
 
@@ -118,6 +121,43 @@ def _limited_get(limiter: RateLimiter, url: str, params: dict = None, timeout: i
 
 def _chunks(items: List[Tuple[str, str]], size: int) -> List[List[Tuple[str, str]]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _closed_kline_by_open_time(candles: List[list], now_ms: int, open_idx: int = 0) -> Optional[list]:
+    """Return the most recent candle whose 15m window has fully closed."""
+    cutoff_ms = now_ms - KLINE_SETTLE_DELAY_MS
+    closed = []
+    for candle in candles:
+        try:
+            open_ms = int(candle[open_idx])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if open_ms + KLINE_INTERVAL_MS <= cutoff_ms:
+            closed.append((open_ms, candle))
+    if not closed:
+        return None
+    return max(closed, key=lambda item: item[0])[1]
+
+
+def _next_aligned_poll_time(now: datetime) -> datetime:
+    """Next UTC 15m boundary plus settle delay for closed exchange klines."""
+    now = now.astimezone(UTC)
+    minute = (now.minute // 15 + 1) * 15
+    if minute == 60:
+        boundary = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    else:
+        boundary = now.replace(minute=minute, second=0, microsecond=0)
+    target = boundary + timedelta(seconds=KLINE_SETTLE_DELAY_S)
+    if now >= target:
+        target += timedelta(minutes=15)
+    return target
+
+
+def _sleep_until_aligned_poll() -> None:
+    target = _next_aligned_poll_time(datetime.now(UTC))
+    sleep_for = max(0.0, (target - datetime.now(UTC)).total_seconds())
+    log.info("Next aligned 15m poll at %s UTC (in %.1fs).", target.strftime("%Y-%m-%d %H:%M:%S"), sleep_for)
+    time.sleep(sleep_for)
 
 
 def resolve_exchange_symbols(base_assets: List[str]) -> Dict[str, List[Tuple[str, str]]]:
@@ -232,6 +272,53 @@ class BinanceFetcher:
 
         return self._fetch_parallel(symbols, fetch_one)
 
+    def fetch_klines_15m(self, symbols: List[Tuple[str, str]]) -> List[dict]:
+        limiter = RateLimiter(self.REQUEST_INTERVAL)
+
+        def fetch_one(base: str, sym: str) -> Optional[dict]:
+            now_ms = int(time.time() * 1000)
+            data = _limited_get(
+                limiter,
+                f"{BINANCE_FUTURES_API}/fapi/v1/klines",
+                {"symbol": sym, "interval": "15m", "limit": 2},
+            )
+            if not data or not isinstance(data, list):
+                return None
+            k = _closed_kline_by_open_time(data, now_ms)
+            if not k:
+                return None
+            volume_base = _safe_float(k[5])
+            buy_volume_base = _safe_float(k[9]) if len(k) > 9 else None
+            sell_volume_base = (
+                volume_base - buy_volume_base
+                if volume_base is not None and buy_volume_base is not None
+                else None
+            )
+            return {
+                "candle_open_at": datetime.fromtimestamp(int(k[0]) / 1000, UTC),
+                "candle_close_at": datetime.fromtimestamp((int(k[0]) + KLINE_INTERVAL_MS) / 1000, UTC),
+                "symbol": sym,
+                "exchange": self.EXCHANGE,
+                "base_asset": base,
+                "price_open": _safe_float(k[1]),
+                "price_high": _safe_float(k[2]),
+                "price_low": _safe_float(k[3]),
+                "price_close": _safe_float(k[4]),
+                "volume_base": volume_base,
+                "volume_usd": _safe_float(k[7]) if len(k) > 7 else None,
+                "txn_count": int(k[8]) if len(k) > 8 and k[8] is not None else None,
+                "buy_volume_base": buy_volume_base,
+                "sell_volume_base": sell_volume_base,
+                "volume_delta": (
+                    buy_volume_base - sell_volume_base
+                    if buy_volume_base is not None and sell_volume_base is not None
+                    else None
+                ),
+                "polled_at": datetime.now(UTC),
+            }
+
+        return [row for row in self._fetch_parallel(symbols, fetch_one) if row]
+
     def _fetch_parallel(self, symbols, fetch_one):
         rows = []
         chunks = _chunks(symbols, self.CHUNK_SIZE)
@@ -294,6 +381,43 @@ class BybitFetcher:
             return row
 
         return self._fetch_parallel(symbols, fetch_one)
+
+    def fetch_klines_15m(self, symbols: List[Tuple[str, str]]) -> List[dict]:
+        limiter = RateLimiter(self.REQUEST_INTERVAL)
+
+        def fetch_one(base: str, sym: str) -> Optional[dict]:
+            now_ms = int(time.time() * 1000)
+            data = _limited_get(
+                limiter,
+                f"{BYBIT_V5_API}/market/kline",
+                {"category": "linear", "symbol": sym, "interval": "15", "limit": 2},
+            )
+            candles = (data or {}).get("result", {}).get("list", []) if isinstance(data, dict) else []
+            k = _closed_kline_by_open_time(candles, now_ms)
+            if not k:
+                return None
+            volume_base = _safe_float(k[5])
+            volume_usd = _safe_float(k[6]) if len(k) > 6 else None
+            return {
+                "candle_open_at": datetime.fromtimestamp(int(k[0]) / 1000, UTC),
+                "candle_close_at": datetime.fromtimestamp((int(k[0]) + KLINE_INTERVAL_MS) / 1000, UTC),
+                "symbol": sym,
+                "exchange": self.EXCHANGE,
+                "base_asset": base,
+                "price_open": _safe_float(k[1]),
+                "price_high": _safe_float(k[2]),
+                "price_low": _safe_float(k[3]),
+                "price_close": _safe_float(k[4]),
+                "volume_base": volume_base,
+                "volume_usd": volume_usd,
+                "txn_count": None,
+                "buy_volume_base": None,
+                "sell_volume_base": None,
+                "volume_delta": None,
+                "polled_at": datetime.now(UTC),
+            }
+
+        return [row for row in self._fetch_parallel(symbols, fetch_one) if row]
 
     def _fetch_parallel(self, symbols, fetch_one):
         rows = []
@@ -368,6 +492,48 @@ class OKXFetcher:
 
         return self._fetch_parallel(symbols, fetch_one)
 
+    def fetch_klines_15m(self, symbols: List[Tuple[str, str]]) -> List[dict]:
+        limiter = RateLimiter(self.REQUEST_INTERVAL)
+
+        def fetch_one(base: str, inst: str) -> Optional[dict]:
+            data = _limited_get(
+                limiter,
+                f"{OKX_V5_API}/market/candles",
+                {"instId": inst, "bar": "15m", "limit": 3},
+            )
+            candles = (data or {}).get("data", []) if isinstance(data, dict) else []
+            k = None
+            for candle in candles:
+                if len(candle) > 8 and str(candle[8]) == "1":
+                    k = candle
+                    break
+            if not k:
+                k = _closed_kline_by_open_time(candles, int(time.time() * 1000))
+            if not k:
+                return None
+            volume_base = _safe_float(k[5])
+            volume_usd = _safe_float(k[7]) if len(k) > 7 else None
+            return {
+                "candle_open_at": datetime.fromtimestamp(int(k[0]) / 1000, UTC),
+                "candle_close_at": datetime.fromtimestamp((int(k[0]) + KLINE_INTERVAL_MS) / 1000, UTC),
+                "symbol": f"{base}USDT",
+                "exchange": self.EXCHANGE,
+                "base_asset": base,
+                "price_open": _safe_float(k[1]),
+                "price_high": _safe_float(k[2]),
+                "price_low": _safe_float(k[3]),
+                "price_close": _safe_float(k[4]),
+                "volume_base": volume_base,
+                "volume_usd": volume_usd,
+                "txn_count": None,
+                "buy_volume_base": None,
+                "sell_volume_base": None,
+                "volume_delta": None,
+                "polled_at": datetime.now(UTC),
+            }
+
+        return [row for row in self._fetch_parallel(symbols, fetch_one) if row]
+
     def _fetch_parallel(self, symbols, fetch_one):
         rows = []
         chunks = _chunks(symbols, self.CHUNK_SIZE)
@@ -436,6 +602,40 @@ INTRADAY_SNAPSHOT_KEYS = [
     "ls_pos_top", "price", "polled_at",
 ]
 
+KLINE_15M_SQL = """
+INSERT INTO futures_klines_15m (
+    candle_open_at, candle_close_at, symbol, exchange, base_asset,
+    price_open, price_high, price_low, price_close,
+    volume_base, volume_usd, buy_volume_base, sell_volume_base,
+    volume_delta, txn_count, polled_at
+)
+VALUES %s
+ON CONFLICT (candle_open_at, symbol, exchange) DO UPDATE SET
+    candle_close_at   = EXCLUDED.candle_close_at,
+    base_asset        = EXCLUDED.base_asset,
+    price_open        = COALESCE(EXCLUDED.price_open, futures_klines_15m.price_open),
+    price_high        = COALESCE(EXCLUDED.price_high, futures_klines_15m.price_high),
+    price_low         = COALESCE(EXCLUDED.price_low, futures_klines_15m.price_low),
+    price_close       = COALESCE(EXCLUDED.price_close, futures_klines_15m.price_close),
+    volume_base       = COALESCE(EXCLUDED.volume_base, futures_klines_15m.volume_base),
+    volume_usd        = COALESCE(EXCLUDED.volume_usd, futures_klines_15m.volume_usd),
+    buy_volume_base   = COALESCE(EXCLUDED.buy_volume_base, futures_klines_15m.buy_volume_base),
+    sell_volume_base  = COALESCE(EXCLUDED.sell_volume_base, futures_klines_15m.sell_volume_base),
+    volume_delta      = COALESCE(EXCLUDED.volume_delta, futures_klines_15m.volume_delta),
+    txn_count         = COALESCE(EXCLUDED.txn_count, futures_klines_15m.txn_count),
+    polled_at         = EXCLUDED.polled_at,
+    updated_at        = NOW()
+"""
+
+KLINE_15M_TEMPLATE = "(%(candle_open_at)s, %(candle_close_at)s, %(symbol)s, %(exchange)s, %(base_asset)s, %(price_open)s, %(price_high)s, %(price_low)s, %(price_close)s, %(volume_base)s, %(volume_usd)s, %(buy_volume_base)s, %(sell_volume_base)s, %(volume_delta)s, %(txn_count)s, %(polled_at)s)"
+
+KLINE_15M_KEYS = [
+    "candle_open_at", "candle_close_at", "symbol", "exchange", "base_asset",
+    "price_open", "price_high", "price_low", "price_close", "volume_base",
+    "volume_usd", "buy_volume_base", "sell_volume_base", "volume_delta",
+    "txn_count", "polled_at",
+]
+
 SNAPSHOT_HOURS = {0, 6, 12, 18}
 
 
@@ -498,6 +698,26 @@ def upsert_rows(db_url: str, rows: List[dict]):
         log.info("Upserted %d rows into futures_latest.", len(records))
     except Exception as e:
         log.error("DB upsert failed: %s", e)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+
+def upsert_klines_15m(db_url: str, rows: List[dict]):
+    if not rows:
+        return
+    conn = None
+    try:
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        records = [{k: r.get(k) for k in KLINE_15M_KEYS} for r in rows]
+        execute_values(cur, KLINE_15M_SQL, records, template=KLINE_15M_TEMPLATE, page_size=500)
+        conn.commit()
+        log.info("Upserted %d rows into futures_klines_15m.", len(records))
+    except Exception as e:
+        log.error("15m kline upsert failed: %s", e)
         if conn:
             conn.rollback()
     finally:
@@ -609,11 +829,38 @@ def run_once(db_url: str, top_n: Optional[int], exchanges: List[str], top_active
         log.info("  %s → %d rows fetched.", ex, len(rows))
         return rows
 
+    def _fetch_klines(ex: str) -> List[dict]:
+        cls = FETCHER_MAP.get(ex)
+        if not cls:
+            return []
+        symbols = resolved.get(ex, [])
+        if not symbols:
+            return []
+        log.info("Polling %s 15m klines for %d supported symbols...", ex, len(symbols))
+        rows = cls().fetch_klines_15m(symbols)
+        log.info("  %s 15m klines → %d rows fetched.", ex, len(rows))
+        return rows
+
     all_rows = []
-    with ThreadPoolExecutor(max_workers=len(exchanges)) as executor:
-        futures = {executor.submit(_fetch, ex): ex for ex in exchanges}
-        for future in as_completed(futures):
-            ex = futures[future]
+    kline_rows = []
+    with ThreadPoolExecutor(max_workers=len(exchanges)) as metrics_executor, \
+            ThreadPoolExecutor(max_workers=len(exchanges)) as kline_executor:
+        metric_futures = {metrics_executor.submit(_fetch, ex): ex for ex in exchanges}
+        kline_futures = {kline_executor.submit(_fetch_klines, ex): ex for ex in exchanges}
+
+        for future in as_completed(kline_futures):
+            ex = kline_futures[future]
+            try:
+                rows = future.result()
+                if not rows:
+                    log.warning("  %s returned 0 closed 15m klines.", ex)
+                kline_rows.extend(rows)
+            except Exception as e:
+                log.error("  %s 15m kline fetch error: %s", ex, e)
+        upsert_klines_15m(db_url, kline_rows)
+
+        for future in as_completed(metric_futures):
+            ex = metric_futures[future]
             try:
                 rows = future.result()
                 if not rows:
@@ -646,6 +893,8 @@ def main():
                              "Default: off — polls the full tracked universe (all assets ever in top-N).")
     parser.add_argument("--exchanges",  type=str,   default=",".join(DEFAULT_EXCHANGES), help="Comma-separated exchange list")
     parser.add_argument("--interval",   type=int,   default=DEFAULT_POLL_INTERVAL, help="Poll interval in seconds (default 900)")
+    parser.add_argument("--no-align-15m", action="store_true",
+                        help="Disable default alignment to UTC 15m candle closes. Only relevant when --interval is 900.")
     parser.add_argument("--once",       action="store_true", help="Run one poll cycle then exit (useful for testing)")
     args = parser.parse_args()
 
@@ -657,13 +906,22 @@ def main():
     exchanges = [e.strip().lower() for e in args.exchanges.split(",") if e.strip()]
 
     top_label = str(args.top) if args.top else (f"top-active-{args.top_active}" if args.top_active else "full-universe")
-    log.info("Starting realtime_daemon — exchanges=%s, mode=%s, interval=%ds", exchanges, top_label, args.interval)
+    align_15m = args.interval == DEFAULT_POLL_INTERVAL and not args.no_align_15m
+    log.info(
+        "Starting realtime_daemon — exchanges=%s, mode=%s, interval=%ds, align_15m=%s",
+        exchanges,
+        top_label,
+        args.interval,
+        align_15m,
+    )
 
     if args.once:
         run_once(db_url, args.top, exchanges, top_active=args.top_active)
         return
 
     while True:
+        if align_15m:
+            _sleep_until_aligned_poll()
         start = time.monotonic()
         try:
             run_once(db_url, args.top, exchanges, top_active=args.top_active)
@@ -671,9 +929,12 @@ def main():
             log.error("Unexpected error in poll cycle: %s", e)
             _telegram(f"🔴 *alt-scraper-realtime*: unexpected error in poll cycle\n`{e}`")
         elapsed = time.monotonic() - start
-        sleep_for = max(0, args.interval - elapsed)
-        log.info("Poll cycle done in %.1fs. Next in %.0fs.", elapsed, sleep_for)
-        time.sleep(sleep_for)
+        if align_15m:
+            log.info("Poll cycle done in %.1fs.", elapsed)
+        else:
+            sleep_for = max(0, args.interval - elapsed)
+            log.info("Poll cycle done in %.1fs. Next in %.0fs.", elapsed, sleep_for)
+            time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
