@@ -42,6 +42,13 @@ log = logging.getLogger("orderbook")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Historical CMC symbols can differ from current exchange tickers after renames.
+# Keep base_asset unchanged in DB rows, but subscribe to the live exchange alias.
+SYMBOL_ALIASES = {
+    "MATIC": ["POL"],
+    "RNDR": ["RENDER"],
+}
+
 SNAPSHOT_HOURS     = {0, 4, 8, 12, 16, 20}
 DEPTH_BANDS        = [1.0, 2.5, 5.0, 10.0]
 # Maps band float → DB column suffix (matching schema column names exactly)
@@ -187,17 +194,17 @@ def resolve_exchange_symbols(bases: List[str]) -> List[dict]:
         except Exception:
             return None
 
-    # Binance Futures — try {BASE}USDT then 1000{BASE}USDT
+    # Binance Futures — try {BASE}USDT then prefixed small-unit variants
     bf_data = _fetch("https://fapi.binance.com/fapi/v1/exchangeInfo")
     bf_syms = {s["symbol"] for s in (bf_data or {}).get("symbols", [])
                if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"}
 
-    # Bybit Linear — try {BASE}USDT then 1000{BASE}USDT  (limit max=1000; >1000 returns 0)
+    # Bybit Linear — try {BASE}USDT then prefixed small-unit variants  (limit max=1000; >1000 returns 0)
     bb_data = _fetch("https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000")
     bb_syms = {s["symbol"] for s in (bb_data or {}).get("result", {}).get("list", [])
                if s.get("quoteCoin") == "USDT" and s.get("status") == "Trading"}
 
-    # OKX Swap — uses {BASE}-USDT-SWAP format, no 1000x variants
+    # OKX Swap — uses {BASE}-USDT-SWAP format; some symbols use 1000x variants
     okx_data = _fetch("https://www.okx.com/api/v5/public/instruments?instType=SWAP")
     okx_syms = {s["ctValCcy"]: s["instId"] for s in (okx_data or {}).get("data", [])
                 if s.get("settleCcy") == "USDT" and s.get("state") == "live"}
@@ -217,31 +224,59 @@ def resolve_exchange_symbols(bases: List[str]) -> List[dict]:
     bbs_syms = {s["symbol"] for s in (bbs_data or {}).get("result", {}).get("list", [])
                 if s.get("quoteCoin") == "USDT" and s.get("status") == "Trading"}
 
+    def base_candidates(base):
+        base = base.upper()
+        return [base] + SYMBOL_ALIASES.get(base, [])
+
+    def linear_variants(base):
+        for candidate in base_candidates(base):
+            for pfx in ("", "1000", "10000", "1000000"):
+                yield f"{pfx}{candidate}"
+
     def bf_sym(base):
-        for pfx in ("", "1000"):
-            s = f"{pfx}{base}USDT"
+        for variant in linear_variants(base):
+            s = f"{variant}USDT"
             if s in bf_syms:
                 return s
         return None
 
     def bb_sym(base):
-        for pfx in ("", "1000"):
-            s = f"{pfx}{base}USDT"
+        for variant in linear_variants(base):
+            s = f"{variant}USDT"
             if s in bb_syms:
                 return s
         return None
 
+    def okx_sym(base):
+        for variant in linear_variants(base):
+            inst = okx_syms.get(variant)
+            if inst:
+                return inst
+        return None
+
+    def spot_symbol(base, symbols):
+        for candidate in base_candidates(base):
+            s = f"{candidate}USDT"
+            if s in symbols:
+                return s
+        return None
+
+    def upbit_symbol(base):
+        for candidate in base_candidates(base):
+            if candidate in upbit_syms:
+                return f"KRW-{candidate}"
+        return None
+
     result = []
     for b in bases:
-        spot_sym = f"{b}USDT"
         result.append({
             "base_asset":          b,
             "symbol_binance":      bf_sym(b),
             "symbol_bybit":        bb_sym(b),
-            "symbol_okx":          okx_syms.get(b),
-            "symbol_upbit":        f"KRW-{b}" if b in upbit_syms else None,
-            "symbol_binance_spot": spot_sym if spot_sym in bns_syms else None,
-            "symbol_bybit_spot":   spot_sym if spot_sym in bbs_syms else None,
+            "symbol_okx":          okx_sym(b),
+            "symbol_upbit":        upbit_symbol(b),
+            "symbol_binance_spot": spot_symbol(b, bns_syms),
+            "symbol_bybit_spot":   spot_symbol(b, bbs_syms),
         })
     return result
 
