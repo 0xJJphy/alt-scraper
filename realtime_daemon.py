@@ -26,9 +26,10 @@ import argparse
 import logging
 import requests
 import psycopg2
+import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
@@ -92,6 +93,87 @@ def _safe_float(val) -> Optional[float]:
         return None
 
 
+class RateLimiter:
+    """Thread-safe minimum-spacing limiter for one exchange's REST calls."""
+    def __init__(self, min_interval: float):
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+
+    def wait(self) -> None:
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            gap = self.min_interval - (now - self._last_call)
+            if gap > 0:
+                time.sleep(gap)
+            self._last_call = time.monotonic()
+
+
+def _limited_get(limiter: RateLimiter, url: str, params: dict = None, timeout: int = 10):
+    limiter.wait()
+    return _get(url, params=params, timeout=timeout)
+
+
+def _chunks(items: List[Tuple[str, str]], size: int) -> List[List[Tuple[str, str]]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def resolve_exchange_symbols(base_assets: List[str]) -> Dict[str, List[Tuple[str, str]]]:
+    """Resolve only currently-listed USDT perpetual symbols per exchange."""
+    resolved = {"binance": [], "bybit": [], "okx": []}
+
+    # Binance USDT-M futures: {BASE}USDT or 1000{BASE}USDT for some meme contracts.
+    b_data = _get(f"{BINANCE_FUTURES_API}/fapi/v1/exchangeInfo", timeout=20)
+    b_syms = {
+        s["symbol"]
+        for s in (b_data or {}).get("symbols", [])
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+    }
+
+    # Bybit linear contracts.
+    by_data = _get(
+        f"{BYBIT_V5_API}/market/instruments-info",
+        {"category": "linear", "limit": 1000},
+        timeout=20,
+    )
+    by_syms = {
+        s["symbol"]
+        for s in (by_data or {}).get("result", {}).get("list", [])
+        if s.get("quoteCoin") == "USDT" and s.get("status") == "Trading"
+    }
+
+    # OKX USDT swaps. Map ctValCcy -> instId.
+    okx_data = _get(
+        f"{OKX_V5_API}/public/instruments",
+        {"instType": "SWAP"},
+        timeout=20,
+    )
+    okx_syms = {
+        s["ctValCcy"]: s["instId"]
+        for s in (okx_data or {}).get("data", [])
+        if s.get("settleCcy") == "USDT" and s.get("state") == "live"
+    }
+
+    for base in base_assets:
+        for pfx in ("", "1000"):
+            sym = f"{pfx}{base}USDT"
+            if sym in b_syms:
+                resolved["binance"].append((base, sym))
+                break
+        for pfx in ("", "1000"):
+            sym = f"{pfx}{base}USDT"
+            if sym in by_syms:
+                resolved["bybit"].append((base, sym))
+                break
+        inst = okx_syms.get(base)
+        if inst:
+            resolved["okx"].append((base, inst))
+
+    return resolved
+
+
 # ==============================================================================
 # Exchange fetchers
 # ==============================================================================
@@ -100,26 +182,25 @@ class BinanceFetcher:
     """Fetches OI, funding, L/S ratios and price for Binance USDT perpetuals."""
 
     EXCHANGE = "binance"
+    CHUNK_SIZE = 10
+    MAX_WORKERS = 6
+    REQUEST_INTERVAL = 0.04
 
-    def _perp_symbol(self, base: str) -> str:
-        return f"{base}USDT"
+    def fetch(self, symbols: List[Tuple[str, str]]) -> List[dict]:
+        limiter = RateLimiter(self.REQUEST_INTERVAL)
 
-    def fetch(self, base_assets: List[str]) -> List[dict]:
-        rows = []
-        polled_at = datetime.now(UTC)
-
-        for base in base_assets:
-            sym = self._perp_symbol(base)
+        def fetch_one(base: str, sym: str) -> dict:
+            polled_at = datetime.now(UTC)
             row = {"symbol": sym, "exchange": self.EXCHANGE, "base_asset": base, "polled_at": polled_at}
 
             # Mark price + predicted funding (fetch first — needed for OI USD calc)
-            pm = _get(f"{BINANCE_FUTURES_API}/fapi/v1/premiumIndex", {"symbol": sym})
+            pm = _limited_get(limiter, f"{BINANCE_FUTURES_API}/fapi/v1/premiumIndex", {"symbol": sym})
             if pm:
                 row["price"]        = _safe_float(pm.get("markPrice"))
                 row["pred_funding"] = _safe_float(pm.get("lastFundingRate"))
 
             # Open Interest — returned in base asset, convert to USD using mark price
-            oi_data = _get(f"{BINANCE_FUTURES_API}/fapi/v1/openInterest", {"symbol": sym})
+            oi_data = _limited_get(limiter, f"{BINANCE_FUTURES_API}/fapi/v1/openInterest", {"symbol": sym})
             if oi_data:
                 oi_base = _safe_float(oi_data.get("openInterest"))
                 price   = row.get("price")
@@ -127,29 +208,37 @@ class BinanceFetcher:
                     row["oi_usd"] = oi_base * price
 
             # Current funding rate (from fundingRate endpoint)
-            fr = _get(f"{BINANCE_FUTURES_API}/fapi/v1/fundingRate", {"symbol": sym, "limit": 1})
+            fr = _limited_get(limiter, f"{BINANCE_FUTURES_API}/fapi/v1/fundingRate", {"symbol": sym, "limit": 1})
             if fr and isinstance(fr, list) and fr:
                 row["funding"] = _safe_float(fr[0].get("fundingRate"))
 
             # L/S ratios
-            r_gl = _get(f"{BINANCE_FUTURES_API}/futures/data/globalLongShortAccountRatio",
-                        {"symbol": sym, "period": "5m", "limit": 1})
+            r_gl = _limited_get(limiter, f"{BINANCE_FUTURES_API}/futures/data/globalLongShortAccountRatio",
+                                {"symbol": sym, "period": "5m", "limit": 1})
             if r_gl and isinstance(r_gl, list) and r_gl:
                 row["ls_acc_global"] = _safe_float(r_gl[0].get("longShortRatio"))
 
-            r_ta = _get(f"{BINANCE_FUTURES_API}/futures/data/topLongShortAccountRatio",
-                        {"symbol": sym, "period": "5m", "limit": 1})
+            r_ta = _limited_get(limiter, f"{BINANCE_FUTURES_API}/futures/data/topLongShortAccountRatio",
+                                {"symbol": sym, "period": "5m", "limit": 1})
             if r_ta and isinstance(r_ta, list) and r_ta:
                 row["ls_acc_top"] = _safe_float(r_ta[0].get("longShortRatio"))
 
-            r_tp = _get(f"{BINANCE_FUTURES_API}/futures/data/topLongShortPositionRatio",
-                        {"symbol": sym, "period": "5m", "limit": 1})
+            r_tp = _limited_get(limiter, f"{BINANCE_FUTURES_API}/futures/data/topLongShortPositionRatio",
+                                {"symbol": sym, "period": "5m", "limit": 1})
             if r_tp and isinstance(r_tp, list) and r_tp:
                 row["ls_pos_top"] = _safe_float(r_tp[0].get("longShortRatio"))
 
-            rows.append(row)
-            time.sleep(0.25)  # stay well within Binance's 2400 weight/min limit
+            return row
 
+        return self._fetch_parallel(symbols, fetch_one)
+
+    def _fetch_parallel(self, symbols, fetch_one):
+        rows = []
+        chunks = _chunks(symbols, self.CHUNK_SIZE)
+        with ThreadPoolExecutor(max_workers=min(self.MAX_WORKERS, len(chunks) or 1)) as executor:
+            futures = [executor.submit(lambda c: [fetch_one(base, sym) for base, sym in c], chunk) for chunk in chunks]
+            for future in as_completed(futures):
+                rows.extend(future.result())
         return rows
 
 
@@ -157,21 +246,20 @@ class BybitFetcher:
     """Fetches OI, funding and price for Bybit USDT linear perpetuals."""
 
     EXCHANGE = "bybit"
+    CHUNK_SIZE = 8
+    MAX_WORKERS = 5
+    REQUEST_INTERVAL = 0.05
 
-    def _perp_symbol(self, base: str) -> str:
-        return f"{base}USDT"
+    def fetch(self, symbols: List[Tuple[str, str]]) -> List[dict]:
+        limiter = RateLimiter(self.REQUEST_INTERVAL)
 
-    def fetch(self, base_assets: List[str]) -> List[dict]:
-        rows = []
-        polled_at = datetime.now(UTC)
-
-        for base in base_assets:
-            sym = self._perp_symbol(base)
+        def fetch_one(base: str, sym: str) -> dict:
+            polled_at = datetime.now(UTC)
             row = {"symbol": sym, "exchange": self.EXCHANGE, "base_asset": base, "polled_at": polled_at}
 
             # Ticker (price + predicted funding)
-            tickers = _get(f"{BYBIT_V5_API}/market/tickers",
-                           {"category": "linear", "symbol": sym})
+            tickers = _limited_get(limiter, f"{BYBIT_V5_API}/market/tickers",
+                                   {"category": "linear", "symbol": sym})
             if tickers:
                 result = tickers.get("result", {}).get("list", [])
                 if result:
@@ -185,16 +273,16 @@ class BybitFetcher:
                         row["oi_usd"] = oi_base * price
 
             # Latest funding rate paid
-            funding_hist = _get(f"{BYBIT_V5_API}/market/funding/history",
-                                {"category": "linear", "symbol": sym, "limit": 1})
+            funding_hist = _limited_get(limiter, f"{BYBIT_V5_API}/market/funding/history",
+                                        {"category": "linear", "symbol": sym, "limit": 1})
             if funding_hist:
                 flist = funding_hist.get("result", {}).get("list", [])
                 if flist:
                     row["funding"] = _safe_float(flist[0].get("fundingRate"))
 
             # L/S ratio (account ratio)
-            ls = _get(f"{BYBIT_V5_API}/market/account-ratio",
-                      {"category": "linear", "symbol": sym, "period": "5min", "limit": 1})
+            ls = _limited_get(limiter, f"{BYBIT_V5_API}/market/account-ratio",
+                              {"category": "linear", "symbol": sym, "period": "5min", "limit": 1})
             if ls:
                 llist = ls.get("result", {}).get("list", [])
                 if llist:
@@ -203,9 +291,17 @@ class BybitFetcher:
                     if buy and sell and sell > 0:
                         row["ls_acc_global"] = buy / sell
 
-            rows.append(row)
-            time.sleep(0.2)
+            return row
 
+        return self._fetch_parallel(symbols, fetch_one)
+
+    def _fetch_parallel(self, symbols, fetch_one):
+        rows = []
+        chunks = _chunks(symbols, self.CHUNK_SIZE)
+        with ThreadPoolExecutor(max_workers=min(self.MAX_WORKERS, len(chunks) or 1)) as executor:
+            futures = [executor.submit(lambda c: [fetch_one(base, sym) for base, sym in c], chunk) for chunk in chunks]
+            for future in as_completed(futures):
+                rows.extend(future.result())
         return rows
 
 
@@ -213,28 +309,27 @@ class OKXFetcher:
     """Fetches OI, funding and L/S ratios for OKX USDT swap perpetuals."""
 
     EXCHANGE = "okx"
+    CHUNK_SIZE = 8
+    MAX_WORKERS = 5
+    REQUEST_INTERVAL = 0.06
 
-    def _inst_id(self, base: str) -> str:
-        return f"{base}-USDT-SWAP"
+    def fetch(self, symbols: List[Tuple[str, str]]) -> List[dict]:
+        limiter = RateLimiter(self.REQUEST_INTERVAL)
 
-    def fetch(self, base_assets: List[str]) -> List[dict]:
-        rows = []
-        polled_at = datetime.now(UTC)
-
-        for base in base_assets:
-            inst = self._inst_id(base)
+        def fetch_one(base: str, inst: str) -> dict:
+            polled_at = datetime.now(UTC)
             sym  = f"{base}USDT"
             row  = {"symbol": sym, "exchange": self.EXCHANGE, "base_asset": base, "polled_at": polled_at}
 
             # Ticker (price)
-            ticker = _get(f"{OKX_V5_API}/market/ticker", {"instId": inst})
+            ticker = _limited_get(limiter, f"{OKX_V5_API}/market/ticker", {"instId": inst})
             if ticker:
                 data = ticker.get("data", [])
                 if data:
                     row["price"] = _safe_float(data[0].get("markPx") or data[0].get("last"))
 
             # Open Interest (in USD — OKX returns in contracts, each = 1 USD for USDT swaps)
-            oi = _get(f"{OKX_V5_API}/public/open-interest", {"instId": inst})
+            oi = _limited_get(limiter, f"{OKX_V5_API}/public/open-interest", {"instId": inst})
             if oi:
                 data = oi.get("data", [])
                 if data:
@@ -242,7 +337,7 @@ class OKXFetcher:
                     row["oi_usd"] = _safe_float(data[0].get("oiUsd"))
 
             # Funding rate
-            fr = _get(f"{OKX_V5_API}/public/funding-rate", {"instId": inst})
+            fr = _limited_get(limiter, f"{OKX_V5_API}/public/funding-rate", {"instId": inst})
             if fr:
                 data = fr.get("data", [])
                 if data:
@@ -251,27 +346,35 @@ class OKXFetcher:
 
             # L/S ratios (Rubik stats — by base currency, not instId)
             params = {"ccy": base.upper(), "period": "5m"}
-            r_gl = _get(f"{OKX_V5_API}/rubik/stat/contracts/long-short-account-ratio", params)
+            r_gl = _limited_get(limiter, f"{OKX_V5_API}/rubik/stat/contracts/long-short-account-ratio", params)
             if r_gl:
                 d = r_gl.get("data", [])
                 if d:
                     row["ls_acc_global"] = _safe_float(d[0][1])
 
-            r_ta = _get(f"{OKX_V5_API}/rubik/stat/contracts/top-traders-long-short-account-ratio", params)
+            r_ta = _limited_get(limiter, f"{OKX_V5_API}/rubik/stat/contracts/top-traders-long-short-account-ratio", params)
             if r_ta:
                 d = r_ta.get("data", [])
                 if d:
                     row["ls_acc_top"] = _safe_float(d[0][1])
 
-            r_tp = _get(f"{OKX_V5_API}/rubik/stat/contracts/top-traders-long-short-position-ratio", params)
+            r_tp = _limited_get(limiter, f"{OKX_V5_API}/rubik/stat/contracts/top-traders-long-short-position-ratio", params)
             if r_tp:
                 d = r_tp.get("data", [])
                 if d:
                     row["ls_pos_top"] = _safe_float(d[0][1])
 
-            rows.append(row)
-            time.sleep(0.2)
+            return row
 
+        return self._fetch_parallel(symbols, fetch_one)
+
+    def _fetch_parallel(self, symbols, fetch_one):
+        rows = []
+        chunks = _chunks(symbols, self.CHUNK_SIZE)
+        with ThreadPoolExecutor(max_workers=min(self.MAX_WORKERS, len(chunks) or 1)) as executor:
+            futures = [executor.submit(lambda c: [fetch_one(base, sym) for base, sym in c], chunk) for chunk in chunks]
+            for future in as_completed(futures):
+                rows.extend(future.result())
         return rows
 
 
@@ -406,27 +509,53 @@ def upsert_rows(db_url: str, rows: List[dict]):
 # Asset loader
 # ==============================================================================
 
-def load_top_assets(db_url: str, top_n: Optional[int]) -> List[str]:
-    """Return non-filtered base_assets ordered by market_cap_rank. top_n=None loads all."""
+def load_top_assets(db_url: str, top_n: Optional[int], top_active: Optional[int] = None) -> List[str]:
+    """
+    Return base_assets to poll, ordered by current market_cap_rank.
+
+    By default (top_active=None) loads ALL assets that have EVER been in the
+    top-N (ever_in_top_50=true) — this is the full tracked universe, ensuring
+    no survivor bias in the realtime data collection.
+
+    When --top-active N is set, restricts to only the top N assets by their
+    current market_cap_rank. Useful to reduce load if the full universe causes
+    rate-limit pressure on the exchanges.
+    """
     conn = None
     try:
         conn = psycopg2.connect(db_url)
         cur  = conn.cursor()
-        if top_n is None:
+
+        if top_active is not None:
+            # Restricted mode: only top N currently active assets
+            log.info("Asset load mode: TOP-ACTIVE %d (current rank only)", top_active)
             cur.execute("""
                 SELECT symbol FROM asset_metadata
-                WHERE is_filtered = false OR is_filtered IS NULL
+                WHERE (is_filtered = false OR is_filtered IS NULL)
                 ORDER BY market_cap_rank ASC NULLS LAST
-            """)
-        else:
+                LIMIT %s
+            """, (top_active,))
+        elif top_n is not None:
+            # Legacy explicit limit
+            log.info("Asset load mode: TOP %d (legacy limit)", top_n)
             cur.execute("""
                 SELECT symbol FROM asset_metadata
-                WHERE is_filtered = false OR is_filtered IS NULL
+                WHERE (is_filtered = false OR is_filtered IS NULL)
                 ORDER BY market_cap_rank ASC NULLS LAST
                 LIMIT %s
             """, (top_n,))
+        else:
+            # Default: full tracked universe — all assets that were ever in top-N
+            log.info("Asset load mode: FULL UNIVERSE (ever_in_top_50 = true)")
+            cur.execute("""
+                SELECT symbol FROM asset_metadata
+                WHERE (is_filtered = false OR is_filtered IS NULL)
+                  AND (ever_in_top_50 = true OR market_cap_rank IS NOT NULL)
+                ORDER BY market_cap_rank ASC NULLS LAST
+            """)
+
         assets = [row[0] for row in cur.fetchall()]
-        log.info("Loaded %d assets from asset_metadata.", len(assets))
+        log.info("Loaded %d assets to poll.", len(assets))
         return assets
     except Exception as e:
         log.error("Failed to load assets: %s", e)
@@ -447,12 +576,21 @@ FETCHER_MAP = {
 }
 
 
-def run_once(db_url: str, top_n: Optional[int], exchanges: List[str]):
-    assets = load_top_assets(db_url, top_n)
+def run_once(db_url: str, top_n: Optional[int], exchanges: List[str], top_active: Optional[int] = None):
+    assets = load_top_assets(db_url, top_n, top_active=top_active)
     if not assets:
         log.warning("No assets loaded — skipping poll cycle.")
         _telegram("⚠️ *alt-scraper-realtime*: no assets loaded from metadata — poll skipped.")
         return
+
+    resolved = resolve_exchange_symbols(assets)
+    for ex in exchanges:
+        log.info(
+            "Resolved %s symbols: %d/%d assets supported",
+            ex,
+            len(resolved.get(ex, [])),
+            len(assets),
+        )
 
     now = datetime.now(UTC)
     failed_exchanges: List[str] = []
@@ -462,8 +600,12 @@ def run_once(db_url: str, top_n: Optional[int], exchanges: List[str]):
         if not cls:
             log.warning("Unknown exchange: %s", ex)
             return []
-        log.info("Polling %s for %d assets...", ex, len(assets))
-        rows = cls().fetch(assets)
+        symbols = resolved.get(ex, [])
+        if not symbols:
+            log.warning("No supported symbols resolved for %s — skipping.", ex)
+            return []
+        log.info("Polling %s for %d supported symbols...", ex, len(symbols))
+        rows = cls().fetch(symbols)
         log.info("  %s → %d rows fetched.", ex, len(rows))
         return rows
 
@@ -498,10 +640,13 @@ def run_once(db_url: str, top_n: Optional[int], exchanges: List[str]):
 
 def main():
     parser = argparse.ArgumentParser(description="Futures latest snapshot daemon")
-    parser.add_argument("--top",       type=int,   default=None,                help="Limit to top N assets (default: all assets in metadata)")
-    parser.add_argument("--exchanges", type=str,   default=",".join(DEFAULT_EXCHANGES), help="Comma-separated exchange list")
-    parser.add_argument("--interval",  type=int,   default=DEFAULT_POLL_INTERVAL, help="Poll interval in seconds (default 900)")
-    parser.add_argument("--once",      action="store_true", help="Run one poll cycle then exit (useful for testing)")
+    parser.add_argument("--top",        type=int,   default=None,                help="(Legacy) Limit to top N assets by rank")
+    parser.add_argument("--top-active",  type=int,   default=None,  dest="top_active",
+                        help="Restrict polling to only the top N currently-active assets by market_cap_rank. "
+                             "Default: off — polls the full tracked universe (all assets ever in top-N).")
+    parser.add_argument("--exchanges",  type=str,   default=",".join(DEFAULT_EXCHANGES), help="Comma-separated exchange list")
+    parser.add_argument("--interval",   type=int,   default=DEFAULT_POLL_INTERVAL, help="Poll interval in seconds (default 900)")
+    parser.add_argument("--once",       action="store_true", help="Run one poll cycle then exit (useful for testing)")
     args = parser.parse_args()
 
     db_url = os.getenv("DATABASE_URL")
@@ -511,17 +656,17 @@ def main():
 
     exchanges = [e.strip().lower() for e in args.exchanges.split(",") if e.strip()]
 
-    top_label = str(args.top) if args.top else "all"
-    log.info("Starting realtime_daemon — exchanges=%s, top=%s, interval=%ds", exchanges, top_label, args.interval)
+    top_label = str(args.top) if args.top else (f"top-active-{args.top_active}" if args.top_active else "full-universe")
+    log.info("Starting realtime_daemon — exchanges=%s, mode=%s, interval=%ds", exchanges, top_label, args.interval)
 
     if args.once:
-        run_once(db_url, args.top, exchanges)
+        run_once(db_url, args.top, exchanges, top_active=args.top_active)
         return
 
     while True:
         start = time.monotonic()
         try:
-            run_once(db_url, args.top, exchanges)
+            run_once(db_url, args.top, exchanges, top_active=args.top_active)
         except Exception as e:
             log.error("Unexpected error in poll cycle: %s", e)
             _telegram(f"🔴 *alt-scraper-realtime*: unexpected error in poll cycle\n`{e}`")

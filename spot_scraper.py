@@ -1,6 +1,7 @@
 import os
 import time
 import socket
+import json
 import requests
 import pandas as pd
 import psycopg2
@@ -39,9 +40,119 @@ BYBIT_SPOT_API = "https://api.bybit.com/v5/market/kline"
 OKX_SPOT_API = "https://www.okx.com/api/v5/market/history-candles"
 OKX_RUBIK_API = "https://www.okx.com/api/v5/rubik/stat/taker-volume"
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
+SPOT_SYMBOL_CACHE = os.path.join("data", "cache", "spot_exchange_symbols.json")
 
 def to_unix_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
+
+
+def _load_json_cache(path: str, ttl_hours: float) -> Optional[dict]:
+    if ttl_hours <= 0 or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        cached_at = float(payload.get("cached_at", 0))
+        age_hours = (time.time() - cached_at) / 3600
+        if age_hours <= ttl_hours:
+            print(f"[INFO] Loaded spot exchange symbol cache ({age_hours:.1f}h old)")
+            return payload
+    except Exception as e:
+        print(f"[INFO] Could not read spot symbol cache: {e}")
+    return None
+
+
+def _save_json_cache(path: str, payload: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception as e:
+        print(f"[INFO] Could not write spot symbol cache: {e}")
+
+
+def _fetch_binance_spot_symbols() -> Dict[str, str]:
+    resp = _tor.direct.get(
+        f"{BINANCE_SPOT_MIRRORS[0]}/api/v3/exchangeInfo",
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return {
+        s["baseAsset"].upper(): s["symbol"]
+        for s in data.get("symbols", [])
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+    }
+
+
+def _fetch_bybit_spot_symbols() -> Dict[str, str]:
+    out = {}
+    cursor = None
+    while True:
+        params = {"category": "spot", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        resp = _tor.session.get(
+            "https://api.bybit.com/v5/market/instruments-info",
+            params=params,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json().get("result", {})
+        for s in result.get("list", []):
+            if s.get("quoteCoin") == "USDT" and s.get("status") == "Trading":
+                out[s.get("baseCoin", "").upper()] = s.get("symbol", "")
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
+    return out
+
+
+def _fetch_okx_spot_symbols() -> Dict[str, str]:
+    resp = _tor.session.get(
+        "https://www.okx.com/api/v5/public/instruments",
+        params={"instType": "SPOT"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return {
+        s.get("baseCcy", "").upper(): s.get("instId", "")
+        for s in data.get("data", [])
+        if s.get("quoteCcy") == "USDT" and s.get("state") == "live"
+    }
+
+
+def load_spot_exchange_symbols(exchanges: List[str], ttl_hours: float = 24.0) -> Dict[str, Dict[str, str]]:
+    """
+    Load native spot USDT listings per exchange.
+
+    This prevents wasting historical requests on assets that are in the global
+    universe but do not trade on a given spot venue.
+    """
+    cached = _load_json_cache(SPOT_SYMBOL_CACHE, ttl_hours)
+    symbols_by_exchange = cached.get("exchanges", {}) if cached else {}
+    loaded = dict(symbols_by_exchange)
+
+    fetchers = {
+        "binance": _fetch_binance_spot_symbols,
+        "bybit": _fetch_bybit_spot_symbols,
+        "okx": _fetch_okx_spot_symbols,
+    }
+
+    missing = [ex for ex in exchanges if ex in fetchers and ex not in loaded]
+    for exchange in missing:
+        try:
+            loaded[exchange] = fetchers[exchange]()
+            print(f"[INFO] Loaded {len(loaded[exchange])} native spot USDT symbols for {exchange}")
+        except Exception as e:
+            print(f"[WARN] Could not load native spot symbols for {exchange}: {e}")
+            loaded[exchange] = {}
+
+    if missing:
+        _save_json_cache(SPOT_SYMBOL_CACHE, {"cached_at": time.time(), "exchanges": loaded})
+
+    return {ex: loaded.get(ex, {}) for ex in exchanges}
 
 # ==============================================================================
 # Tor Proxy Manager (opt-in via TOR_PROXY env var)
@@ -300,6 +411,29 @@ class DatabaseManager:
             return pd.DataFrame()
         finally:
             if conn: conn.close()
+
+    def get_full_tracked_symbols(self) -> List[str]:
+        """Return all non-filtered assets that have ever been in the historical top universe."""
+        if not self.enabled:
+            return []
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT symbol
+                FROM asset_metadata
+                WHERE (is_filtered = false OR is_filtered IS NULL)
+                  AND ever_in_top_50 = true
+                ORDER BY market_cap_rank ASC NULLS LAST, symbol ASC
+            """)
+            return [r[0] for r in cur.fetchall()]
+        except Exception as e:
+            print(f"    [DB INFO] Could not fetch full tracked universe: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
 
 class AssetMetadataManager:
     def __init__(self, file_path: str = "data/asset_metadata.csv", db_manager: Optional[DatabaseManager] = None, allow_csv: bool = True):
@@ -1050,6 +1184,16 @@ def main():
     parser.add_argument("--start", type=str, default="2017-01-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--output-dir", type=str, default="data/spot", help="Output directory")
     parser.add_argument("--metadata-only", action="store_true", help="Only sync metadata and exit")
+    parser.add_argument("--full-universe", action="store_true",
+                       help="Use all non-filtered assets marked ever_in_top_50 in asset_metadata. "
+                            "Avoids selecting assets from the current CoinGecko top list.")
+    parser.add_argument("--skip-exchange-symbol-filter", action="store_true",
+                       help="Do not prefilter assets by native exchange spot listings")
+    parser.add_argument("--spot-symbol-cache-ttl-hours", type=float,
+                       default=float(os.environ.get("SPOT_SYMBOL_CACHE_TTL_HOURS", "24")),
+                       help="Hours to reuse cached native spot symbol lists (default: env SPOT_SYMBOL_CACHE_TTL_HOURS or 24)")
+    parser.add_argument("--dry-run", action="store_true",
+                       help="Resolve target symbols and exchange support, then exit without fetching candles")
     args = parser.parse_args()
     
     scraper = SpotScraper(args.output_dir)
@@ -1060,7 +1204,11 @@ def main():
     
     target_bases = []
     
-    if args.symbols:
+    if args.full_universe and not args.symbols:
+        target_bases = db_manager.get_full_tracked_symbols()
+        if not target_bases:
+            raise SystemExit("[ERROR] --full-universe requested but no ever_in_top_50 assets found in asset_metadata.")
+    elif args.symbols:
         raw_symbols = [s.strip().upper() for s in args.symbols.split(",")]
         candidates = coingecko_get_top_candidates(specific_symbols=raw_symbols)
         for c in candidates:
@@ -1108,6 +1256,10 @@ def main():
     start_dt = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end_dt = datetime.now(timezone.utc)
     start_ts, end_ts = to_unix_ms(start_dt), to_unix_ms(end_dt)
+
+    spot_symbols = {}
+    if not args.skip_exchange_symbol_filter:
+        spot_symbols = load_spot_exchange_symbols(exchanges, ttl_hours=args.spot_symbol_cache_ttl_hours)
     
     print("=" * 60)
     print(f"Exchange Spot OHLCV Backfill (Cache: {len(meta.df)} assets)")
@@ -1115,8 +1267,16 @@ def main():
     print(f"Date Range: {start_dt.date()} to {end_dt.date()}")
     print(f"Exchanges:  {exchanges}")
     print(f"Targeting:  {len(target_bases)} tokens")
-    print(f"Targeting:  {len(target_bases)} tokens")
+    if spot_symbols:
+        for exchange in exchanges:
+            supported = spot_symbols.get(exchange, {})
+            supported_count = sum(1 for base in target_bases if base in supported)
+            print(f"Supported on {exchange}: {supported_count}/{len(target_bases)} tokens")
     print("=" * 60)
+
+    if args.dry_run:
+        print("[INFO] Dry run complete. No candles fetched.")
+        return
     
     # Sync Metadata to Database (Efficient bulk sync)
     if db_manager.enabled and not meta.df.empty:
@@ -1127,7 +1287,15 @@ def main():
         print(f"\nProcessing EXCHANGE: {exchange.upper()}")
         exch_dir = os.path.join(args.output_dir, exchange)
         os.makedirs(exch_dir, exist_ok=True)
-        for base in target_bases:
+        exchange_symbols = spot_symbols.get(exchange, {}) if not args.skip_exchange_symbol_filter else {}
+        if not args.skip_exchange_symbol_filter:
+            bases_for_exchange = [base for base in target_bases if base in exchange_symbols]
+            skipped = len(target_bases) - len(bases_for_exchange)
+            print(f"  [Filter] {len(bases_for_exchange)} tradable USDT spot assets on {exchange}; skipping {skipped} unsupported assets.")
+        else:
+            bases_for_exchange = target_bases
+
+        for base in bases_for_exchange:
             try:
                 # Determine save path and incremental start
                 fname = f"{base}USDT_spot_1d.csv"

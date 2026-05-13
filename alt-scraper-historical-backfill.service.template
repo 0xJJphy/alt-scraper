@@ -1,0 +1,19 @@
+[Unit]
+Description=Alt Scraper Historical Backfill (manual long-running job)
+After=network.target
+OnFailure=alt-scraper-notify@%n.service
+
+[Service]
+Type=simple
+User={{USER}}
+WorkingDirectory={{INSTALL_DIR}}
+EnvironmentFile={{INSTALL_DIR}}/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/bash {{INSTALL_DIR}}/vps_historical_backfill.sh
+Restart=no
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alt-scraper-historical-backfill
+
+[Install]
+WantedBy=multi-user.target

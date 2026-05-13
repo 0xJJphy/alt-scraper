@@ -23,6 +23,7 @@ import sys
 import time
 import threading
 import argparse
+import json
 import requests
 import pandas as pd
 import psycopg2
@@ -45,7 +46,7 @@ load_dotenv()
 # ==============================================================================
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
-COINALYZE_BATCH_SIZE = 10  # symbols per batch request (confirmed working)
+COINALYZE_BATCH_SIZE = int(os.environ.get("COINALYZE_BATCH_SIZE", "10"))  # symbols per batch request
 
 # Coinalyze API Endpoints
 COINALYZE_ENDPOINTS = {
@@ -350,6 +351,29 @@ class DatabaseManager:
         finally:
             if conn: conn.close()
 
+    def get_full_tracked_symbols(self) -> List[str]:
+        """Return all non-filtered assets that have ever been in the historical top universe."""
+        if not self.enabled:
+            return []
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT symbol
+                FROM asset_metadata
+                WHERE (is_filtered = false OR is_filtered IS NULL)
+                  AND ever_in_top_50 = true
+                ORDER BY market_cap_rank ASC NULLS LAST, symbol ASC
+            """)
+            return [r[0] for r in cur.fetchall()]
+        except Exception as e:
+            print(f"    [DB INFO] Could not fetch full tracked universe: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
     def upsert_asset_metadata(self, symbol: str, narrative: str, is_filtered: int, market_cap: Optional[float] = None, market_cap_rank: Optional[int] = None):
         """Upsert asset metadata into asset_metadata table."""
         if not self.enabled: return
@@ -403,6 +427,77 @@ class DatabaseManager:
             print(f"    [DB] Bulk synced {len(records)} metadata records.")
         except Exception as e:
             print(f"    [DB ERROR] Bulk metadata sync failed: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+
+    def bulk_upsert_market_cap_history(self, snapshot_date: str, candidates: List[Dict], top_n: int) -> None:
+        """
+        Persist a daily CoinGecko market cap snapshot into market_cap_history.
+
+        For each candidate:
+        - in_top_50  = True if market_cap_rank <= top_n on this date.
+        - ever_in_top_50 = True if in_top_50 now OR it was already true in a previous row.
+
+        Also updates asset_metadata.ever_in_top_50 so daemons can load the full
+        tracked universe with a simple query (no join needed).
+        """
+        if not self.enabled or not candidates:
+            return
+        conn = None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+
+            records = []
+            for c in candidates:
+                sym = c.get('symbol', '').upper()
+                if not sym:
+                    continue
+                rank = c.get('market_cap_rank')
+                mcap = c.get('market_cap')
+                in_top = bool(rank and rank <= top_n)
+                records.append((
+                    snapshot_date,
+                    sym,
+                    rank,
+                    self._sanitize_float(mcap),
+                    in_top,
+                    in_top,   # ever_in_top_50 starts equal to in_top; OR'd with existing on conflict
+                ))
+
+            sql = """
+                INSERT INTO market_cap_history
+                    (date, symbol, market_cap_rank, market_cap_usd, in_top_50, ever_in_top_50)
+                VALUES %s
+                ON CONFLICT (date, symbol) DO UPDATE SET
+                    market_cap_rank = EXCLUDED.market_cap_rank,
+                    market_cap_usd  = EXCLUDED.market_cap_usd,
+                    in_top_50       = EXCLUDED.in_top_50,
+                    -- ever_in_top_50 is monotonically increasing: once true, stays true
+                    ever_in_top_50  = market_cap_history.ever_in_top_50 OR EXCLUDED.ever_in_top_50
+            """
+            template = "(%s, %s, %s, %s, %s, %s)"
+            execute_values(cur, sql, records, template=template, page_size=500)
+
+            # Propagate ever_in_top_50=true back to asset_metadata for fast daemon queries
+            in_top_symbols = [r[1] for r in records if r[4]]  # r[4] = in_top
+            if in_top_symbols:
+                cur.execute(
+                    """
+                    UPDATE asset_metadata
+                    SET ever_in_top_50 = true
+                    WHERE symbol = ANY(%s) AND (ever_in_top_50 IS NULL OR ever_in_top_50 = false)
+                    """,
+                    (in_top_symbols,)
+                )
+
+            conn.commit()
+            in_top_count = sum(1 for r in records if r[4])
+            print(f"    [DB] Market cap snapshot saved: {len(records)} assets, {in_top_count} in top-{top_n}.")
+
+        except Exception as e:
+            print(f"    [DB ERROR] market_cap_history upsert failed: {e}")
             if conn: conn.rollback()
         finally:
             if conn: conn.close()
@@ -659,7 +754,14 @@ class CoinalyzeClient:
     See: https://coinalyze.net/api-docs/
     """
     
-    def __init__(self, api_key: str, rate_delay: float = 1.6, rate_limiter: Optional['ThreadSafeRateLimiter'] = None):
+    def __init__(
+        self,
+        api_key: str,
+        rate_delay: float = 1.6,
+        rate_limiter: Optional['ThreadSafeRateLimiter'] = None,
+        symbol_cache_path: Optional[str] = None,
+        symbol_cache_ttl_hours: float = 24.0,
+    ):
         """
         Initialize Coinalyze client.
 
@@ -672,6 +774,68 @@ class CoinalyzeClient:
         self.rate_delay = rate_delay
         self._rate_limiter = rate_limiter
         self._future_symbols_cache: Optional[set] = None
+        self.symbol_cache_path = symbol_cache_path or os.environ.get(
+            "COINALYZE_SYMBOL_CACHE",
+            os.path.join("data", "cache", "coinalyze_future_markets.json"),
+        )
+        self.symbol_cache_ttl_hours = symbol_cache_ttl_hours
+
+    def _organize_future_symbols(self, data: list) -> dict:
+        """Organize Coinalyze market rows into fast exact-match lookup sets."""
+        symbols_by_exchange = {}
+        all_symbols = set()
+
+        if isinstance(data, list):
+            for market in data:
+                symbol = market.get("symbol", "")
+                if not symbol:
+                    continue
+
+                all_symbols.add(symbol)
+
+                # Extract exchange code from symbol (e.g., 'BTCUSDT_PERP.A' -> 'A')
+                exchange_code = symbol.split('.')[-1] if '.' in symbol else None
+
+                if exchange_code not in symbols_by_exchange:
+                    symbols_by_exchange[exchange_code] = set()
+                symbols_by_exchange[exchange_code].add(symbol)
+
+        return {
+            'all': all_symbols,
+            'by_exchange': symbols_by_exchange
+        }
+
+    def _load_future_markets_from_disk(self) -> Optional[list]:
+        """Load cached Coinalyze future-markets response if it is still fresh."""
+        if not self.symbol_cache_path or self.symbol_cache_ttl_hours <= 0:
+            return None
+        try:
+            if not os.path.exists(self.symbol_cache_path):
+                return None
+            with open(self.symbol_cache_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            cached_at = float(payload.get("cached_at", 0))
+            age_hours = (time.time() - cached_at) / 3600
+            if age_hours > self.symbol_cache_ttl_hours:
+                return None
+            markets = payload.get("markets")
+            if isinstance(markets, list):
+                print(f"[INFO] Loaded Coinalyze futures market list from cache ({age_hours:.1f}h old)")
+                return markets
+        except Exception as e:
+            print(f"[INFO] Could not read Coinalyze symbol cache: {e}")
+        return None
+
+    def _save_future_markets_to_disk(self, data: list) -> None:
+        """Persist Coinalyze future-markets response for subsequent daily runs."""
+        if not self.symbol_cache_path or self.symbol_cache_ttl_hours <= 0:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.symbol_cache_path), exist_ok=True)
+            with open(self.symbol_cache_path, "w", encoding="utf-8") as f:
+                json.dump({"cached_at": time.time(), "markets": data}, f)
+        except Exception as e:
+            print(f"[INFO] Could not write Coinalyze symbol cache: {e}")
         
     def _get(self, url: str, params: dict) -> Optional[dict]:
         """
@@ -850,38 +1014,17 @@ class CoinalyzeClient:
         """
         if self._future_symbols_cache is not None:
             return self._future_symbols_cache
-            
-        print("[INFO] Loading Coinalyze futures market list...")
-        data = self._get(COINALYZE_ENDPOINTS["future_markets"], params={})
+
+        data = self._load_future_markets_from_disk()
+        if data is None:
+            print("[INFO] Loading Coinalyze futures market list...")
+            data = self._get(COINALYZE_ENDPOINTS["future_markets"], params={})
+            if isinstance(data, list):
+                self._save_future_markets_to_disk(data)
+
+        self._future_symbols_cache = self._organize_future_symbols(data or [])
         
-        # Organize symbols by exchange code
-        symbols_by_exchange = {}
-        all_symbols = set()
-        
-        if isinstance(data, list):
-            for market in data:
-                symbol = market.get("symbol", "")
-                if not symbol:
-                    continue
-                    
-                all_symbols.add(symbol)
-                
-                # Extract exchange code from symbol (e.g., 'BTCUSDT_PERP.A' -> 'A')
-                if '.' in symbol:
-                    exchange_code = symbol.split('.')[-1]
-                else:
-                    exchange_code = None  # Aggregated
-                    
-                if exchange_code not in symbols_by_exchange:
-                    symbols_by_exchange[exchange_code] = set()
-                symbols_by_exchange[exchange_code].add(symbol)
-        
-        self._future_symbols_cache = {
-            'all': all_symbols,
-            'by_exchange': symbols_by_exchange
-        }
-        
-        print(f"[INFO] Found {len(all_symbols)} futures markets across {len(symbols_by_exchange)} exchange codes")
+        print(f"[INFO] Found {len(self._future_symbols_cache['all'])} futures markets across {len(self._future_symbols_cache['by_exchange'])} exchange codes")
         return self._future_symbols_cache
     
     def find_symbol_for_base(self, base: str, exchange: str) -> str:
@@ -2036,7 +2179,8 @@ def process_exchange(exchange, bases, api_key, rate_limiter, symbols_cache, args
         df_final['symbol'] = symbol
         df_final['exchange'] = exchange
         df_final['base_asset'] = base
-        df_final = patch_missing_metrics(df_final, base, exchange, symbol)
+        if not args.skip_native_patch:
+            df_final = patch_missing_metrics(df_final, base, exchange, symbol)
 
         print(f"    {tag} -> {len(df_final)} rows collected", flush=True)
 
@@ -2091,14 +2235,29 @@ def main():
     parser.add_argument("--skip-ohlcv", action="store_true",
                        help="Skip OHLCV data (useful if you have price data from elsewhere)")
     parser.add_argument("--skip-merge", action="store_true", help="Skip merging metrics into OHLCV files")
+    parser.add_argument("--skip-native-patch", action="store_true",
+                       help="Skip per-symbol native exchange enrichment after Coinalyze batch fetches")
+    parser.add_argument("--coinalyze-min-interval", type=float,
+                       default=float(os.environ.get("COINALYZE_MIN_INTERVAL", "3.2")),
+                       help="Minimum seconds between Coinalyze API calls across threads (default: env COINALYZE_MIN_INTERVAL or 3.2)")
+    parser.add_argument("--coinalyze-symbol-cache-ttl-hours", type=float,
+                       default=float(os.environ.get("COINALYZE_SYMBOL_CACHE_TTL_HOURS", "24")),
+                       help="Hours to reuse cached Coinalyze future-markets list (default: env COINALYZE_SYMBOL_CACHE_TTL_HOURS or 24)")
     parser.add_argument("--csv", action="store_true", help="Save results to local CSV files (default: False)")
     parser.add_argument("--exchanges", type=str, default="binance,bybit,okx",
                        help=f"Comma-separated list of exchanges, or 'all' for all (default: binance,bybit,okx). Available: {','.join(EXCHANGE_CODES.keys())}")
     parser.add_argument("--metadata-only", action="store_true", help="Only sync metadata and exit")
+    parser.add_argument("--full-universe", action="store_true",
+                       help="Use all non-filtered assets marked ever_in_top_50 in asset_metadata. "
+                            "Avoids selecting assets from the current CoinGecko top list.")
     args = parser.parse_args()
     
     # Initialize API Clients
-    client = CoinalyzeClient(args.coinalyze_key, rate_delay=1.6)
+    client = CoinalyzeClient(
+        args.coinalyze_key,
+        rate_delay=1.6,
+        symbol_cache_ttl_hours=args.coinalyze_symbol_cache_ttl_hours,
+    )
     db_manager = DatabaseManager()
     
     # Validate API key
@@ -2133,7 +2292,12 @@ def main():
     
     target_bases = []
     
-    if args.symbols:
+    if args.full_universe and not args.symbols:
+        target_bases = db_manager.get_full_tracked_symbols()
+        selection_desc = f"Full historical universe: {len(target_bases)} ever-top assets"
+        if not target_bases:
+            raise SystemExit("[ERROR] --full-universe requested but no ever_in_top_50 assets found in asset_metadata.")
+    elif args.symbols:
         raw_symbols = [s.strip().upper() for s in args.symbols.split(",")]
         candidates = coingecko_get_top_candidates(specific_symbols=raw_symbols)
         for c in candidates:
@@ -2155,8 +2319,14 @@ def main():
         tracked_active = meta.df[meta.df['is_filtered'] == 0]['symbol'].tolist()
         target_bases = [s for s in tracked_active if s not in ['BTC', 'ETH']] # Filter main pairs if desired, though usually kept
         
-        # B. Add current top candidates from CoinGecko
-        candidates = coingecko_get_top_candidates(n=limit)
+        # B. Add current top candidates from CoinGecko (fetch wider universe for ranking history)
+        candidates = coingecko_get_top_candidates(n=max(limit, 200))
+
+        # Persist daily market cap snapshot BEFORE filtering — captures full universe for backtesting
+        today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+        if db_manager and db_manager.enabled:
+            db_manager.bulk_upsert_market_cap_history(today_str, candidates, top_n=limit)
+
         new_top_symbols = []
         for c in candidates:
             res = meta.get_metadata(c['symbol'], c['id'], c.get('market_cap'), c.get('market_cap_rank'))
@@ -2210,9 +2380,8 @@ def main():
               "Wait ~1 minute for the rate-limit window to reset, then retry.", flush=True)
         sys.exit(1)
 
-    # Shared rate limiter: all exchange threads share the 40 req/min Coinalyze budget
-    # Increased to 2.0s (30 req/min) to be more conservative and avoid 429s
-    rate_limiter = ThreadSafeRateLimiter(min_interval=2.0)
+    # Shared rate limiter: all exchange threads share the Coinalyze request budget.
+    rate_limiter = ThreadSafeRateLimiter(min_interval=args.coinalyze_min_interval)
 
     # Process exchanges in parallel (one thread per exchange)
     print(f"\n[INFO] Running {len(exchanges)} exchange(s) in parallel...", flush=True)

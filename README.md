@@ -69,6 +69,28 @@ python alts_scraper.py --start 2023-01-01 --end-days-ago 1
 python alts_scraper.py --skip-ohlcv
 ```
 
+### Survivor-Bias-Free Universe Backfill
+
+Use CoinMarketCap historical snapshots as the primary source for point-in-time
+top-N membership. This avoids reconstructing historical ranks from today's
+surviving assets or from a rate-limited CoinGecko market-cap backfill.
+
+```bash
+# Preferred: build daily top-50 membership from CMC snapshots since 2020
+python backfill_market_cap_history.py --source cmc --start 2020-01-01 --frequency daily
+
+# Faster first pass if daily CMC scraping is too slow
+python backfill_market_cap_history.py --source cmc --start 2020-01-01 --frequency weekly
+
+# Explicit fallback only: enrich/reconstruct market caps from CoinGecko with caches
+python backfill_market_cap_history.py --source coingecko --from-file data/universe_cmc.json --start 2020-01-01
+```
+
+The default CMC mode writes `market_cap_history` with filtered ranks: stables,
+wrapped tokens, liquid-staking wrappers, and synthetic dollar assets are excluded
+before marking `in_top_50`. Cached snapshots live under
+`data/cache/market_cap_history/`, so interrupted runs are resumable.
+
 ### GitHub Actions (Stateless)
 The system is designed to run statelessly in the cloud. It will:
 1. Connect to `DATABASE_URL`.

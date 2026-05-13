@@ -246,17 +246,40 @@ def resolve_exchange_symbols(bases: List[str]) -> List[dict]:
     return result
 
 
-def load_top_assets(db_url: str, top_n: int) -> List[dict]:
-    """Load top assets from asset_metadata with resolved exchange-native symbols."""
+def load_top_assets(db_url: str, top_n: Optional[int] = None, top_active: Optional[int] = None) -> List[dict]:
+    """
+    Load assets from asset_metadata with resolved exchange-native symbols.
+
+    By default (both None) loads ALL assets that have ever been in the top-N
+    (ever_in_top_50=true) — the full tracked universe for no-survivor-bias coverage.
+
+    --top-active N: restrict to only the top N assets by current market_cap_rank.
+    --top N (legacy): same as top-active, kept for backwards compat.
+    """
     conn = psycopg2.connect(db_url)
     cur  = conn.cursor()
-    cur.execute("""
-        SELECT symbol
-        FROM asset_metadata
-        WHERE is_filtered = FALSE OR is_filtered IS NULL
-        ORDER BY market_cap_rank ASC NULLS LAST
-        LIMIT %s
-    """, (top_n,))
+
+    active_limit = top_active or top_n  # top_active takes priority
+
+    if active_limit is not None:
+        log.info("Asset load mode: TOP-ACTIVE %d (current rank only)", active_limit)
+        cur.execute("""
+            SELECT symbol
+            FROM asset_metadata
+            WHERE is_filtered = FALSE OR is_filtered IS NULL
+            ORDER BY market_cap_rank ASC NULLS LAST
+            LIMIT %s
+        """, (active_limit,))
+    else:
+        log.info("Asset load mode: FULL UNIVERSE (ever_in_top_50 = true)")
+        cur.execute("""
+            SELECT symbol
+            FROM asset_metadata
+            WHERE (is_filtered = FALSE OR is_filtered IS NULL)
+              AND (ever_in_top_50 = true OR market_cap_rank IS NOT NULL)
+            ORDER BY market_cap_rank ASC NULLS LAST
+        """)
+
     bases = [r[0] for r in cur.fetchall()]
     cur.close()
     conn.close()
@@ -834,10 +857,12 @@ STREAM_CONFIGS = [
 
 
 class OrderBookDaemon:
-    def __init__(self, db_url: str, assets: List[dict], top_n: int, once: bool = False):
-        self.db_url  = db_url
-        self.top_n   = top_n
-        self.once    = once
+    def __init__(self, db_url: str, assets: List[dict], top_n: int,
+                 top_active: Optional[int] = None, once: bool = False):
+        self.db_url     = db_url
+        self.top_n      = top_n
+        self.top_active = top_active
+        self.once       = once
         self.streams = {name: cls(assets) for name, cls in STREAM_CONFIGS}
         self._stream_last_ok: Dict[str, float] = {k: time.time() for k in self.streams}
         self._known_bases: set = {a["base_asset"] for a in assets}
@@ -883,7 +908,7 @@ class OrderBookDaemon:
             return
         self._last_metadata_check = time.time()
         try:
-            current = load_top_assets(self.db_url, self.top_n)
+            current = load_top_assets(self.db_url, top_n=self.top_n, top_active=self.top_active)
             current_bases = {a["base_asset"] for a in current}
             new_bases = current_bases - self._known_bases
             if new_bases:
@@ -947,8 +972,12 @@ class OrderBookDaemon:
 
 def main():
     parser = argparse.ArgumentParser(description="Order book depth WebSocket daemon")
-    parser.add_argument("--top",  type=int, default=80, help="Top N assets to track")
-    parser.add_argument("--once", action="store_true",  help="One snapshot then exit (testing)")
+    parser.add_argument("--top",        type=int, default=None,
+                        help="(Legacy) Limit to top N assets by rank")
+    parser.add_argument("--top-active", type=int, default=None, dest="top_active",
+                        help="Restrict to only the top N currently-active assets by market_cap_rank. "
+                             "Default: off — tracks the full universe (all assets ever in top-N).")
+    parser.add_argument("--once",       action="store_true", help="One snapshot then exit (testing)")
     args = parser.parse_args()
 
     db_url = os.getenv("DATABASE_URL")
@@ -956,11 +985,19 @@ def main():
         print("DATABASE_URL not set", file=sys.stderr)
         sys.exit(1)
 
-    log.info("loading top %d assets from DB...", args.top)
-    assets = load_top_assets(db_url, args.top)
+    mode_label = f"top-active-{args.top_active}" if args.top_active else \
+                 (f"top-{args.top}" if args.top else "full-universe")
+    log.info("loading assets — mode: %s", mode_label)
+    assets = load_top_assets(db_url, top_n=args.top, top_active=args.top_active)
     log.info("loaded %d assets", len(assets))
 
-    daemon = OrderBookDaemon(db_url=db_url, assets=assets, top_n=args.top, once=args.once)
+    daemon = OrderBookDaemon(
+        db_url=db_url,
+        assets=assets,
+        top_n=args.top or 0,
+        top_active=args.top_active,
+        once=args.once,
+    )
     daemon.run()
 
 
