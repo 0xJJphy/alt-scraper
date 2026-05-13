@@ -48,6 +48,13 @@ COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
 COINALYZE_BATCH_SIZE = int(os.environ.get("COINALYZE_BATCH_SIZE", "10"))  # symbols per batch request
 
+# Some historical CMC symbols no longer match exchange contract tickers.
+# Try canonical exchange aliases after the raw symbol, without rewriting the DB universe.
+FUTURES_SYMBOL_ALIASES = {
+    "MATIC": ["POL"],
+    "RNDR": ["RENDER"],
+}
+
 # Coinalyze API Endpoints
 COINALYZE_ENDPOINTS = {
     "future_markets": f"{COINALYZE_BASE}/future-markets",
@@ -99,6 +106,15 @@ def _get_default_narrative(market_cap_rank: Optional[int]) -> str:
         return "Mid Cap"
     else:
         return "Small Cap"
+
+
+def _retry_after_seconds(resp, default: int = 60, minimum: int = 10) -> int:
+    """Parse Retry-After defensively; some APIs return 0 while the window is still locked."""
+    try:
+        retry_after = int(float(resp.headers.get("Retry-After", str(default))))
+    except (TypeError, ValueError):
+        retry_after = default
+    return max(retry_after, minimum)
 
 # ==============================================================================
 # Exchange Configuration
@@ -868,7 +884,7 @@ class CoinalyzeClient:
                     
                 if resp.status_code == 429:
                     # Rate limited - honor Retry-After or default to 10s as requested
-                    retry_after = int(float(resp.headers.get("Retry-After", "10")))
+                    retry_after = _retry_after_seconds(resp, default=60, minimum=10)
                     print(f"    [Coinalyze Retry] Rate limited, waiting {retry_after}s (attempt {attempt+1}/3)...")
                     time.sleep(retry_after)
                     continue
@@ -918,7 +934,7 @@ class CoinalyzeClient:
                         return {item["symbol"]: item.get("history", []) for item in data}
                     return {}
                 if resp.status_code == 429:
-                    retry_after = int(float(resp.headers.get("Retry-After", "10")))
+                    retry_after = _retry_after_seconds(resp, default=60, minimum=10)
                     print(f"    [Coinalyze Retry] Rate limited, waiting {retry_after}s (attempt {attempt+1}/3)...")
                     time.sleep(retry_after)
                     continue
@@ -1049,67 +1065,76 @@ class CoinalyzeClient:
             
         exchange_code, _ = EXCHANGE_FORMATS[exchange_lower]
         base_upper = base.upper()
+        base_candidates = [base_upper] + FUTURES_SYMBOL_ALIASES.get(base_upper, [])
         
         # Get symbols for this exchange code
         symbols_by_exchange = cache.get('by_exchange', {})
         exchange_symbols = symbols_by_exchange.get(exchange_code, set())
+
+        def _linear_variants(symbol_base: str) -> List[str]:
+            # Binance/Bybit/OKX list some small-unit contracts as 1000{BASE}USDT.
+            # Exact matching keeps us away from false positives like BTCDOMUSDT.
+            return [symbol_base, f"1000{symbol_base}", f"10000{symbol_base}", f"1000000{symbol_base}"]
         
         # Define EXACT patterns for each exchange (in priority order)
         # Verified from Coinalyze API /v1/future-markets endpoint
-        exact_patterns = {
+        exact_patterns = {}
+        for candidate in base_candidates:
+            linear_bases = _linear_variants(candidate)
+            exact_patterns.update({
             'binance': [
-                f"{base_upper}USDT_PERP.A",      # BTCUSDT_PERP.A
-                f"{base_upper}USD_PERP.A",       # Coin-margined
+                *[f"{b}USDT_PERP.A" for b in linear_bases],  # BTCUSDT_PERP.A, 1000PEPEUSDT_PERP.A
+                f"{candidate}USD_PERP.A",        # Coin-margined
             ],
             'bybit': [
-                f"{base_upper}USDT.6",           # BTCUSDT.6
-                f"{base_upper}USD.6",
+                *[f"{b}USDT.6" for b in linear_bases],       # BTCUSDT.6, 1000PEPEUSDT.6
+                f"{candidate}USD.6",
             ],
             'okx': [
-                f"{base_upper}USDT_PERP.3",      # BTCUSDT_PERP.3
-                f"{base_upper}USD_PERP.3",       # Coin-margined
+                *[f"{b}USDT_PERP.3" for b in linear_bases],  # BTCUSDT_PERP.3, 1000PEPEUSDT_PERP.3
+                f"{candidate}USD_PERP.3",        # Coin-margined
             ],
             'deribit': [
-                f"{base_upper}-USD.8",           # BTC-USD.8
+                f"{candidate}-USD.8",            # BTC-USD.8
             ],
             'bitget': [
-                f"{base_upper}USDT_PERP.4",      # BTCUSDT_PERP.4
-                f"{base_upper}USD_PERP.4",
+                *[f"{b}USDT_PERP.4" for b in linear_bases],
+                f"{candidate}USD_PERP.4",
             ],
             'gate': [
-                f"{base_upper}_USDT.Y",          # BTC_USDT.Y
+                *[f"{b}_USDT.Y" for b in linear_bases],
             ],
             'huobi': [
-                f"{base_upper}.H",               # BTC.H
+                f"{candidate}.H",                # BTC.H
             ],
             'kraken': [
-                f"{base_upper}USD_PERP.K",       # BTCUSD_PERP.K
+                f"{candidate}USD_PERP.K",        # BTCUSD_PERP.K
             ],
             'bitmex': [
-                f"{base_upper}USD.7",            # BTCUSD.7
+                f"{candidate}USD.7",             # BTCUSD.7
             ],
             'mexc': [
-                f"{base_upper}-PERP.V",          # BTC-PERP.V
+                *[f"{b}-PERP.V" for b in linear_bases],
             ],
             'kucoin': [
-                f"{base_upper}USDT_PERP.0",      # BTCUSDT_PERP.0
-                f"{base_upper}USD_PERP.0",
+                *[f"{b}USDT_PERP.0" for b in linear_bases],
+                f"{candidate}USD_PERP.0",
             ],
             'phemex': [
-                f"PERP_{base_upper}_USDT.W",     # PERP_BTC_USDT.W
+                *[f"PERP_{b}_USDT.W" for b in linear_bases],
             ],
             'coinex': [
-                f"{base_upper}USDT_PERP.F",      # BTCUSDT_PERP.F
+                *[f"{b}USDT_PERP.F" for b in linear_bases],
             ],
-        }
+            })
         
-        # Get patterns for this exchange
-        patterns = exact_patterns.get(exchange_lower, [])
-        
-        # Try each pattern in priority order
-        for pattern in patterns:
-            if pattern in exchange_symbols:
-                return pattern
+            # Get patterns for this exchange
+            patterns = exact_patterns.get(exchange_lower, [])
+
+            # Try each pattern in priority order
+            for pattern in patterns:
+                if pattern in exchange_symbols:
+                    return pattern
         
         # If no exact match, return None (don't guess)
         return None
@@ -2131,15 +2156,25 @@ def process_exchange(exchange, bases, api_key, rate_limiter, symbols_cache, args
 
     # Phase 1: resolve symbols and per-symbol start dates (fast, no API calls)
     valid_tokens = []  # list of (base, symbol, start_sec, out_path)
+    skipped_bases = []
     for base in bases:
         symbol = client.find_symbol_for_base(base, exchange)
         if not symbol:
-            print(f"{tag} SKIP {base} (not found on {exchange})", flush=True)
+            skipped_bases.append(base)
             skip_count += 1
             continue
         out_path = os.path.join(metrics_root, f"{symbol}_1d_metrics.csv")
         token_start = get_incremental_start(out_path, default_start_sec, symbol, exchange, db)
         valid_tokens.append((base, symbol, token_start, out_path))
+
+    if skipped_bases:
+        preview = ", ".join(skipped_bases[:30])
+        suffix = "..." if len(skipped_bases) > 30 else ""
+        print(
+            f"{tag} Supported symbols: {len(valid_tokens)}/{len(bases)}. "
+            f"Skipping {len(skipped_bases)} unsupported assets on {exchange}: {preview}{suffix}",
+            flush=True,
+        )
 
     # Phase 2: batch-fetch Coinalyze data (COINALYZE_BATCH_SIZE symbols per API call)
     # Group by start_sec — for daily runs all tokens share the same window
