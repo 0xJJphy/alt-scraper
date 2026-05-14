@@ -665,6 +665,26 @@ KLINE_15M_KEYS = [
 SNAPSHOT_HOURS = {0, 6, 12, 18}
 
 
+def _non_null_count(row: dict) -> int:
+    return sum(1 for value in row.values() if value is not None)
+
+
+def _dedupe_rows(rows: List[dict], key_fields: Tuple[str, ...]) -> List[dict]:
+    """Postgres cannot update the same ON CONFLICT target twice in one INSERT."""
+    deduped: Dict[Tuple[object, ...], dict] = {}
+    for row in rows:
+        key = tuple(row.get(field) for field in key_fields)
+        if any(value is None for value in key):
+            continue
+        existing = deduped.get(key)
+        if existing is None or _non_null_count(row) >= _non_null_count(existing):
+            deduped[key] = row
+    skipped = len(rows) - len(deduped)
+    if skipped:
+        log.warning("Deduped %d rows for conflict key %s.", skipped, ",".join(key_fields))
+    return list(deduped.values())
+
+
 def write_snapshots(db_url: str, rows: List[dict], snapshot_at: datetime):
     if not rows:
         return
@@ -710,6 +730,9 @@ def write_intraday_snapshots(db_url: str, rows: List[dict], snapshot_at: datetim
 def upsert_rows(db_url: str, rows: List[dict]):
     if not rows:
         return
+    rows = _dedupe_rows(rows, ("symbol", "exchange"))
+    if not rows:
+        return
     conn = None
     try:
         conn = psycopg2.connect(db_url)
@@ -732,6 +755,9 @@ def upsert_rows(db_url: str, rows: List[dict]):
 
 
 def upsert_klines_15m(db_url: str, rows: List[dict]):
+    if not rows:
+        return
+    rows = _dedupe_rows(rows, ("candle_open_at", "symbol", "exchange"))
     if not rows:
         return
     conn = None
