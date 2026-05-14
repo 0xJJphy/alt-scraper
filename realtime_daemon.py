@@ -44,7 +44,14 @@ log = logging.getLogger(__name__)
 
 UTC = timezone.utc
 
-BINANCE_FUTURES_API = "https://fapi.binance.com"
+BINANCE_FUTURES_APIS = [
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi.binance.cc",
+    "https://fapi.binance.me",
+]
 BYBIT_V5_API        = "https://api.bybit.com/v5"
 OKX_V5_API          = "https://www.okx.com/api/v5"
 
@@ -54,10 +61,16 @@ KLINE_INTERVAL_MS     = 15 * 60 * 1000
 KLINE_SETTLE_DELAY_MS = 5_000
 KLINE_SETTLE_DELAY_S  = KLINE_SETTLE_DELAY_MS / 1000
 
-HEADERS = {"User-Agent": "alt-scraper/realtime-daemon"}
+HEADERS = {
+    "User-Agent": "alt-scraper/realtime-daemon",
+    "Accept": "application/json",
+    "Referer": "https://www.binance.com/",
+}
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+_binance_api_idx = 0
+_binance_api_lock = threading.Lock()
 
 # Historical CMC symbols may differ from current exchange tickers after renames.
 _SYMBOL_ALIASES = {
@@ -99,6 +112,38 @@ def _get(url: str, params: dict = None, timeout: int = 10) -> Optional[Union[dic
         return None
 
 
+def _binance_get(path: str, params: dict = None, timeout: int = 10) -> Optional[Union[dict, list]]:
+    """Fetch Binance Futures data, rotating mirrors when the primary is blocked."""
+    global _binance_api_idx
+    last_error = None
+    with _binance_api_lock:
+        start_idx = _binance_api_idx
+    base_urls = BINANCE_FUTURES_APIS[start_idx:] + BINANCE_FUTURES_APIS[:start_idx]
+
+    for base_url in base_urls:
+        url = f"{base_url}{path}"
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+            if r.status_code == 200:
+                idx = BINANCE_FUTURES_APIS.index(base_url)
+                with _binance_api_lock:
+                    if idx != _binance_api_idx:
+                        log.info("Using Binance Futures API mirror: %s", base_url)
+                    _binance_api_idx = idx
+                return r.json()
+            last_error = f"HTTP {r.status_code}: {r.text[:160]}"
+            if r.status_code in (403, 418, 451, 502, 503, 504):
+                log.warning("Binance %s failed via %s (%s); trying next mirror.", path, base_url, last_error)
+                continue
+            log.warning("Binance %s failed via %s (%s).", path, base_url, last_error)
+            return None
+        except Exception as e:
+            last_error = str(e)
+            log.warning("Binance %s failed via %s (%s); trying next mirror.", path, base_url, e)
+    log.error("Binance %s failed on all mirrors. Last error: %s", path, last_error)
+    return None
+
+
 def _safe_float(val) -> Optional[float]:
     try:
         f = float(val)
@@ -128,6 +173,11 @@ class RateLimiter:
 def _limited_get(limiter: RateLimiter, url: str, params: dict = None, timeout: int = 10):
     limiter.wait()
     return _get(url, params=params, timeout=timeout)
+
+
+def _limited_binance_get(limiter: RateLimiter, path: str, params: dict = None, timeout: int = 10):
+    limiter.wait()
+    return _binance_get(path, params=params, timeout=timeout)
 
 
 def _chunks(items: List[Tuple[str, str]], size: int) -> List[List[Tuple[str, str]]]:
@@ -176,7 +226,7 @@ def resolve_exchange_symbols(base_assets: List[str]) -> Dict[str, List[Tuple[str
     resolved = {"binance": [], "bybit": [], "okx": []}
 
     # Binance USDT-M futures: {BASE}USDT or 1000{BASE}USDT for some meme contracts.
-    b_data = _get(f"{BINANCE_FUTURES_API}/fapi/v1/exchangeInfo", timeout=20)
+    b_data = _binance_get("/fapi/v1/exchangeInfo", timeout=20)
     b_syms = {
         s["symbol"]
         for s in (b_data or {}).get("symbols", [])
@@ -260,13 +310,13 @@ class BinanceFetcher:
             row = {"symbol": sym, "exchange": self.EXCHANGE, "base_asset": base, "polled_at": polled_at}
 
             # Mark price + predicted funding (fetch first — needed for OI USD calc)
-            pm = _limited_get(limiter, f"{BINANCE_FUTURES_API}/fapi/v1/premiumIndex", {"symbol": sym})
+            pm = _limited_binance_get(limiter, "/fapi/v1/premiumIndex", {"symbol": sym})
             if pm:
                 row["price"]        = _safe_float(pm.get("markPrice"))
                 row["pred_funding"] = _safe_float(pm.get("lastFundingRate"))
 
             # Open Interest — returned in base asset, convert to USD using mark price
-            oi_data = _limited_get(limiter, f"{BINANCE_FUTURES_API}/fapi/v1/openInterest", {"symbol": sym})
+            oi_data = _limited_binance_get(limiter, "/fapi/v1/openInterest", {"symbol": sym})
             if oi_data:
                 oi_base = _safe_float(oi_data.get("openInterest"))
                 price   = row.get("price")
@@ -274,22 +324,22 @@ class BinanceFetcher:
                     row["oi_usd"] = oi_base * price
 
             # Current funding rate (from fundingRate endpoint)
-            fr = _limited_get(limiter, f"{BINANCE_FUTURES_API}/fapi/v1/fundingRate", {"symbol": sym, "limit": 1})
+            fr = _limited_binance_get(limiter, "/fapi/v1/fundingRate", {"symbol": sym, "limit": 1})
             if fr and isinstance(fr, list) and fr:
                 row["funding"] = _safe_float(fr[0].get("fundingRate"))
 
             # L/S ratios
-            r_gl = _limited_get(limiter, f"{BINANCE_FUTURES_API}/futures/data/globalLongShortAccountRatio",
+            r_gl = _limited_binance_get(limiter, "/futures/data/globalLongShortAccountRatio",
                                 {"symbol": sym, "period": "5m", "limit": 1})
             if r_gl and isinstance(r_gl, list) and r_gl:
                 row["ls_acc_global"] = _safe_float(r_gl[0].get("longShortRatio"))
 
-            r_ta = _limited_get(limiter, f"{BINANCE_FUTURES_API}/futures/data/topLongShortAccountRatio",
+            r_ta = _limited_binance_get(limiter, "/futures/data/topLongShortAccountRatio",
                                 {"symbol": sym, "period": "5m", "limit": 1})
             if r_ta and isinstance(r_ta, list) and r_ta:
                 row["ls_acc_top"] = _safe_float(r_ta[0].get("longShortRatio"))
 
-            r_tp = _limited_get(limiter, f"{BINANCE_FUTURES_API}/futures/data/topLongShortPositionRatio",
+            r_tp = _limited_binance_get(limiter, "/futures/data/topLongShortPositionRatio",
                                 {"symbol": sym, "period": "5m", "limit": 1})
             if r_tp and isinstance(r_tp, list) and r_tp:
                 row["ls_pos_top"] = _safe_float(r_tp[0].get("longShortRatio"))
@@ -303,9 +353,9 @@ class BinanceFetcher:
 
         def fetch_one(base: str, sym: str) -> Optional[dict]:
             now_ms = int(time.time() * 1000)
-            data = _limited_get(
+            data = _limited_binance_get(
                 limiter,
-                f"{BINANCE_FUTURES_API}/fapi/v1/klines",
+                "/fapi/v1/klines",
                 {"symbol": sym, "interval": "15m", "limit": 2},
             )
             if not data or not isinstance(data, list):
