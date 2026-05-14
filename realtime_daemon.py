@@ -59,6 +59,17 @@ HEADERS = {"User-Agent": "alt-scraper/realtime-daemon"}
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Historical CMC symbols may differ from current exchange tickers after renames.
+_SYMBOL_ALIASES = {
+    "MATIC": ["POL"],
+    "RNDR":  ["RENDER"],
+}
+# Normalize old names to canonical before storing base_asset.
+_SYMBOL_CANONICAL = {
+    "MATIC": "POL",
+    "RNDR":  "RENDER",
+}
+
 
 def _telegram(msg: str) -> None:
     """Send a Telegram message. Silently no-ops if credentials are not set."""
@@ -197,19 +208,34 @@ def resolve_exchange_symbols(base_assets: List[str]) -> Dict[str, List[Tuple[str
     }
 
     for base in base_assets:
+        store_base = _SYMBOL_CANONICAL.get(base, base)
+        candidates = [base] + _SYMBOL_ALIASES.get(base, [])
+
         for pfx in ("", "1000"):
-            sym = f"{pfx}{base}USDT"
-            if sym in b_syms:
-                resolved["binance"].append((base, sym))
-                break
+            for candidate in candidates:
+                sym = f"{pfx}{candidate}USDT"
+                if sym in b_syms:
+                    resolved["binance"].append((store_base, sym))
+                    break
+            else:
+                continue
+            break
+
         for pfx in ("", "1000"):
-            sym = f"{pfx}{base}USDT"
-            if sym in by_syms:
-                resolved["bybit"].append((base, sym))
+            for candidate in candidates:
+                sym = f"{pfx}{candidate}USDT"
+                if sym in by_syms:
+                    resolved["bybit"].append((store_base, sym))
+                    break
+            else:
+                continue
+            break
+
+        for candidate in candidates:
+            inst = okx_syms.get(candidate)
+            if inst:
+                resolved["okx"].append((store_base, inst))
                 break
-        inst = okx_syms.get(base)
-        if inst:
-            resolved["okx"].append((base, inst))
 
     return resolved
 

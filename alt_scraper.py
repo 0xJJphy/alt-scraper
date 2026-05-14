@@ -55,6 +55,13 @@ FUTURES_SYMBOL_ALIASES = {
     "RNDR": ["RENDER"],
 }
 
+# Normalize base_asset to the current canonical ticker before storing.
+# Prevents fragmentation when universe has both old (MATIC) and new (POL) names.
+_SYMBOL_CANONICAL = {
+    "MATIC": "POL",
+    "RNDR": "RENDER",
+}
+
 # Coinalyze API Endpoints
 COINALYZE_ENDPOINTS = {
     "future_markets": f"{COINALYZE_BASE}/future-markets",
@@ -2031,7 +2038,7 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
             today_row['date'] = today_str
             today_row['symbol'] = symbol
             today_row['exchange'] = exchange
-            today_row['base_asset'] = base
+            today_row['base_asset'] = _SYMBOL_CANONICAL.get(base, base)
             df = pd.concat([df, today_row], ignore_index=True)
             
     if df.empty: return df
@@ -2213,7 +2220,7 @@ def process_exchange(exchange, bases, api_key, rate_limiter, symbols_cache, args
 
         df_final['symbol'] = symbol
         df_final['exchange'] = exchange
-        df_final['base_asset'] = base
+        df_final['base_asset'] = _SYMBOL_CANONICAL.get(base, base)
         if not args.skip_native_patch:
             df_final = patch_missing_metrics(df_final, base, exchange, symbol)
 

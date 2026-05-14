@@ -49,6 +49,12 @@ SYMBOL_ALIASES = {
     "RNDR": ["RENDER"],
 }
 
+# Normalize to current canonical ticker before storing to prevent fragmentation.
+_SYMBOL_CANONICAL = {
+    "MATIC": "POL",
+    "RNDR": "RENDER",
+}
+
 SNAPSHOT_HOURS     = {0, 4, 8, 12, 16, 20}
 DEPTH_BANDS        = [1.0, 2.5, 5.0, 10.0]
 # Maps band float → DB column suffix (matching schema column names exactly)
@@ -270,7 +276,7 @@ def resolve_exchange_symbols(bases: List[str]) -> List[dict]:
     result = []
     for b in bases:
         result.append({
-            "base_asset":          b,
+            "base_asset":          _SYMBOL_CANONICAL.get(b, b),
             "symbol_binance":      bf_sym(b),
             "symbol_bybit":        bb_sym(b),
             "symbol_okx":          okx_sym(b),
