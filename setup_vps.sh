@@ -38,6 +38,12 @@ sed -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
     -e "s|{{USER}}|$EXEC_USER|g" \
     alt-scraper-orderbook.service.template > alt-scraper-orderbook.service
 
+# 2c. Generate futures klines WebSocket daemon service from template
+echo "Generating alt-scraper-klines-ws.service..."
+sed -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
+    -e "s|{{USER}}|$EXEC_USER|g" \
+    alt-scraper-klines-ws.service.template > alt-scraper-klines-ws.service
+
 # 3. Copy to systemd directory
 echo "Installing systemd units..."
 # Main service and timer
@@ -47,6 +53,8 @@ cp alt-scraper.timer /etc/systemd/system/
 cp alt-scraper-realtime.service /etc/systemd/system/
 # Orderbook daemon
 cp alt-scraper-orderbook.service /etc/systemd/system/
+# Futures klines WebSocket daemon
+cp alt-scraper-klines-ws.service /etc/systemd/system/
 # Notification service
 sed "s|{{INSTALL_DIR}}|$INSTALL_DIR|g; s|{{USER}}|$EXEC_USER|g" alt-scraper-notify@.service.template > /etc/systemd/system/alt-scraper-notify@.service
 
@@ -84,6 +92,10 @@ systemctl restart alt-scraper-realtime.service
 systemctl enable alt-scraper-orderbook.service
 systemctl restart alt-scraper-orderbook.service
 
+# Futures klines daemon (always running, WebSocket 15m candles + REST reconcile)
+systemctl enable alt-scraper-klines-ws.service
+systemctl restart alt-scraper-klines-ws.service
+
 echo ""
 echo "Setup complete!"
 echo ""
@@ -96,7 +108,11 @@ echo ""
 echo "Orderbook daemon status:"
 systemctl status alt-scraper-orderbook.service --no-pager
 echo ""
+echo "Futures klines WebSocket daemon status:"
+systemctl status alt-scraper-klines-ws.service --no-pager
+echo ""
 echo "Logs:"
 echo "  journalctl -u alt-scraper.service -f           # daily pipeline"
 echo "  journalctl -u alt-scraper-realtime.service -f  # realtime daemon"
 echo "  journalctl -u alt-scraper-orderbook.service -f # orderbook daemon"
+echo "  journalctl -u alt-scraper-klines-ws.service -f # 15m kline WebSocket daemon"

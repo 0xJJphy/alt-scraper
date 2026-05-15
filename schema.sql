@@ -1084,6 +1084,10 @@ CREATE TABLE IF NOT EXISTS futures_klines_15m (
     txn_count           BIGINT,
 
     polled_at           TIMESTAMPTZ,
+    source              VARCHAR(32),
+    ws_received_at      TIMESTAMPTZ,
+    rest_reconciled_at  TIMESTAMPTZ,
+    exchange_event_time TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -1096,6 +1100,8 @@ CREATE INDEX IF NOT EXISTS idx_fk15_base_at
     ON futures_klines_15m(base_asset, candle_open_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fk15_at
     ON futures_klines_15m(candle_open_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fk15_source_at
+    ON futures_klines_15m(source, candle_open_at DESC);
 
 DROP TRIGGER IF EXISTS trigger_update_timestamp_fk15 ON futures_klines_15m;
 CREATE TRIGGER trigger_update_timestamp_fk15

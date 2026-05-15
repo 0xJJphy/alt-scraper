@@ -9,6 +9,7 @@ Esta es la referencia técnica exhaustiva de todas las tablas, campos y procesos
 | Proceso | Tabla Destino | Frecuencia |
 | :--- | :--- | :--- |
 | **Realtime Futures** | `futures_latest` | Cada 15 min |
+| **Futures Klines WS** | `futures_klines_15m` | WebSocket; al cierre de cada vela 15m + reconciliación REST |
 | **Realtime Orderbook** | `orderbook_latest` | Cada 60 seg |
 | **Snapshots Futures** | `futures_snapshots` | Cada 4 horas* (Sincronizado) |
 | **Snapshots Orderbook** | `orderbook_snapshots` | Cada 4 horas (00, 04, 08, 12, 16, 20 UTC) |
