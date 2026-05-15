@@ -50,7 +50,42 @@ log = logging.getLogger(__name__)
 DEFAULT_EXCHANGES = ["binance", "bybit", "okx"]
 DEFAULT_RECONCILE_DELAY_S = 20
 DEFAULT_MAX_STREAMS_PER_CONN = 80
+DEFAULT_METRICS_FLUSH_INTERVAL_S = 10
 RECONNECT_DELAY_S = 5
+
+
+LATEST_SQL = """
+INSERT INTO futures_latest (
+    symbol, exchange, base_asset,
+    oi_usd, funding, pred_funding,
+    price, polled_at
+)
+VALUES %s
+ON CONFLICT (symbol, exchange) DO UPDATE SET
+    base_asset    = EXCLUDED.base_asset,
+    oi_usd        = COALESCE(EXCLUDED.oi_usd, futures_latest.oi_usd),
+    funding       = COALESCE(EXCLUDED.funding, futures_latest.funding),
+    pred_funding  = COALESCE(EXCLUDED.pred_funding, futures_latest.pred_funding),
+    price         = COALESCE(EXCLUDED.price, futures_latest.price),
+    polled_at     = EXCLUDED.polled_at,
+    updated_at    = NOW()
+"""
+
+LATEST_TEMPLATE = (
+    "(%(symbol)s, %(exchange)s, %(base_asset)s, %(oi_usd)s, %(funding)s, "
+    "%(pred_funding)s, %(price)s, %(polled_at)s)"
+)
+
+LATEST_KEYS = [
+    "symbol",
+    "exchange",
+    "base_asset",
+    "oi_usd",
+    "funding",
+    "pred_funding",
+    "price",
+    "polled_at",
+]
 
 
 KLINE_15M_SQL = """
@@ -304,6 +339,80 @@ def normalize_okx_ws(payload: dict, inst_to_meta: Dict[str, Tuple[str, str]]) ->
     return row
 
 
+def _latest_base_row(symbol: str, exchange: str, base_asset: str) -> dict:
+    return {
+        "symbol": symbol,
+        "exchange": exchange,
+        "base_asset": base_asset,
+        "oi_usd": None,
+        "funding": None,
+        "pred_funding": None,
+        "price": None,
+        "polled_at": datetime.now(UTC),
+    }
+
+
+def normalize_binance_mark_price_ws(payload: dict, symbol_to_base: Dict[str, str]) -> Optional[dict]:
+    data = payload.get("data", payload)
+    symbol = data.get("s") if isinstance(data, dict) else None
+    if symbol not in symbol_to_base:
+        return None
+    row = _latest_base_row(symbol, "binance", symbol_to_base[symbol])
+    row["price"] = _safe_float(data.get("p"))
+    row["pred_funding"] = _safe_float(data.get("r"))
+    if not row["price"] and row["pred_funding"] is None:
+        return None
+    return row
+
+
+def normalize_bybit_ticker_ws(payload: dict, symbol_to_base: Dict[str, str]) -> Optional[dict]:
+    topic = payload.get("topic", "")
+    parts = topic.split(".")
+    symbol = parts[-1] if parts else None
+    if symbol not in symbol_to_base:
+        return None
+    data = payload.get("data") or {}
+    row = _latest_base_row(symbol, "bybit", symbol_to_base[symbol])
+    row["price"] = _safe_float(data.get("markPrice"))
+    row["pred_funding"] = _safe_float(data.get("fundingRate"))
+    oi_value = _safe_float(data.get("openInterestValue"))
+    if oi_value is not None:
+        row["oi_usd"] = oi_value
+    else:
+        oi_base = _safe_float(data.get("openInterest"))
+        if oi_base is not None and row["price"] is not None:
+            row["oi_usd"] = oi_base * row["price"]
+    if row["price"] is None and row["pred_funding"] is None and row["oi_usd"] is None:
+        return None
+    return row
+
+
+def normalize_okx_metrics_ws(payload: dict, inst_to_meta: Dict[str, Tuple[str, str]]) -> Optional[dict]:
+    arg = payload.get("arg") or {}
+    channel = arg.get("channel")
+    inst_id = arg.get("instId")
+    if inst_id not in inst_to_meta:
+        return None
+    data = payload.get("data") or []
+    if not data:
+        return None
+    item = data[0]
+    base_asset, store_symbol = inst_to_meta[inst_id]
+    row = _latest_base_row(store_symbol, "okx", base_asset)
+    if channel == "open-interest":
+        row["oi_usd"] = _safe_float(item.get("oiUsd"))
+    elif channel == "funding-rate":
+        row["funding"] = _safe_float(item.get("fundingRate"))
+        row["pred_funding"] = _safe_float(item.get("nextFundingRate"))
+    elif channel == "mark-price":
+        row["price"] = _safe_float(item.get("markPx"))
+    else:
+        return None
+    if row["price"] is None and row["funding"] is None and row["pred_funding"] is None and row["oi_usd"] is None:
+        return None
+    return row
+
+
 def _dedupe_rows(rows: Sequence[dict]) -> List[dict]:
     deduped: Dict[Tuple[object, object, object], dict] = {}
     for row in rows:
@@ -353,6 +462,97 @@ def write_klines_15m(db_url: str, rows: Sequence[dict], dry_run: bool = False) -
             )
         return
     upsert_klines_15m(db_url, rows)
+
+
+def _dedupe_latest_rows(rows: Sequence[dict]) -> List[dict]:
+    deduped: Dict[Tuple[object, object], dict] = {}
+    for row in rows:
+        key = (row.get("symbol"), row.get("exchange"))
+        if any(v is None for v in key):
+            continue
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = row
+            continue
+        merged = dict(existing)
+        for field, value in row.items():
+            if value is not None:
+                merged[field] = value
+        deduped[key] = merged
+    return list(deduped.values())
+
+
+def upsert_latest_rows(db_url: str, rows: Sequence[dict]) -> None:
+    rows = _dedupe_latest_rows(rows)
+    if not rows:
+        return
+    conn = None
+    try:
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        records = [{k: row.get(k) for k in LATEST_KEYS} for row in rows]
+        execute_values(cur, LATEST_SQL, records, template=LATEST_TEMPLATE, page_size=500)
+        conn.commit()
+        log.info("Upserted %d futures_latest WS metric rows.", len(records))
+    except Exception as e:
+        log.error("futures_latest WS metric upsert failed: %s", e)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+
+def write_latest_rows(db_url: str, rows: Sequence[dict], dry_run: bool = False) -> None:
+    rows = _dedupe_latest_rows(rows)
+    if not rows:
+        return
+    if dry_run:
+        for row in rows:
+            log.info(
+                "[DRY RUN] latest %s %s price=%s oi_usd=%s funding=%s pred_funding=%s",
+                row.get("exchange"),
+                row.get("symbol"),
+                row.get("price"),
+                row.get("oi_usd"),
+                row.get("funding"),
+                row.get("pred_funding"),
+            )
+        return
+    upsert_latest_rows(db_url, rows)
+
+
+class LatestMetricWriter:
+    def __init__(self, db_url: str, dry_run: bool, flush_interval_s: int):
+        self.db_url = db_url
+        self.dry_run = dry_run
+        self.flush_interval_s = flush_interval_s
+        self._pending: Dict[Tuple[str, str], dict] = {}
+        self._lock = asyncio.Lock()
+
+    async def add(self, row: dict) -> None:
+        key = (row.get("symbol"), row.get("exchange"))
+        if any(value is None for value in key):
+            return
+        async with self._lock:
+            existing = self._pending.get(key, {})
+            merged = dict(existing)
+            for field, value in row.items():
+                if value is not None:
+                    merged[field] = value
+            self._pending[key] = merged
+
+    async def run(self) -> None:
+        while True:
+            await asyncio.sleep(self.flush_interval_s)
+            await self.flush()
+
+    async def flush(self) -> None:
+        async with self._lock:
+            rows = list(self._pending.values())
+            self._pending.clear()
+        if rows:
+            await asyncio.to_thread(write_latest_rows, self.db_url, rows, self.dry_run)
 
 
 def fetch_binance_rest_kline(base: str, symbol: str, candle_open_at: datetime) -> Optional[dict]:
@@ -650,6 +850,41 @@ async def run_binance_stream(
     await asyncio.gather(*tasks)
 
 
+async def run_binance_metrics_stream(
+    latest_writer: LatestMetricWriter,
+    symbols: List[Tuple[str, str]],
+    log_first_event: bool,
+    once_event: Optional[asyncio.Event],
+) -> None:
+    symbol_to_base = {sym: base for base, sym in symbols}
+    streams = "/".join(f"{sym.lower()}@markPrice@1s" for _, sym in symbols)
+    url = f"wss://fstream.binance.com/market/stream?streams={streams}"
+    logged_first_event = False
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=30) as ws:
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    row = normalize_binance_mark_price_ws(msg, symbol_to_base)
+                    if row:
+                        if log_first_event and not logged_first_event:
+                            log.info(
+                                "[PROBE] Binance markPrice received: symbol=%s price=%s pred_funding=%s",
+                                row.get("symbol"),
+                                row.get("price"),
+                                row.get("pred_funding"),
+                            )
+                            logged_first_event = True
+                        await latest_writer.add(row)
+                    if once_event and once_event.is_set():
+                        return
+        except Exception as e:
+            log.error("Binance metrics WS error: %s", e)
+            if once_event:
+                return
+            await asyncio.sleep(RECONNECT_DELAY_S)
+
+
 async def _run_binance_connection(
     db_url: str,
     url: str,
@@ -718,6 +953,46 @@ async def run_bybit_stream(
             )
         )
     await asyncio.gather(*tasks)
+
+
+async def run_bybit_metrics_stream(
+    latest_writer: LatestMetricWriter,
+    symbols: List[Tuple[str, str]],
+    log_first_event: bool,
+    once_event: Optional[asyncio.Event],
+) -> None:
+    symbol_to_base = {sym: base for base, sym in symbols}
+    args = [f"tickers.{sym}" for _, sym in symbols]
+    logged_first_event = False
+    while True:
+        try:
+            async with websockets.connect(
+                "wss://stream.bybit.com/v5/public/linear",
+                ping_interval=20,
+                ping_timeout=30,
+            ) as ws:
+                await ws.send(json.dumps({"op": "subscribe", "args": args}))
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    row = normalize_bybit_ticker_ws(msg, symbol_to_base)
+                    if row:
+                        if log_first_event and not logged_first_event:
+                            log.info(
+                                "[PROBE] Bybit ticker received: symbol=%s price=%s oi_usd=%s pred_funding=%s",
+                                row.get("symbol"),
+                                row.get("price"),
+                                row.get("oi_usd"),
+                                row.get("pred_funding"),
+                            )
+                            logged_first_event = True
+                        await latest_writer.add(row)
+                    if once_event and once_event.is_set():
+                        return
+        except Exception as e:
+            log.error("Bybit metrics WS error: %s", e)
+            if once_event:
+                return
+            await asyncio.sleep(RECONNECT_DELAY_S)
 
 
 async def _run_bybit_connection(
@@ -796,6 +1071,55 @@ async def run_okx_stream(
     await asyncio.gather(*tasks)
 
 
+async def run_okx_metrics_stream(
+    latest_writer: LatestMetricWriter,
+    symbols: List[Tuple[str, str]],
+    log_first_event: bool,
+    once_event: Optional[asyncio.Event],
+) -> None:
+    inst_to_meta = {inst: (base, f"{base}USDT") for base, inst in symbols}
+    args = []
+    for _, inst in symbols:
+        args.extend(
+            [
+                {"channel": "mark-price", "instId": inst},
+                {"channel": "funding-rate", "instId": inst},
+                {"channel": "open-interest", "instId": inst},
+            ]
+        )
+    logged_first_event = False
+    while True:
+        try:
+            async with websockets.connect(
+                "wss://ws.okx.com:8443/ws/v5/public",
+                ping_interval=20,
+                ping_timeout=30,
+            ) as ws:
+                await ws.send(json.dumps({"op": "subscribe", "args": args}))
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    row = normalize_okx_metrics_ws(msg, inst_to_meta)
+                    if row:
+                        if log_first_event and not logged_first_event:
+                            log.info(
+                                "[PROBE] OKX metrics received: symbol=%s price=%s oi_usd=%s funding=%s pred_funding=%s",
+                                row.get("symbol"),
+                                row.get("price"),
+                                row.get("oi_usd"),
+                                row.get("funding"),
+                                row.get("pred_funding"),
+                            )
+                            logged_first_event = True
+                        await latest_writer.add(row)
+                    if once_event and once_event.is_set():
+                        return
+        except Exception as e:
+            log.error("OKX metrics WS error: %s", e)
+            if once_event:
+                return
+            await asyncio.sleep(RECONNECT_DELAY_S)
+
+
 async def _run_okx_connection(
     db_url: str,
     args: List[dict],
@@ -855,6 +1179,8 @@ async def run_daemon(
     dry_run: bool,
     log_first_event: bool,
     probe_seconds: Optional[int],
+    metrics_ws: bool,
+    metrics_flush_interval_s: int,
     once: bool,
 ) -> None:
     assets = [base.strip().upper() for base in bases if base.strip()] if bases else load_top_assets(db_url, top_n, top_active=top_active)
@@ -864,8 +1190,11 @@ async def run_daemon(
     resolved = resolve_exchange_symbols(assets)
     symbol_maps = _build_symbol_maps(resolved)
     once_event = asyncio.Event() if once else None
+    latest_writer = LatestMetricWriter(db_url, dry_run, metrics_flush_interval_s)
 
     tasks = []
+    if metrics_ws:
+        tasks.append(asyncio.create_task(latest_writer.run()))
     for exchange in exchanges:
         symbols = resolved.get(exchange, [])
         log.info("Resolved %s kline symbols: %d/%d assets supported", exchange, len(symbols), len(assets))
@@ -886,6 +1215,12 @@ async def run_daemon(
                     )
                 )
             )
+            if metrics_ws:
+                tasks.append(
+                    asyncio.create_task(
+                        run_binance_metrics_stream(latest_writer, symbols, log_first_event, once_event)
+                    )
+                )
         elif exchange == "bybit":
             tasks.append(
                 asyncio.create_task(
@@ -901,6 +1236,12 @@ async def run_daemon(
                     )
                 )
             )
+            if metrics_ws:
+                tasks.append(
+                    asyncio.create_task(
+                        run_bybit_metrics_stream(latest_writer, symbols, log_first_event, once_event)
+                    )
+                )
         elif exchange == "okx":
             tasks.append(
                 asyncio.create_task(
@@ -916,6 +1257,12 @@ async def run_daemon(
                     )
                 )
             )
+            if metrics_ws:
+                tasks.append(
+                    asyncio.create_task(
+                        run_okx_metrics_stream(latest_writer, symbols, log_first_event, once_event)
+                    )
+                )
         else:
             log.warning("Unknown exchange: %s", exchange)
 
@@ -929,6 +1276,7 @@ async def run_daemon(
 
     if once_event:
         await once_event.wait()
+        await latest_writer.flush()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -936,6 +1284,7 @@ async def run_daemon(
     if probe_seconds:
         await asyncio.sleep(probe_seconds)
         log.info("Probe window elapsed after %ds; stopping daemon.", probe_seconds)
+        await latest_writer.flush()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -954,6 +1303,9 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Log normalized rows without writing to the database")
     parser.add_argument("--log-first-event", action="store_true", help="Log the first open/closed WebSocket kline event per connection")
     parser.add_argument("--probe-seconds", type=int, default=None, help="Stop after N seconds; useful with --dry-run")
+    parser.add_argument("--no-metrics-ws", action="store_true", help="Disable WebSocket updates for futures_latest metrics")
+    parser.add_argument("--metrics-flush-interval", type=int, default=DEFAULT_METRICS_FLUSH_INTERVAL_S,
+                        help="Seconds between batched futures_latest WS metric writes")
     parser.add_argument("--once", action="store_true", help="Exit after first closed WS kline")
     args = parser.parse_args()
 
@@ -988,6 +1340,8 @@ def main() -> None:
             dry_run=args.dry_run,
             log_first_event=args.log_first_event,
             probe_seconds=args.probe_seconds,
+            metrics_ws=not args.no_metrics_ws,
+            metrics_flush_interval_s=args.metrics_flush_interval,
             once=args.once,
         )
     )

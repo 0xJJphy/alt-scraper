@@ -302,31 +302,32 @@ class BinanceFetcher:
     MAX_WORKERS = 6
     REQUEST_INTERVAL = 0.04
 
-    def fetch(self, symbols: List[Tuple[str, str]]) -> List[dict]:
+    def fetch(self, symbols: List[Tuple[str, str]], ls_only: bool = False) -> List[dict]:
         limiter = RateLimiter(self.REQUEST_INTERVAL)
 
         def fetch_one(base: str, sym: str) -> dict:
             polled_at = datetime.now(UTC)
             row = {"symbol": sym, "exchange": self.EXCHANGE, "base_asset": base, "polled_at": polled_at}
 
-            # Mark price + predicted funding (fetch first — needed for OI USD calc)
-            pm = _limited_binance_get(limiter, "/fapi/v1/premiumIndex", {"symbol": sym})
-            if pm:
-                row["price"]        = _safe_float(pm.get("markPrice"))
-                row["pred_funding"] = _safe_float(pm.get("lastFundingRate"))
+            if not ls_only:
+                # Mark price + predicted funding (fetch first — needed for OI USD calc)
+                pm = _limited_binance_get(limiter, "/fapi/v1/premiumIndex", {"symbol": sym})
+                if pm:
+                    row["price"]        = _safe_float(pm.get("markPrice"))
+                    row["pred_funding"] = _safe_float(pm.get("lastFundingRate"))
 
-            # Open Interest — returned in base asset, convert to USD using mark price
-            oi_data = _limited_binance_get(limiter, "/fapi/v1/openInterest", {"symbol": sym})
-            if oi_data:
-                oi_base = _safe_float(oi_data.get("openInterest"))
-                price   = row.get("price")
-                if oi_base and price:
-                    row["oi_usd"] = oi_base * price
+                # Open Interest — returned in base asset, convert to USD using mark price
+                oi_data = _limited_binance_get(limiter, "/fapi/v1/openInterest", {"symbol": sym})
+                if oi_data:
+                    oi_base = _safe_float(oi_data.get("openInterest"))
+                    price   = row.get("price")
+                    if oi_base and price:
+                        row["oi_usd"] = oi_base * price
 
-            # Current funding rate (from fundingRate endpoint)
-            fr = _limited_binance_get(limiter, "/fapi/v1/fundingRate", {"symbol": sym, "limit": 1})
-            if fr and isinstance(fr, list) and fr:
-                row["funding"] = _safe_float(fr[0].get("fundingRate"))
+                # Current funding rate (from fundingRate endpoint)
+                fr = _limited_binance_get(limiter, "/fapi/v1/fundingRate", {"symbol": sym, "limit": 1})
+                if fr and isinstance(fr, list) and fr:
+                    row["funding"] = _safe_float(fr[0].get("fundingRate"))
 
             # L/S ratios
             r_gl = _limited_binance_get(limiter, "/futures/data/globalLongShortAccountRatio",
@@ -413,35 +414,36 @@ class BybitFetcher:
     MAX_WORKERS = 5
     REQUEST_INTERVAL = 0.05
 
-    def fetch(self, symbols: List[Tuple[str, str]]) -> List[dict]:
+    def fetch(self, symbols: List[Tuple[str, str]], ls_only: bool = False) -> List[dict]:
         limiter = RateLimiter(self.REQUEST_INTERVAL)
 
         def fetch_one(base: str, sym: str) -> dict:
             polled_at = datetime.now(UTC)
             row = {"symbol": sym, "exchange": self.EXCHANGE, "base_asset": base, "polled_at": polled_at}
 
-            # Ticker (price + predicted funding)
-            tickers = _limited_get(limiter, f"{BYBIT_V5_API}/market/tickers",
-                                   {"category": "linear", "symbol": sym})
-            if tickers:
-                result = tickers.get("result", {}).get("list", [])
-                if result:
-                    t = result[0]
-                    row["price"]        = _safe_float(t.get("markPrice"))
-                    row["pred_funding"] = _safe_float(t.get("fundingRate"))
-                    # OI in base asset — convert to USD
-                    oi_base = _safe_float(t.get("openInterest"))
-                    price   = row.get("price")
-                    if oi_base and price:
-                        row["oi_usd"] = oi_base * price
+            if not ls_only:
+                # Ticker (price + predicted funding)
+                tickers = _limited_get(limiter, f"{BYBIT_V5_API}/market/tickers",
+                                       {"category": "linear", "symbol": sym})
+                if tickers:
+                    result = tickers.get("result", {}).get("list", [])
+                    if result:
+                        t = result[0]
+                        row["price"]        = _safe_float(t.get("markPrice"))
+                        row["pred_funding"] = _safe_float(t.get("fundingRate"))
+                        # OI in base asset — convert to USD
+                        oi_base = _safe_float(t.get("openInterest"))
+                        price   = row.get("price")
+                        if oi_base and price:
+                            row["oi_usd"] = oi_base * price
 
-            # Latest funding rate paid
-            funding_hist = _limited_get(limiter, f"{BYBIT_V5_API}/market/funding/history",
-                                        {"category": "linear", "symbol": sym, "limit": 1})
-            if funding_hist:
-                flist = funding_hist.get("result", {}).get("list", [])
-                if flist:
-                    row["funding"] = _safe_float(flist[0].get("fundingRate"))
+                # Latest funding rate paid
+                funding_hist = _limited_get(limiter, f"{BYBIT_V5_API}/market/funding/history",
+                                            {"category": "linear", "symbol": sym, "limit": 1})
+                if funding_hist:
+                    flist = funding_hist.get("result", {}).get("list", [])
+                    if flist:
+                        row["funding"] = _safe_float(flist[0].get("fundingRate"))
 
             # L/S ratio (account ratio)
             ls = _limited_get(limiter, f"{BYBIT_V5_API}/market/account-ratio",
@@ -513,7 +515,7 @@ class OKXFetcher:
     MAX_WORKERS = 5
     REQUEST_INTERVAL = 0.06
 
-    def fetch(self, symbols: List[Tuple[str, str]]) -> List[dict]:
+    def fetch(self, symbols: List[Tuple[str, str]], ls_only: bool = False) -> List[dict]:
         limiter = RateLimiter(self.REQUEST_INTERVAL)
 
         def fetch_one(base: str, inst: str) -> dict:
@@ -521,28 +523,29 @@ class OKXFetcher:
             sym  = f"{base}USDT"
             row  = {"symbol": sym, "exchange": self.EXCHANGE, "base_asset": base, "polled_at": polled_at}
 
-            # Ticker (price)
-            ticker = _limited_get(limiter, f"{OKX_V5_API}/market/ticker", {"instId": inst})
-            if ticker:
-                data = ticker.get("data", [])
-                if data:
-                    row["price"] = _safe_float(data[0].get("markPx") or data[0].get("last"))
+            if not ls_only:
+                # Ticker (price)
+                ticker = _limited_get(limiter, f"{OKX_V5_API}/market/ticker", {"instId": inst})
+                if ticker:
+                    data = ticker.get("data", [])
+                    if data:
+                        row["price"] = _safe_float(data[0].get("markPx") or data[0].get("last"))
 
-            # Open Interest (in USD — OKX returns in contracts, each = 1 USD for USDT swaps)
-            oi = _limited_get(limiter, f"{OKX_V5_API}/public/open-interest", {"instId": inst})
-            if oi:
-                data = oi.get("data", [])
-                if data:
-                    # oiUsd is directly in USD value
-                    row["oi_usd"] = _safe_float(data[0].get("oiUsd"))
+                # Open Interest (in USD — OKX returns in contracts, each = 1 USD for USDT swaps)
+                oi = _limited_get(limiter, f"{OKX_V5_API}/public/open-interest", {"instId": inst})
+                if oi:
+                    data = oi.get("data", [])
+                    if data:
+                        # oiUsd is directly in USD value
+                        row["oi_usd"] = _safe_float(data[0].get("oiUsd"))
 
-            # Funding rate
-            fr = _limited_get(limiter, f"{OKX_V5_API}/public/funding-rate", {"instId": inst})
-            if fr:
-                data = fr.get("data", [])
-                if data:
-                    row["funding"]      = _safe_float(data[0].get("fundingRate"))
-                    row["pred_funding"] = _safe_float(data[0].get("nextFundingRate"))
+                # Funding rate
+                fr = _limited_get(limiter, f"{OKX_V5_API}/public/funding-rate", {"instId": inst})
+                if fr:
+                    data = fr.get("data", [])
+                    if data:
+                        row["funding"]      = _safe_float(data[0].get("fundingRate"))
+                        row["pred_funding"] = _safe_float(data[0].get("nextFundingRate"))
 
             # L/S ratios (Rubik stats — by base currency, not instId)
             params = {"ccy": base.upper(), "period": "5m"}
@@ -898,7 +901,14 @@ FETCHER_MAP = {
 }
 
 
-def run_once(db_url: str, top_n: Optional[int], exchanges: List[str], top_active: Optional[int] = None):
+def run_once(
+    db_url: str,
+    top_n: Optional[int],
+    exchanges: List[str],
+    top_active: Optional[int] = None,
+    skip_klines: bool = False,
+    ls_only: bool = False,
+):
     assets = load_top_assets(db_url, top_n, top_active=top_active)
     if not assets:
         log.warning("No assets loaded — skipping poll cycle.")
@@ -927,7 +937,7 @@ def run_once(db_url: str, top_n: Optional[int], exchanges: List[str], top_active
             log.warning("No supported symbols resolved for %s — skipping.", ex)
             return []
         log.info("Polling %s for %d supported symbols...", ex, len(symbols))
-        rows = cls().fetch(symbols)
+        rows = cls().fetch(symbols, ls_only=ls_only)
         log.info("  %s → %d rows fetched.", ex, len(rows))
         return rows
 
@@ -945,21 +955,24 @@ def run_once(db_url: str, top_n: Optional[int], exchanges: List[str], top_active
 
     all_rows = []
     kline_rows = []
-    with ThreadPoolExecutor(max_workers=len(exchanges)) as metrics_executor, \
-            ThreadPoolExecutor(max_workers=len(exchanges)) as kline_executor:
+    with ThreadPoolExecutor(max_workers=len(exchanges)) as metrics_executor:
         metric_futures = {metrics_executor.submit(_fetch, ex): ex for ex in exchanges}
-        kline_futures = {kline_executor.submit(_fetch_klines, ex): ex for ex in exchanges}
 
-        for future in as_completed(kline_futures):
-            ex = kline_futures[future]
-            try:
-                rows = future.result()
-                if not rows:
-                    log.warning("  %s returned 0 closed 15m klines.", ex)
-                kline_rows.extend(rows)
-            except Exception as e:
-                log.error("  %s 15m kline fetch error: %s", ex, e)
-        upsert_klines_15m(db_url, kline_rows)
+        if skip_klines:
+            log.info("Skipping REST 15m kline polling; futures_ws_daemon owns futures_klines_15m.")
+        else:
+            with ThreadPoolExecutor(max_workers=len(exchanges)) as kline_executor:
+                kline_futures = {kline_executor.submit(_fetch_klines, ex): ex for ex in exchanges}
+                for future in as_completed(kline_futures):
+                    ex = kline_futures[future]
+                    try:
+                        rows = future.result()
+                        if not rows:
+                            log.warning("  %s returned 0 closed 15m klines.", ex)
+                        kline_rows.extend(rows)
+                    except Exception as e:
+                        log.error("  %s 15m kline fetch error: %s", ex, e)
+                upsert_klines_15m(db_url, kline_rows)
 
         for future in as_completed(metric_futures):
             ex = metric_futures[future]
@@ -997,6 +1010,10 @@ def main():
     parser.add_argument("--interval",   type=int,   default=DEFAULT_POLL_INTERVAL, help="Poll interval in seconds (default 900)")
     parser.add_argument("--no-align-15m", action="store_true",
                         help="Disable default alignment to UTC 15m candle closes. Only relevant when --interval is 900.")
+    parser.add_argument("--skip-klines", action="store_true",
+                        help="Do not poll REST 15m klines. Use when futures_ws_daemon owns futures_klines_15m.")
+    parser.add_argument("--ls-only", action="store_true",
+                        help="Only poll REST long/short ratios; use WS daemon for live price/funding/OI where available.")
     parser.add_argument("--once",       action="store_true", help="Run one poll cycle then exit (useful for testing)")
     args = parser.parse_args()
 
@@ -1018,7 +1035,14 @@ def main():
     )
 
     if args.once:
-        run_once(db_url, args.top, exchanges, top_active=args.top_active)
+        run_once(
+            db_url,
+            args.top,
+            exchanges,
+            top_active=args.top_active,
+            skip_klines=args.skip_klines,
+            ls_only=args.ls_only,
+        )
         return
 
     while True:
@@ -1026,7 +1050,14 @@ def main():
             _sleep_until_aligned_poll()
         start = time.monotonic()
         try:
-            run_once(db_url, args.top, exchanges, top_active=args.top_active)
+            run_once(
+                db_url,
+                args.top,
+                exchanges,
+                top_active=args.top_active,
+                skip_klines=args.skip_klines,
+                ls_only=args.ls_only,
+            )
         except Exception as e:
             log.error("Unexpected error in poll cycle: %s", e)
             _telegram(f"🔴 *alt-scraper-realtime*: unexpected error in poll cycle\n`{e}`")
