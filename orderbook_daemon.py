@@ -41,6 +41,8 @@ log = logging.getLogger("orderbook")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+DB_WRITE_MAX_ATTEMPTS = 3
+DB_WRITE_RETRY_DELAY  = 10
 
 # Historical CMC symbols can differ from current exchange tickers after renames.
 # Keep base_asset unchanged in DB rows, but subscribe to the live exchange alias.
@@ -438,14 +440,34 @@ def _to_latest_row(symbol, exchange, base_asset, market_type, m: dict, polled_at
 def _db_write(db_url: str, rows: list, sql: str) -> None:
     if not rows:
         return
-    conn = psycopg2.connect(db_url)
-    try:
-        cur = conn.cursor()
-        psycopg2.extras.execute_values(cur, sql, rows, page_size=200)
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+    last_error = None
+    for attempt in range(1, DB_WRITE_MAX_ATTEMPTS + 1):
+        conn = None
+        try:
+            conn = psycopg2.connect(db_url)
+            cur = conn.cursor()
+            psycopg2.extras.execute_values(cur, sql, rows, page_size=200)
+            conn.commit()
+            cur.close()
+            return
+        except Exception as e:
+            last_error = e
+            if conn:
+                conn.rollback()
+            if attempt < DB_WRITE_MAX_ATTEMPTS:
+                log.warning(
+                    "DB write failed (attempt %d/%d): %s; retrying in %ds",
+                    attempt,
+                    DB_WRITE_MAX_ATTEMPTS,
+                    e,
+                    DB_WRITE_RETRY_DELAY,
+                )
+                time.sleep(DB_WRITE_RETRY_DELAY)
+            else:
+                raise last_error
+        finally:
+            if conn:
+                conn.close()
 
 
 # ---------------------------------------------------------------------------
