@@ -27,6 +27,7 @@ import logging
 import requests
 import psycopg2
 import threading
+import socket
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple, Union
@@ -88,10 +89,11 @@ def _telegram(msg: str) -> None:
     """Send a Telegram message. Silently no-ops if credentials are not set."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    context = f"\n\n_host:_ `{socket.gethostname()}`\n_pid:_ `{os.getpid()}`\n_cwd:_ `{os.getcwd()}`"
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"{msg}{context}", "parse_mode": "Markdown"},
             timeout=10,
         )
     except Exception:
@@ -834,6 +836,10 @@ def upsert_klines_15m(db_url: str, rows: List[dict]):
 # Asset loader
 # ==============================================================================
 
+_LOAD_ASSETS_MAX_ATTEMPTS = 3
+_LOAD_ASSETS_RETRY_DELAY  = 30  # seconds; 3×30s covers a brief DB backup/restart window
+
+
 def load_top_assets(db_url: str, top_n: Optional[int], top_active: Optional[int] = None) -> List[str]:
     """
     Return base_assets to poll, ordered by current market_cap_rank.
@@ -845,49 +851,91 @@ def load_top_assets(db_url: str, top_n: Optional[int], top_active: Optional[int]
     When --top-active N is set, restricts to only the top N assets by their
     current market_cap_rank. Useful to reduce load if the full universe causes
     rate-limit pressure on the exchanges.
+
+    Retries up to _LOAD_ASSETS_MAX_ATTEMPTS times so transient DB outages
+    (e.g. backup window) don't trigger a false "no assets" Telegram alert.
     """
-    conn = None
-    try:
-        conn = psycopg2.connect(db_url)
-        cur  = conn.cursor()
+    for attempt in range(1, _LOAD_ASSETS_MAX_ATTEMPTS + 1):
+        conn = None
+        try:
+            conn = psycopg2.connect(db_url)
+            cur  = conn.cursor()
 
-        if top_active is not None:
-            # Restricted mode: only top N currently active assets
-            log.info("Asset load mode: TOP-ACTIVE %d (current rank only)", top_active)
-            cur.execute("""
-                SELECT symbol FROM asset_metadata
-                WHERE (is_filtered = false OR is_filtered IS NULL)
-                ORDER BY market_cap_rank ASC NULLS LAST
-                LIMIT %s
-            """, (top_active,))
-        elif top_n is not None:
-            # Legacy explicit limit
-            log.info("Asset load mode: TOP %d (legacy limit)", top_n)
-            cur.execute("""
-                SELECT symbol FROM asset_metadata
-                WHERE (is_filtered = false OR is_filtered IS NULL)
-                ORDER BY market_cap_rank ASC NULLS LAST
-                LIMIT %s
-            """, (top_n,))
-        else:
-            # Default: full tracked universe — all assets that were ever in top-N
-            log.info("Asset load mode: FULL UNIVERSE (ever_in_top_50 = true)")
-            cur.execute("""
-                SELECT symbol FROM asset_metadata
-                WHERE (is_filtered = false OR is_filtered IS NULL)
-                  AND (ever_in_top_50 = true OR market_cap_rank IS NOT NULL)
-                ORDER BY market_cap_rank ASC NULLS LAST
-            """)
+            if top_active is not None:
+                # Restricted mode: only top N currently active assets
+                log.info("Asset load mode: TOP-ACTIVE %d (current rank only)", top_active)
+                cur.execute("""
+                    SELECT symbol FROM asset_metadata
+                    WHERE (is_filtered = false OR is_filtered IS NULL)
+                    ORDER BY market_cap_rank ASC NULLS LAST
+                    LIMIT %s
+                """, (top_active,))
+            elif top_n is not None:
+                # Legacy explicit limit
+                log.info("Asset load mode: TOP %d (legacy limit)", top_n)
+                cur.execute("""
+                    SELECT symbol FROM asset_metadata
+                    WHERE (is_filtered = false OR is_filtered IS NULL)
+                    ORDER BY market_cap_rank ASC NULLS LAST
+                    LIMIT %s
+                """, (top_n,))
+            else:
+                # Default: full tracked universe — all assets that were ever in top-N
+                log.info("Asset load mode: FULL UNIVERSE (ever_in_top_50 = true)")
+                cur.execute("""
+                    SELECT symbol FROM asset_metadata
+                    WHERE (is_filtered = false OR is_filtered IS NULL)
+                      AND (ever_in_top_50 = true OR market_cap_rank IS NOT NULL)
+                    ORDER BY market_cap_rank ASC NULLS LAST
+                """)
 
-        assets = [row[0] for row in cur.fetchall()]
-        log.info("Loaded %d assets to poll.", len(assets))
-        return assets
-    except Exception as e:
-        log.error("Failed to load assets: %s", e)
-        return []
-    finally:
-        if conn:
-            conn.close()
+            assets = [row[0] for row in cur.fetchall()]
+            if not assets and top_active is None and top_n is None:
+                log.warning(
+                    "Primary full-universe asset query returned 0 rows; "
+                    "falling back to market_cap_history ever_in_top_50."
+                )
+                try:
+                    cur.execute("""
+                        SELECT DISTINCT ON (m.symbol) m.symbol
+                        FROM market_cap_history m
+                        LEFT JOIN asset_metadata am ON am.symbol = m.symbol
+                        WHERE m.ever_in_top_50 = true
+                          AND (am.is_filtered = false OR am.is_filtered IS NULL)
+                        ORDER BY m.symbol, m.date DESC
+                    """)
+                    assets = [row[0] for row in cur.fetchall()]
+                    log.info("Fallback market_cap_history loaded %d assets.", len(assets))
+                except Exception as e:
+                    log.warning("market_cap_history fallback failed: %s", e)
+
+            if not assets:
+                log.warning(
+                    "Asset query returned 0 rows; falling back to unfiltered asset_metadata symbols."
+                )
+                cur.execute("""
+                    SELECT symbol FROM asset_metadata
+                    WHERE (is_filtered = false OR is_filtered IS NULL)
+                    ORDER BY market_cap_rank ASC NULLS LAST, symbol ASC
+                """)
+                assets = [row[0] for row in cur.fetchall()]
+                log.info("Fallback asset_metadata loaded %d assets.", len(assets))
+
+            log.info("Loaded %d assets to poll.", len(assets))
+            return assets
+        except Exception as e:
+            if attempt < _LOAD_ASSETS_MAX_ATTEMPTS:
+                log.warning(
+                    "Failed to load assets (attempt %d/%d): %s — retrying in %ds",
+                    attempt, _LOAD_ASSETS_MAX_ATTEMPTS, e, _LOAD_ASSETS_RETRY_DELAY,
+                )
+                time.sleep(_LOAD_ASSETS_RETRY_DELAY)
+            else:
+                log.error("Failed to load assets after %d attempts: %s", _LOAD_ASSETS_MAX_ATTEMPTS, e)
+                return []
+        finally:
+            if conn:
+                conn.close()
 
 
 # ==============================================================================
