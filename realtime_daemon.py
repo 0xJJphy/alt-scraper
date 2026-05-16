@@ -56,8 +56,10 @@ BINANCE_FUTURES_APIS = [
 BYBIT_V5_API        = "https://api.bybit.com/v5"
 OKX_V5_API          = "https://www.okx.com/api/v5"
 
-DEFAULT_POLL_INTERVAL = 900   # 15 minutes
-DEFAULT_EXCHANGES     = ["binance", "bybit", "okx"]
+DEFAULT_POLL_INTERVAL     = 900   # 15 minutes
+DEFAULT_EXCHANGES         = ["binance", "bybit", "okx"]
+_ALERT_COOLDOWN_SECONDS   = 3600  # suppress repeated Telegram alerts of the same type for 1h
+_last_alert_sent: dict    = {}
 KLINE_INTERVAL_MS     = 15 * 60 * 1000
 KLINE_SETTLE_DELAY_MS = 5_000
 KLINE_SETTLE_DELAY_S  = KLINE_SETTLE_DELAY_MS / 1000
@@ -72,6 +74,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 _binance_api_idx = 0
 _binance_api_lock = threading.Lock()
+_exchange_syms_cache: dict = {}  # last successful raw symbol sets per exchange
 
 # Historical CMC symbols may differ from current exchange tickers after renames.
 _SYMBOL_ALIASES = {
@@ -85,10 +88,18 @@ _SYMBOL_CANONICAL = {
 }
 
 
-def _telegram(msg: str) -> None:
-    """Send a Telegram message. Silently no-ops if credentials are not set."""
+def _telegram(msg: str, key: str = None) -> None:
+    """Send a Telegram message. Silently no-ops if credentials are not set.
+
+    Pass key to suppress duplicate alerts of the same type for _ALERT_COOLDOWN_SECONDS.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    if key is not None:
+        now = time.monotonic()
+        if now - _last_alert_sent.get(key, 0.0) < _ALERT_COOLDOWN_SECONDS:
+            return
+        _last_alert_sent[key] = now
     context = f"\n\n_host:_ `{socket.gethostname()}`\n_pid:_ `{os.getpid()}`\n_cwd:_ `{os.getcwd()}`"
     try:
         requests.post(
@@ -224,7 +235,11 @@ def _sleep_until_aligned_poll() -> None:
 
 
 def resolve_exchange_symbols(base_assets: List[str]) -> Dict[str, List[Tuple[str, str]]]:
-    """Resolve only currently-listed USDT perpetual symbols per exchange."""
+    """Resolve only currently-listed USDT perpetual symbols per exchange.
+
+    Falls back to the last successful resolution when an exchange's instrument
+    API fails transiently, preventing false "0 rows" Telegram alerts.
+    """
     resolved = {"binance": [], "bybit": [], "okx": []}
 
     # Binance USDT-M futures: {BASE}USDT or 1000{BASE}USDT for some meme contracts.
@@ -234,6 +249,11 @@ def resolve_exchange_symbols(base_assets: List[str]) -> Dict[str, List[Tuple[str
         for s in (b_data or {}).get("symbols", [])
         if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
     }
+    if b_syms:
+        _exchange_syms_cache["binance"] = b_syms
+    elif "binance" in _exchange_syms_cache:
+        log.warning("Binance exchangeInfo failed — using cached symbol list (%d symbols).", len(_exchange_syms_cache["binance"]))
+        b_syms = _exchange_syms_cache["binance"]
 
     # Bybit linear contracts.
     by_data = _get(
@@ -246,6 +266,11 @@ def resolve_exchange_symbols(base_assets: List[str]) -> Dict[str, List[Tuple[str
         for s in (by_data or {}).get("result", {}).get("list", [])
         if s.get("quoteCoin") == "USDT" and s.get("status") == "Trading"
     }
+    if by_syms:
+        _exchange_syms_cache["bybit"] = by_syms
+    elif "bybit" in _exchange_syms_cache:
+        log.warning("Bybit instruments-info failed — using cached symbol list (%d symbols).", len(_exchange_syms_cache["bybit"]))
+        by_syms = _exchange_syms_cache["bybit"]
 
     # OKX USDT swaps. Map ctValCcy -> instId.
     okx_data = _get(
@@ -258,6 +283,11 @@ def resolve_exchange_symbols(base_assets: List[str]) -> Dict[str, List[Tuple[str
         for s in (okx_data or {}).get("data", [])
         if s.get("settleCcy") == "USDT" and s.get("state") == "live"
     }
+    if okx_syms:
+        _exchange_syms_cache["okx"] = okx_syms
+    elif "okx" in _exchange_syms_cache:
+        log.warning("OKX instruments failed — using cached symbol list (%d symbols).", len(_exchange_syms_cache["okx"]))
+        okx_syms = _exchange_syms_cache["okx"]
 
     for base in base_assets:
         store_base = _SYMBOL_CANONICAL.get(base, base)
@@ -960,7 +990,7 @@ def run_once(
     assets = load_top_assets(db_url, top_n, top_active=top_active)
     if not assets:
         log.warning("No assets loaded — skipping poll cycle.")
-        _telegram("⚠️ *alt-scraper-realtime*: no assets loaded from metadata — poll skipped.")
+        _telegram("⚠️ *alt-scraper-realtime*: no assets loaded from metadata — poll skipped.", key="no_assets")
         return
 
     resolved = resolve_exchange_symbols(assets)
@@ -1038,7 +1068,8 @@ def run_once(
         _telegram(
             f"⚠️ *alt-scraper-realtime*: exchange(s) returned 0 rows\n"
             f"*Failed:* {', '.join(failed_exchanges)}\n"
-            f"*Time:* {now.strftime('%Y-%m-%d %H:%M UTC')}"
+            f"*Time:* {now.strftime('%Y-%m-%d %H:%M UTC')}",
+            key="zero_rows",
         )
 
     upsert_rows(db_url, all_rows)
