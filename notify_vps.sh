@@ -40,7 +40,7 @@ case $EVENT_TYPE in
 
 *Últimas 15 líneas del log:*
 \`\`\`
-$(journalctl -u "$UNIT" -n 15 --no-pager | sed 's/`//g')
+$(journalctl -u "$UNIT" --since "2 minutes ago" --no-pager | sed 's/`//g')
 \`\`\`"
         ;;
     *)
