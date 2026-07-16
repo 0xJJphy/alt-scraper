@@ -998,8 +998,9 @@ CREATE INDEX IF NOT EXISTS idx_fis_base_at ON futures_intraday_snapshots(base_as
 CREATE INDEX IF NOT EXISTS idx_fis_symbol_at ON futures_intraday_snapshots(symbol, exchange, snapshot_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fis_at ON futures_intraday_snapshots(snapshot_at DESC);
 
+-- futures_snapshots is kept permanently (cheap: ~90-100 MB/year at 4x/day).
+-- Only futures_intraday_snapshots (operational, ~15min cadence) is purged.
 CREATE OR REPLACE FUNCTION purge_old_snapshots() RETURNS void AS $$
-    DELETE FROM futures_snapshots WHERE snapshot_at < NOW() - INTERVAL '90 days';
     DELETE FROM futures_intraday_snapshots WHERE snapshot_at < NOW() - INTERVAL '48 hours';
 $$ LANGUAGE sql;
 

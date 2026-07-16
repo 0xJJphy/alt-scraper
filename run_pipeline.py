@@ -181,8 +181,8 @@ def main():
         print(f"  [DB ERROR] Orderbook daily aggregation failed: {e}", flush=True)
         failed_steps.append("Orderbook Daily Metrics")
 
-    # 5. Purge snapshots older than 90 days
-    print("\n[5/5] Purging old snapshots + Refreshing Materialized Views...", flush=True)
+    # 5. Purge intraday_snapshots older than 48h (futures_snapshots kept permanently)
+    print("\n[5/5] Purging old intraday snapshots + Refreshing Materialized Views...", flush=True)
     try:
         conn = psycopg2.connect(db_url)
         conn.autocommit = True
