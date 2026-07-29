@@ -70,3 +70,13 @@ logs/
 data/
 *.csv
 *.dump
+
+# Service PID files
+run/
+
+# VPS & local synchronization / restore scripts
+*_vps*.sh
+restore_alt_scraper.sh
+pull_*.sh
+push_*.sh
+

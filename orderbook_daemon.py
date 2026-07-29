@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 import zlib
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -509,6 +510,21 @@ class BinanceFuturesStream:
     SYM_KEY     = "symbol_binance"
     CHUNK       = 200  # max stream subscriptions per WS connection
 
+    # /fapi/v1/depth weighs 20 at limit=1000 and 10 at limit=500, against a
+    # 2400/min per-IP budget. Firing ~150 inits at once costs 3000 and is
+    # guaranteed to 429; limit=500 halves it and INIT_SPACING_SEC keeps the
+    # sustained rate under the budget (10 weight / 0.5s = 1200/min).
+    REST_DEPTH_LIMIT  = 500
+    INIT_SPACING_SEC  = 0.5
+    # A book whose REST init failed emits no metrics, so it must be retried.
+    # Recovery cannot live in _apply_event: that only runs once a book is
+    # initialized, which is exactly what a failed init prevents.
+    INIT_WATCHDOG_SEC = 60
+    # Cap the pre-init buffer: events older than the snapshot are discarded on
+    # init anyway, so an unbounded list only leaks memory on a stuck symbol
+    # (depth@500ms is ~172k events/day).
+    PENDING_MAXLEN    = 500
+
     def __init__(self, assets: List[dict]):
         self.assets = [a for a in assets if a.get(self.SYM_KEY)]
         self.books: Dict[str, LocalOrderBook] = {}
@@ -516,14 +532,20 @@ class BinanceFuturesStream:
             sym = a[self.SYM_KEY].upper()
             self.books[sym] = LocalOrderBook(sym, self.EXCHANGE)
         self._last_u: Dict[str, int]     = {}
-        self._pending: Dict[str, list]   = {}   # events buffered before REST init
+        self._pending: Dict[str, deque]  = {}   # events buffered before REST init
         self._init_lock: Dict[str, bool] = {}   # prevent concurrent REST inits per symbol
         self._init_time: Dict[str, float] = {}  # timestamp of last successful init
+
+    def _buffer(self, symbol: str) -> deque:
+        buf = self._pending.get(symbol)
+        if buf is None:
+            buf = self._pending[symbol] = deque(maxlen=self.PENDING_MAXLEN)
+        return buf
 
     def _rest_snapshot(self, symbol: str) -> Tuple[int, list, list]:
         r = requests.get(
             f"{self.REST_BASE}{self.REST_DEPTH}",
-            params={"symbol": symbol, "limit": 1000},
+            params={"symbol": symbol, "limit": self.REST_DEPTH_LIMIT},
             timeout=15,
         )
         r.raise_for_status()
@@ -540,7 +562,7 @@ class BinanceFuturesStream:
             book = self.books[symbol]
             book.apply_snapshot(bids, asks)
             self._last_u[symbol] = last_id
-            for evt in self._pending.pop(symbol, []):
+            for evt in list(self._pending.pop(symbol, [])):
                 U, u = evt["U"], evt["u"]
                 if u < last_id:
                     continue
@@ -552,6 +574,27 @@ class BinanceFuturesStream:
             log.warning("binance init failed %s: %s", symbol, e)
         finally:
             self._init_lock.pop(symbol, None)
+
+    async def _init_watchdog(self) -> None:
+        """Reintenta los libros que quedaron sin inicializar.
+
+        Sin esto un 429 en el arranque deja el símbolo muerto para el resto de la
+        vida del proceso: el WS acumula eventos pero nunca llama a _apply_event,
+        que es donde vive el único reintento.
+        """
+        while True:
+            await asyncio.sleep(self.INIT_WATCHDOG_SEC)
+            stuck = [s for s, b in self.books.items()
+                     if not b.initialized and not self._init_lock.get(s)]
+            if not stuck:
+                continue
+            log.warning("binance watchdog: %d libros sin inicializar, reintentando",
+                        len(stuck))
+            for i, sym in enumerate(stuck):
+                self._init_lock[sym] = True
+                threading.Thread(target=self._init_book,
+                                 args=(sym, i * self.INIT_SPACING_SEC),
+                                 daemon=True).start()
 
     def _apply_event(self, symbol: str, evt: dict) -> None:
         pu = evt.get("pu")
@@ -565,7 +608,7 @@ class BinanceFuturesStream:
             elif not self._init_lock.get(symbol):
                 log.warning("binance seq gap %s pu=%s expected=%s, reinit", symbol, pu, expected)
                 self.books[symbol].initialized = False
-                self._pending[symbol] = []
+                self._pending[symbol] = deque(maxlen=self.PENDING_MAXLEN)
                 self._init_lock[symbol] = True
                 threading.Thread(target=self._init_book, args=(symbol, 2.0), daemon=True).start()
             return
@@ -574,13 +617,19 @@ class BinanceFuturesStream:
         self.books[symbol].apply_delta(bids, asks)
         self._last_u[symbol] = evt["u"]
 
-    async def _run_chunk(self, symbols: List[str]) -> None:
+    async def _run_chunk(self, symbols: List[str], init_offset: int = 0) -> None:
         streams = "/".join(f"{s.lower()}@depth@500ms" for s in symbols)
         url     = f"{self.WS_BASE}?streams={streams}"
         backoff = 5
-        for sym in symbols:
+        # Escalonado: todos los chunks comparten el presupuesto de peso de la IP,
+        # así que init_offset evita que dos chunks arranquen sobre el mismo hueco.
+        for i, sym in enumerate(symbols):
             self._init_lock[sym] = True
-            threading.Thread(target=self._init_book, args=(sym, 0.0), daemon=True).start()
+            threading.Thread(
+                target=self._init_book,
+                args=(sym, (init_offset + i) * self.INIT_SPACING_SEC),
+                daemon=True,
+            ).start()
         while True:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=30) as ws:
@@ -593,7 +642,7 @@ class BinanceFuturesStream:
                         if not symbol or symbol not in self.books:
                             continue
                         if not self.books[symbol].initialized:
-                            self._pending.setdefault(symbol, []).append(data)
+                            self._buffer(symbol).append(data)
                         else:
                             self._apply_event(symbol, data)
             except Exception as e:
@@ -604,7 +653,10 @@ class BinanceFuturesStream:
     async def run(self) -> None:
         symbols = [a[self.SYM_KEY].upper() for a in self.assets]
         chunks  = [symbols[i:i + self.CHUNK] for i in range(0, len(symbols), self.CHUNK)]
-        await asyncio.gather(*[self._run_chunk(chunk) for chunk in chunks])
+        tasks = [self._run_chunk(chunk, init_offset=i * self.CHUNK)
+                 for i, chunk in enumerate(chunks)]
+        tasks.append(self._init_watchdog())
+        await asyncio.gather(*tasks)
 
     def get_metrics(self) -> Dict[str, dict]:
         out = {}
@@ -873,6 +925,9 @@ class BinanceSpotStream(BinanceFuturesStream):
     EXCHANGE    = "binance"
     MARKET_TYPE = "spot"
     SYM_KEY     = "symbol_binance_spot"
+    # Spot /api/v3/depth: peso 5 a limit=500 (vs 25 a limit=5000), presupuesto
+    # 6000/min. Hereda el escalonado y el watchdog de la clase base.
+    REST_DEPTH_LIMIT = 500
 
     def _apply_event(self, symbol: str, evt: dict) -> None:
         # Spot diff depth stream uses U/u/b/a — same as futures but no pu field
@@ -884,7 +939,7 @@ class BinanceSpotStream(BinanceFuturesStream):
             if age >= 5.0 and not self._init_lock.get(symbol):
                 log.warning("binance spot seq gap %s U=%s expected=%s+1, reinit", symbol, U, expected)
                 self.books[symbol].initialized = False
-                self._pending[symbol] = []
+                self._pending[symbol] = deque(maxlen=self.PENDING_MAXLEN)
                 self._init_lock[symbol] = True
                 threading.Thread(target=self._init_book, args=(symbol, 2.0), daemon=True).start()
             return
