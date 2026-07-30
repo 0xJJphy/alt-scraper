@@ -535,6 +535,10 @@ class BinanceFuturesStream:
         self._pending: Dict[str, deque]  = {}   # events buffered before REST init
         self._init_lock: Dict[str, bool] = {}   # prevent concurrent REST inits per symbol
         self._init_time: Dict[str, float] = {}  # timestamp of last successful init
+        # Futures y spot comparten tickers (XLMUSDT existe en ambos) y la clase de
+        # spot hereda estos logs, así que sin el market_type no se puede saber qué
+        # mercado falló.
+        self._tag = f"{self.EXCHANGE} {self.MARKET_TYPE}"
 
     def _buffer(self, symbol: str) -> deque:
         buf = self._pending.get(symbol)
@@ -569,9 +573,9 @@ class BinanceFuturesStream:
                 if U <= last_id <= u:
                     self._apply_event(symbol, evt)
             self._init_time[symbol] = time.time()
-            log.info("binance init: %s (lastUpdateId=%d)", symbol, last_id)
+            log.info("%s init: %s (lastUpdateId=%d)", self._tag, symbol, last_id)
         except Exception as e:
-            log.warning("binance init failed %s: %s", symbol, e)
+            log.warning("%s init failed %s: %s", self._tag, symbol, e)
         finally:
             self._init_lock.pop(symbol, None)
 
@@ -588,8 +592,8 @@ class BinanceFuturesStream:
                      if not b.initialized and not self._init_lock.get(s)]
             if not stuck:
                 continue
-            log.warning("binance watchdog: %d libros sin inicializar, reintentando",
-                        len(stuck))
+            log.warning("%s watchdog: %d libros sin inicializar, reintentando",
+                        self._tag, len(stuck))
             for i, sym in enumerate(stuck):
                 self._init_lock[sym] = True
                 threading.Thread(target=self._init_book,
@@ -606,7 +610,7 @@ class BinanceFuturesStream:
                 # The book may have minor inconsistencies but it immediately stabilizes.
                 self._last_u[symbol] = evt["u"]
             elif not self._init_lock.get(symbol):
-                log.warning("binance seq gap %s pu=%s expected=%s, reinit", symbol, pu, expected)
+                log.warning("%s seq gap %s pu=%s expected=%s, reinit", self._tag, symbol, pu, expected)
                 self.books[symbol].initialized = False
                 self._pending[symbol] = deque(maxlen=self.PENDING_MAXLEN)
                 self._init_lock[symbol] = True
@@ -634,7 +638,7 @@ class BinanceFuturesStream:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=30) as ws:
                     backoff = 5
-                    log.info("binance WS connected (%d symbols)", len(symbols))
+                    log.info("%s WS connected (%d symbols)", self._tag, len(symbols))
                     async for raw in ws:
                         msg    = json.loads(raw)
                         data   = msg.get("data", msg)
@@ -646,7 +650,7 @@ class BinanceFuturesStream:
                         else:
                             self._apply_event(symbol, data)
             except Exception as e:
-                log.warning("binance WS error: %s — reconnecting in %ds", e, backoff)
+                log.warning("%s WS error: %s — reconnecting in %ds", self._tag, e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
 
@@ -937,7 +941,7 @@ class BinanceSpotStream(BinanceFuturesStream):
         if expected is not None and U > expected + 1:
             age = time.time() - self._init_time.get(symbol, 0)
             if age >= 5.0 and not self._init_lock.get(symbol):
-                log.warning("binance spot seq gap %s U=%s expected=%s+1, reinit", symbol, U, expected)
+                log.warning("%s seq gap %s U=%s expected=%s+1, reinit", self._tag, symbol, U, expected)
                 self.books[symbol].initialized = False
                 self._pending[symbol] = deque(maxlen=self.PENDING_MAXLEN)
                 self._init_lock[symbol] = True

@@ -149,6 +149,27 @@ class RateLimitBudgetTest(unittest.TestCase):
         self.assertEqual(delays, [200 * s.INIT_SPACING_SEC])
 
 
+class LogTagTest(unittest.TestCase):
+    """Futures y spot comparten tickers y la clase de spot hereda los logs de la
+    de futures, así que sin el market_type dos líneas idénticas pueden venir de
+    mercados distintos."""
+
+    def test_tag_distinguishes_futures_from_spot(self):
+        self.assertEqual(BinanceFuturesStream(ASSETS)._tag, "binance futures")
+        self.assertEqual(BinanceSpotStream(ASSETS)._tag, "binance spot")
+
+    def test_init_log_carries_the_market_type(self):
+        for cls, expected in ((BinanceFuturesStream, "binance futures"),
+                              (BinanceSpotStream, "binance spot")):
+            s = cls(ASSETS)
+            with mock.patch.object(s, "_rest_snapshot",
+                                   return_value=(10, [(100.0, 1.0)], [(101.0, 1.0)])):
+                with self.assertLogs("orderbook", level="INFO") as cm:
+                    s._init_book("BTCUSDT")
+            self.assertTrue(any(f"{expected} init: BTCUSDT" in m for m in cm.output),
+                            f"falta el market_type en el log de {cls.__name__}: {cm.output}")
+
+
 class StaggerVsBufferTest(unittest.TestCase):
     """Los dos arreglos interactúan: escalonar retrasa el init del último símbolo,
     y el buffer acotado descarta eventos viejos. El buffer tiene que cubrir la
