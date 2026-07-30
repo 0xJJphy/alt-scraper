@@ -510,20 +510,26 @@ class BinanceFuturesStream:
     SYM_KEY     = "symbol_binance"
     CHUNK       = 200  # max stream subscriptions per WS connection
 
-    # /fapi/v1/depth weighs 20 at limit=1000 and 10 at limit=500, against a
-    # 2400/min per-IP budget. Firing ~150 inits at once costs 3000 and is
-    # guaranteed to 429; limit=500 halves it and INIT_SPACING_SEC keeps the
-    # sustained rate under the budget (10 weight / 0.5s = 1200/min).
-    REST_DEPTH_LIMIT  = 500
-    INIT_SPACING_SEC  = 0.5
+    # /fapi/v1/depth weighs 20 at limit=1000, against a 2400/min per-IP budget.
+    # Firing ~150 inits at once costs 3000 and is guaranteed to 429, so the fix
+    # is spacing them, NOT shrinking the snapshot: measured live, limit=500
+    # halves the price coverage (ATOM 99.9% -> 39.1%, ADA 61.9% -> 30.6%). In
+    # alts the REST snapshot *is* the depth — their far levels barely update, so
+    # the WS diff never refills them (ADA stayed at 61.9% over 90s). Majors do
+    # refill from the stream (BTC 0.19% -> 63% in 30s) but they are the minority.
+    # 20 weight / 0.75s = 1600/min, comfortably under the budget.
+    REST_DEPTH_LIMIT  = 1000
+    INIT_SPACING_SEC  = 0.75
     # A book whose REST init failed emits no metrics, so it must be retried.
     # Recovery cannot live in _apply_event: that only runs once a book is
     # initialized, which is exactly what a failed init prevents.
     INIT_WATCHDOG_SEC = 60
     # Cap the pre-init buffer: events older than the snapshot are discarded on
     # init anyway, so an unbounded list only leaks memory on a stuck symbol
-    # (depth@500ms is ~172k events/day).
-    PENDING_MAXLEN    = 500
+    # (depth@500ms is ~172k events/day). It must still outlast the stagger
+    # window: 250 symbols * 0.75s = ~190s, and depth@500ms is 2 events/s, so
+    # 1000 events (~500s) leaves margin for the last symbol in the queue.
+    PENDING_MAXLEN    = 1000
 
     def __init__(self, assets: List[dict]):
         self.assets = [a for a in assets if a.get(self.SYM_KEY)]
@@ -929,9 +935,10 @@ class BinanceSpotStream(BinanceFuturesStream):
     EXCHANGE    = "binance"
     MARKET_TYPE = "spot"
     SYM_KEY     = "symbol_binance_spot"
-    # Spot /api/v3/depth: peso 5 a limit=500 (vs 25 a limit=5000), presupuesto
-    # 6000/min. Hereda el escalonado y el watchdog de la clase base.
-    REST_DEPTH_LIMIT = 500
+    # Spot /api/v3/depth pesa 50 a limit=1000, contra un presupuesto de 6000/min
+    # (distinto del de fapi, así que no compiten). A 0.75s son 4000/min. Se
+    # hereda REST_DEPTH_LIMIT=1000 por el mismo motivo que en futures: recortar
+    # el snapshot recorta la profundidad de los alts de forma permanente.
 
     def _apply_event(self, symbol: str, evt: dict) -> None:
         # Spot diff depth stream uses U/u/b/a — same as futures but no pu field

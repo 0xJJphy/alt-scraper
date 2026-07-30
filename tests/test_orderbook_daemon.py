@@ -97,12 +97,22 @@ class InitDeadlockTest(unittest.TestCase):
 
 
 class RateLimitBudgetTest(unittest.TestCase):
+    # Pesos de /fapi/v1/depth por tramo de `limit` (presupuesto 2400/min por IP).
+    FAPI_DEPTH_WEIGHT = {50: 2, 100: 5, 500: 10, 1000: 20}
+
     def test_depth_limit_and_spacing_stay_inside_binance_budget(self):
-        """limit=500 pesa 10; a 1 init/0.5s son 1200/min, bajo el techo de 2400."""
-        weight_per_init = 10 if BinanceFuturesStream.REST_DEPTH_LIMIT <= 500 else 20
-        per_minute = weight_per_init * (60.0 / BinanceFuturesStream.INIT_SPACING_SEC)
+        w = self.FAPI_DEPTH_WEIGHT[BinanceFuturesStream.REST_DEPTH_LIMIT]
+        per_minute = w * (60.0 / BinanceFuturesStream.INIT_SPACING_SEC)
         self.assertLessEqual(per_minute, 2400,
                              f"{per_minute}/min supera el presupuesto de Binance")
+
+    def test_snapshot_is_not_shrunk_to_save_weight(self):
+        """Medido en vivo: limit=500 recorta la cobertura de precio a la mitad
+        (ATOM 99.9%->39.1%, ADA 61.9%->30.6%). En los alts el snapshot ES la
+        profundidad, porque sus niveles lejanos no se refrescan por el WS, así
+        que el ahorro de peso se paga en dato perdido. Se espacia, no se recorta."""
+        self.assertEqual(BinanceFuturesStream.REST_DEPTH_LIMIT, 1000)
+        self.assertEqual(BinanceSpotStream.REST_DEPTH_LIMIT, 1000)
 
     def test_inits_are_staggered_not_simultaneous(self):
         s = BinanceFuturesStream([
