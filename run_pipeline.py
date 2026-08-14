@@ -57,7 +57,17 @@ def main():
     if run_command([sys.executable, "-u", spot_script, "--limit", top_n, "--metadata-only"]) != 0:
         failed_steps.append("Sync Metadata")
 
-    # 2+3. Run Spot and Futures scrapers IN PARALLEL (independent of each other)
+    # 2+3. Run Spot and Futures scrapers IN PARALLEL.
+    #
+    # Es seguro porque el cupo de Coinalyze es POR KEY (comprobado: agotando una
+    # hasta el 429, las otras seguían respondiendo 200) y cada proceso usa las
+    # suyas: spot va con COINALYZE_API_KEY_SPOT, futures con COINALYZE_API_KEY[_N].
+    #
+    # Hubo una corrida en la que esto se serializó creyendo que compartían cuota.
+    # No era eso: el fallo estaba en que el limitador de alt_scraper contaba
+    # LLAMADAS cuando Coinalyze cobra por SÍMBOLO, así que gastaba 4,7x de su
+    # propio cupo. Serializar no cambió nada —los exchanges seguían muriendo— y
+    # sólo añadía ~25 min de reloj. Arreglado el limitador, el paralelo vuelve.
     print("\n[2-3/4] Running Spot + Futures scrapers in parallel...", flush=True)
     parallel_results = run_command_parallel({
         "SPOT": [sys.executable, "-u", spot_script, "--limit", top_n],
