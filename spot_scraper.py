@@ -936,8 +936,21 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
     if df.empty: return df
 
     # 2. Patch missing Metrics (Taker Buy Volume & Txn Counts)
-    # Use dedicated spot key to avoid quota contention with alt_scraper futures batch
-    api_key = os.getenv("COINALYZE_API_KEY_SPOT") or os.getenv("COINALYZE_API_KEY")
+    # Use dedicated spot key to avoid quota contention with alt_scraper futures batch.
+    # Confirmado con la API real: cada key de Coinalyze tiene su propio cupo de
+    # 40 req/min, independiente — no es "la misma cuenta reparte cupo entre keys".
+    # El fallback de abajo existía para no romper si no había key de spot, pero
+    # es JUSTO el fallo que este comentario dice evitar: si COINALYZE_API_KEY_SPOT
+    # falta (p.ej. un .env que no la trae), este proceso empieza a compartir cupo
+    # con alt_scraper.py sin que nada lo diga — igual pasa corriendo en paralelo o
+    # secuencial, sólo que en paralelo revienta antes. El aviso de abajo lo hace
+    # ruidoso en vez de silencioso.
+    spot_key = os.getenv("COINALYZE_API_KEY_SPOT")
+    api_key = spot_key or os.getenv("COINALYZE_API_KEY")
+    if api_key and not spot_key:
+        print("    [WARN] COINALYZE_API_KEY_SPOT no está configurada: usando la key de "
+              "futures. Si esto corre junto a alt_scraper.py comparten cupo de 40 req/min "
+              "y uno de los dos puede acabar en 429.")
     if api_key and not df.empty:
         # Determine patch window: from the start of the current dataframe to today
         df_sorted = df.sort_values('date')
