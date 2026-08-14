@@ -472,11 +472,22 @@ class DatabaseManager:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
 
+            # CoinGecko can return two different coin ids sharing the same ticker
+            # (forks, wrapped versions, memecoins that reuse a symbol). The
+            # upsert key is (date, symbol), so two rows for the same symbol in
+            # one batch make Postgres reject the whole INSERT with "ON CONFLICT
+            # DO UPDATE command cannot affect row a second time" — it's not a
+            # partial failure, execute_values() aborts the entire statement.
+            # Same convention as AssetMetadataManager (line ~600/670): candidates
+            # arrive sorted by market_cap_desc, so keeping the first occurrence
+            # per symbol keeps the highest-cap (real) project.
+            seen_symbols = set()
             records = []
             for c in candidates:
                 sym = c.get('symbol', '').upper()
-                if not sym:
+                if not sym or sym in seen_symbols:
                     continue
+                seen_symbols.add(sym)
                 rank = c.get('market_cap_rank')
                 mcap = c.get('market_cap')
                 in_top = bool(rank and rank <= top_n)
