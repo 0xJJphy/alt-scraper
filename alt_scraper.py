@@ -2451,10 +2451,17 @@ def main():
     print("COMPLETE")
     print("=" * 60)
     print(f"Exchanges: {exchanges}")
-    if exchange_errors:
-        print(f"Errors in: {exchange_errors}")
     print(f"Output: {args.output_dir}/coinalyze/")
     print("=" * 60)
+
+    # Un exchange abortado deja su OI congelado en futures_daily_metrics, y como
+    # el panel de apalancamiento corta por min(última fecha de cada venue), un
+    # solo venue parado arrastra el gráfico entero. Salir con 0 aquí hacía que
+    # run_pipeline lo diera por bueno y que vps_run.sh mandara SUCCESS por
+    # Telegram mientras el dato llevaba días sin moverse.
+    if exchange_errors:
+        print(f"Errors in: {exchange_errors}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

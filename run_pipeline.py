@@ -1,7 +1,6 @@
 import os
 import subprocess
 import sys
-import threading
 import psycopg2
 from dotenv import load_dotenv
 
@@ -13,25 +12,6 @@ def run_command(command, label=""):
     if result.returncode != 0:
         print(f"{tag}!! Command failed with return code {result.returncode}", flush=True)
     return result.returncode
-
-
-def run_command_parallel(commands):
-    """Run multiple commands in parallel threads. Returns list of return codes."""
-    results = {}
-    threads = []
-
-    def worker(label, cmd):
-        results[label] = run_command(cmd, label=label)
-
-    for label, cmd in commands.items():
-        t = threading.Thread(target=worker, args=(label, cmd))
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join()
-
-    return results
 
 
 def main():
@@ -57,15 +37,28 @@ def main():
     if run_command([sys.executable, "-u", spot_script, "--limit", top_n, "--metadata-only"]) != 0:
         failed_steps.append("Sync Metadata")
 
-    # 2+3. Run Spot and Futures scrapers IN PARALLEL (independent of each other)
-    print("\n[2-3/4] Running Spot + Futures scrapers in parallel...", flush=True)
-    parallel_results = run_command_parallel({
-        "SPOT": [sys.executable, "-u", spot_script, "--limit", top_n],
-        "FUTURES": [sys.executable, "-u", alts_script, "--limit", top_n, "--exchanges", "binance,bybit,okx"],
-    })
-    if parallel_results.get("SPOT", 0) != 0:
+    # 2+3. Run Spot and Futures scrapers SEQUENTIALLY.
+    #
+    # Son independientes entre sí, pero NO en la cuota de Coinalyze: el límite es
+    # de 40 req/min por cuenta, y COINALYZE_API_KEY_SPOT es de la misma cuenta que
+    # COINALYZE_API_KEY. En paralelo, spot (1,6 s = 37,5 req/min) y futures (3,2 s
+    # = 18,75 req/min) suman 56 req/min y saturan la ventana. El futures acaba
+    # perdiendo: cuando un hilo de exchange se topa un 429 duerme 60 s, pero spot
+    # sigue disparando, así que al despertar la ventana sigue llena, se come el
+    # segundo 429 y aborta ese exchange entero. Medido en el VPS del 11 al 14 de
+    # agosto de 2026: dos de los tres exchanges morían CADA día, y sobrevivía solo
+    # el que quedaba con la ventana para él.
+    #
+    # Cada scraper por separado cabe de sobra en los 40/min. Secuencial cuesta
+    # ~25 min más de reloj; el timer arranca a las 00:15 UTC y el pipeline de GLI
+    # no lee esta base hasta las ~04:00, así que el margen sobra.
+    print("\n[2/4] Running Spot scraper...", flush=True)
+    if run_command([sys.executable, "-u", spot_script, "--limit", top_n], label="SPOT") != 0:
         failed_steps.append("Spot Scraper")
-    if parallel_results.get("FUTURES", 0) != 0:
+
+    print("\n[3/4] Running Futures scraper...", flush=True)
+    if run_command([sys.executable, "-u", alts_script, "--limit", top_n,
+                    "--exchanges", "binance,bybit,okx"], label="FUTURES") != 0:
         failed_steps.append("Futures Scraper")
 
     # 4. Compute daily L/S high/low from today's snapshots → futures_daily_metrics
