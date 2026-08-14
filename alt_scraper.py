@@ -761,20 +761,71 @@ class CoinalyzeQuotaError(Exception):
 # ==============================================================================
 # Shared Rate Limiter (thread-safe — enforces global call budget across threads)
 # ==============================================================================
-class ThreadSafeRateLimiter:
-    """Ensures a minimum interval between API calls across all parallel threads."""
-    def __init__(self, min_interval: float):
-        self._lock = threading.Lock()
-        self._last_call = 0.0
-        self._min_interval = min_interval
+# Coinalyze cuenta la cuota por SÍMBOLO, no por petición. Medido contra la API
+# con dos experimentos que cortan en el mismo sitio:
+#
+#   /v1/exchanges          (0 símbolos)  -> 429 en la petición nº 41
+#   open-interest-history  (10 símbolos) -> 429 en la petición nº 5
+#
+# Las dos se paran en 40 unidades. El límite son 40 SÍMBOLOS/min, no 40 llamadas.
+#
+# La versión anterior espaciaba llamadas a secas (3,2 s = 18,75 llamadas/min) sobre
+# la premisa "40 calls per minute" del docstring del cliente. Como cada llamada
+# lleva COINALYZE_BATCH_SIZE=10 símbolos, el gasto real era 188 símbolos/min: 4,7x
+# por encima. De ahí que el cubo se vaciara a los ~13 s de arrancar y que dos de
+# los tres exchanges murieran cada noche. El batching no ahorra cuota —se paga por
+# símbolo igual—, sólo ahorra viajes HTTP.
+UNITS_PER_MINUTE = float(os.environ.get("COINALYZE_UNITS_PER_MINUTE", "40"))
+# Margen: apurar el límite exacto deja el cubo a cero y cualquier reintento cae en
+# 429. 0,9 lo deja en 36/min efectivos.
+UNITS_SAFETY = float(os.environ.get("COINALYZE_UNITS_SAFETY", "0.9"))
 
-    def wait(self):
+
+def _coinalyze_keys() -> List[str]:
+    """
+    Keys de Coinalyze disponibles para los hilos de futures, sin duplicados.
+
+    Lee COINALYZE_API_KEY y, detrás, cualquier COINALYZE_API_KEY_2/_3/... Se deja
+    fuera COINALYZE_API_KEY_SPOT*: esas son de spot_scraper.py, y colarlas aquí
+    reproduciría la contención que esa separación existe para evitar.
+
+    El orden importa poco (el reparto es round-robin) pero es estable, así que un
+    exchange cae siempre en la misma key entre corridas.
+    """
+    keys, seen = [], set()
+    for name in ["COINALYZE_API_KEY"] + [f"COINALYZE_API_KEY_{i}" for i in range(2, 11)]:
+        k = (os.environ.get(name) or "").strip()
+        if k and k not in seen:
+            seen.add(k)
+            keys.append(k)
+    return keys
+
+
+class ThreadSafeRateLimiter:
+    """
+    Reparte un presupuesto de SÍMBOLOS/minuto entre todos los hilos que lo compartan.
+
+    `wait(units)` reserva `units` fichas y devuelve el control cuando le toca a esa
+    reserva. Se reserva bajo el lock pero se duerme fuera: si dos hilos piden a la
+    vez, cada uno espera su turno sin bloquear al otro mientras tanto.
+    """
+
+    def __init__(self, units_per_minute: float = UNITS_PER_MINUTE,
+                 safety: float = UNITS_SAFETY):
+        self._lock = threading.Lock()
+        # Segundos que "cuesta" una unidad (un símbolo).
+        self._interval = 60.0 / max(units_per_minute * safety, 1e-9)
+        self._next_free = 0.0
+
+    def wait(self, units: int = 1):
+        units = max(int(units), 1)
         with self._lock:
-            now = time.time()
-            gap = self._min_interval - (now - self._last_call)
-            if gap > 0:
-                time.sleep(gap)
-            self._last_call = time.time()
+            now = time.monotonic()
+            start = max(now, self._next_free)
+            self._next_free = start + units * self._interval
+            gap = start - now
+        if gap > 0:
+            time.sleep(gap)
 
 
 # ==============================================================================
@@ -891,12 +942,13 @@ class CoinalyzeClient:
         
         for attempt in range(3):
             if self._rate_limiter:
-                self._rate_limiter.wait()
+                # Endpoints sin `symbols` (p.ej. future-markets) cuestan 1 unidad.
+                self._rate_limiter.wait(1)
             else:
                 time.sleep(self.rate_delay)
             try:
                 resp = requests.get(url, params=params, timeout=60)
-                
+
                 if resp.status_code == 200:
                     return resp.json()
                     
@@ -941,9 +993,11 @@ class CoinalyzeClient:
 
         for attempt in range(3):
             if self._rate_limiter:
-                self._rate_limiter.wait()
+                # Aquí está la corrección: la cuota se cobra por símbolo del lote,
+                # no por llamada. Un chunk de 10 cuesta 10, no 1.
+                self._rate_limiter.wait(len(symbols))
             else:
-                time.sleep(self.rate_delay)
+                time.sleep(self.rate_delay * len(symbols))
             try:
                 resp = requests.get(url, params=p, timeout=60)
                 if resp.status_code == 200:
@@ -2433,8 +2487,22 @@ def main():
               "Wait ~1 minute for the rate-limit window to reset, then retry.", flush=True)
         sys.exit(1)
 
-    # Shared rate limiter: all exchange threads share the Coinalyze request budget.
-    rate_limiter = ThreadSafeRateLimiter(min_interval=args.coinalyze_min_interval)
+    # Reparto de keys entre exchanges. El cupo de 40 símbolos/min es POR KEY
+    # (comprobado: agotando una hasta el 429, las otras seguían respondiendo 200),
+    # así que cada key que se añada multiplica el caudal. Con una sola key los tres
+    # hilos comparten un limitador y van en fila; con tres, cada hilo lleva el suyo
+    # y corren de verdad en paralelo.
+    #
+    # Es round-robin, así que sirve para cualquier número de keys: sobran o faltan
+    # sin que haya que tocar nada.
+    # El `or` cubre el caso de pasar --coinalyze-key sin tenerla en el entorno.
+    keys = _coinalyze_keys() or [args.coinalyze_key]
+    limiters = [ThreadSafeRateLimiter() for _ in keys]
+    print(f"[INFO] {len(keys)} key(s) de Coinalyze -> "
+          f"{len(keys) * UNITS_PER_MINUTE * UNITS_SAFETY:.0f} símbolos/min en total", flush=True)
+    if len(keys) < len(exchanges):
+        print(f"[INFO] Menos keys ({len(keys)}) que exchanges ({len(exchanges)}): "
+              f"algunos hilos comparten cupo y irán más lentos.", flush=True)
 
     # Process exchanges in parallel (one thread per exchange)
     print(f"\n[INFO] Running {len(exchanges)} exchange(s) in parallel...", flush=True)
@@ -2444,10 +2512,10 @@ def main():
         futures = {
             executor.submit(
                 process_exchange,
-                ex, bases, args.coinalyze_key, rate_limiter,
+                ex, bases, keys[i % len(keys)], limiters[i % len(keys)],
                 symbols_cache, args, default_start_sec, end_sec
             ): ex
-            for ex in exchanges
+            for i, ex in enumerate(exchanges)
         }
         for future in as_completed(futures):
             ex = futures[future]
