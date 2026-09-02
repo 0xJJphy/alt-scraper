@@ -377,8 +377,7 @@ The system includes a real-time order book depth scraper (`orderbook_daemon.py`)
 
 ### Features
 - **Exchanges**: Binance Futures, Binance Spot, Bybit Linear, Bybit Spot, OKX Swap, Upbit Spot, Coinbase Spot.
-- **Coinbase**: quotes against USD (not USDT) and its book is clipped to ±25% of the mid, so its
-  `depth_coverage_pct` saturates around 25% instead of reaching 100%. The depth bands are unaffected.
+- **Coinbase**: quotes against USD, not USDT. The book is kept whole, like every other venue.
 - **WebSocket Streaming**: Maintains book state in real time and takes periodic snapshots to sync to the DB.
 - **Backfill Tool**: Includes `orderbook_backfill.py` for downloading available historical snapshots.
 

@@ -3,7 +3,7 @@
 orderbook_daemon.py — WebSocket order book depth daemon.
 
 Maintains live order books for Binance Futures/Spot, Bybit Linear/Spot, OKX Swap, Upbit Spot
-and Coinbase Spot (quote USD; su libro se recorta a ±25% del mid, ver CoinbaseSpotStream).
+and Coinbase Spot (quote USD, no USDT; ver CoinbaseSpotStream).
 Saves 6 snapshots/day at 4-hour UTC intervals (00, 04, 08, 12, 16, 20).
 Also updates orderbook_latest every ~60s for frontend live display.
 
@@ -1009,15 +1009,18 @@ class CoinbaseSpotStream:
     cobertura del mid), asi que no necesita el init REST escalonado de Binance: el molde
     es BybitLinearStream, que tambien recibe el snapshot por el propio WebSocket.
 
-    Dos particularidades que no tiene ningun otro stream:
+    El libro se guarda ENTERO, sin recortar. Se probo recortarlo a +-25% del mid porque
+    guardar los 21k niveles de BTC parecia desperdicio -- la banda mas ancha que se
+    calcula es del 10% -- pero medido sobre los 107 libros reales el recorte solo ahorra
+    17 MB de RAM (58 -> 41 MB) y 67 ms por pasada de metricas, y no toca ni la base de
+    datos ni la red, que es donde estaba el miedo. A cambio obligaba a re-suscribir por
+    deriva del mid: los niveles que caen fuera del recorte NO vuelven, porque los deltas
+    solo traen lo que cambia, asi que un libro recortado se queda cojo en silencio
+    cuando el precio se mueve. Sin recorte ese fallo no existe y `depth_coverage_pct`
+    es comparable con la de binance en vez de saturar en 25%.
 
-      * El libro se recorta a +-CLIP_PCT del mid. Guardar los 21k niveles de BTC no
-        aporta nada -- la banda mas ancha que se calcula es del 10% -- pero recortar y
-        mantener el libro vivo 24 h se muerden entre si: si el precio se mueve, los
-        niveles que quedaron fuera del recorte NO vuelven, porque los deltas solo traen
-        lo que cambia. De ahi el recentrado por deriva y por frontera.
-      * `sequence_num` va por CONEXION, no por producto, asi que un hueco no dice que
-        libro se corrompio: hay que rehacer el trozo entero.
+    La particularidad que si queda: `sequence_num` va por CONEXION, no por producto, asi
+    que un hueco no dice que libro se corrompio y hay que rehacer el trozo entero.
 
     Se eligio Advanced Trade sobre el feed de Exchange porque el `level2` de Exchange
     exige autenticacion y su `level2_batch` no lleva numero de secuencia.
@@ -1028,8 +1031,8 @@ class CoinbaseSpotStream:
     MARKET_TYPE = "spot"
     SYM_KEY     = "symbol_coinbase"
     # Medido contra el servidor: 30 productos por conexion funcionan y 31 devuelven
-    # "too many L2 streams requested in a single session". Se deja margen porque el
-    # recentrado hace unsubscribe+subscribe y no conviene rozar el tope.
+    # "too many L2 streams requested in a single session". Se deja margen para no rozar
+    # el tope, y de paso una caida se lleva por delante menos libros.
     CHUNK       = 25
 
     # El snapshot de BTC pesa mas de 1 MB y el limite por defecto de `websockets` es
@@ -1037,37 +1040,12 @@ class CoinbaseSpotStream:
     # suscribirse, que es justo como se manifesto al probarlo.
     MAX_FRAME = 32 * 1024 * 1024
 
-    # Medido sobre los 107 libros reales del universo: a +-12% tres libros dispersos
-    # (2Z, BEAM, BNT) se quedan por debajo del 10% y pierden la banda ancha; a +-20%
-    # aguantan los 107 con cobertura minima del 14,5%. +-25% deja el doble de margen y
-    # aun asi recorta el libro a un cuarto de sus niveles.
-    CLIP_PCT      = 0.25
-    RECENTER_PCT  = 0.08   # deriva del mid que obliga a re-suscribir
-    BOUNDARY_LEAD = 120    # recentrado alineado antes de cada frontera de 4 h
-    CHECK_EVERY   = 30     # cada cuanto se revisa la deriva
-
     def __init__(self, assets: List[dict]):
         self.assets = [a for a in assets if a.get(self.SYM_KEY)]
         self.books: Dict[str, LocalOrderBook] = {}
         for a in self.assets:
             sym = a[self.SYM_KEY].upper()
             self.books[sym] = LocalOrderBook(sym, self.EXCHANGE)
-        self._center: Dict[str, float] = {}   # mid con el que se recorto cada libro
-
-    # -- recorte ------------------------------------------------------------
-
-    def _clip(self, center: float, bids: list, asks: list) -> Tuple[list, list]:
-        lo, hi = center * (1 - self.CLIP_PCT), center * (1 + self.CLIP_PCT)
-        return ([(p, q) for p, q in bids if p >= lo],
-                [(p, q) for p, q in asks if p <= hi])
-
-    @staticmethod
-    def _mid(book: LocalOrderBook) -> Optional[float]:
-        # Solo escribe esta corrutina, asi que leer sin el lock no compite con nadie:
-        # el hilo principal lee siempre a traves de snapshot(), que si lo toma.
-        if not book.bids or not book.asks:
-            return None
-        return (max(book.bids) + min(book.asks)) / 2.0
 
     @staticmethod
     def _parse_updates(updates: list) -> Tuple[list, list]:
@@ -1098,20 +1076,11 @@ class CoinbaseSpotStream:
         bids, asks = self._parse_updates(ev.get("updates", []))
 
         if ev.get("type") == "snapshot":
-            vivos_b = [p for p, q in bids if q > 0]
-            vivos_a = [p for p, q in asks if q > 0]
-            if not vivos_b or not vivos_a:
-                return
-            center = (max(vivos_b) + min(vivos_a)) / 2.0
-            self._center[product] = center
-            book.apply_snapshot(*self._clip(center, bids, asks))
-        else:
-            center = self._center.get(product)
-            if center is None:      # deltas antes del snapshot: no hay donde aplicarlos
-                return
-            # El mismo filtro vale para altas y para bajas: un borrado fuera del recorte
-            # apunta a un nivel que nunca se llego a guardar.
-            book.apply_delta(*self._clip(center, bids, asks))
+            book.apply_snapshot(bids, asks)
+        elif book.initialized:
+            # Un delta antes del snapshot no tiene donde aplicarse: descartarlo es lo
+            # correcto, porque el snapshot que viene detras trae el libro entero.
+            book.apply_delta(bids, asks)
 
     def _validar(self, msg: dict, esperado: Optional[int]) -> Optional[int]:
         """Comprueba el mensaje de control y devuelve el siguiente `sequence_num`.
@@ -1136,50 +1105,6 @@ class CoinbaseSpotStream:
             raise ConnectionError(f"hueco de secuencia: esperaba {esperado}, llego {seq}")
         return seq + 1
 
-    async def _recentrar(self, ws, symbols: List[str], estado: dict) -> None:
-        """Re-suscribe los libros cuyo recorte se ha quedado descentrado.
-
-        Por deriva del mid, y ademas una vez antes de cada frontera de 4 h para que el
-        libro que se persiste sea fresco. Re-suscribir un producto devuelve snapshot
-        completo sin cortar la conexion ni romper la secuencia (verificado en vivo).
-        """
-        ahora = time.time()
-        if ahora - estado["ultimo_chequeo"] < self.CHECK_EVERY:
-            return
-        estado["ultimo_chequeo"] = ahora
-
-        pendientes, motivo = [], ""
-        secs = _seconds_until_next_snapshot()
-        if secs <= self.BOUNDARY_LEAD:
-            # Se identifica por la hora de la frontera, no por el reloj: las fronteras
-            # caen en hora en punto, asi que dos comprobaciones seguidas dan la misma
-            # marca y el recentrado no se repite.
-            marca = (datetime.now(timezone.utc)
-                     + timedelta(seconds=secs)).replace(minute=0, second=0, microsecond=0)
-            if estado.get("frontera") != marca:
-                estado["frontera"] = marca
-                pendientes = [s for s in symbols if self.books[s].initialized]
-                motivo = "frontera"
-
-        if not pendientes:
-            for sym in symbols:
-                book   = self.books.get(sym)
-                centro = self._center.get(sym)
-                if not book or not book.initialized or not centro:
-                    continue
-                mid = self._mid(book)
-                if mid and abs(mid / centro - 1.0) > self.RECENTER_PCT:
-                    pendientes.append(sym)
-            motivo = "deriva"
-
-        if not pendientes:
-            return
-        log.info("coinbase: recentrando %d libros (%s)", len(pendientes), motivo)
-        await ws.send(json.dumps({"type": "unsubscribe",
-                                  "product_ids": pendientes, "channel": "level2"}))
-        await ws.send(json.dumps({"type": "subscribe",
-                                  "product_ids": pendientes, "channel": "level2"}))
-
     async def _run_chunk(self, symbols: List[str]) -> None:
         backoff = 5
         while True:
@@ -1190,7 +1115,6 @@ class CoinbaseSpotStream:
                     await ws.send(json.dumps({"type": "subscribe",
                                               "product_ids": symbols, "channel": "level2"}))
                     log.info("coinbase WS subscribed (%d symbols)", len(symbols))
-                    estado   = {"ultimo_chequeo": time.time(), "frontera": None}
                     esperado = None
                     async for raw in ws:
                         msg = json.loads(raw)
@@ -1199,7 +1123,6 @@ class CoinbaseSpotStream:
                             continue
                         for ev in msg.get("events", []):
                             self._apply_event(ev)
-                        await self._recentrar(ws, symbols, estado)
             except Exception as e:
                 log.warning("coinbase WS error: %s — reconnecting in %ds", e, backoff)
                 # Se han perdido deltas: los libros de este trozo ya no son de fiar.
@@ -1207,7 +1130,6 @@ class CoinbaseSpotStream:
                     book = self.books.get(sym)
                     if book:
                         book.reset()
-                    self._center.pop(sym, None)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
 
