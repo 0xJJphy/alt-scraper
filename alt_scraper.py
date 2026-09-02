@@ -1628,7 +1628,9 @@ class OKXFuturesFetcher:
     def fetch_current_day_data(self, symbol: str) -> Optional[Dict]:
         sym = symbol.split('.')[0].replace('USDT_PERP', '-USDT-SWAP')
         try:
-            params = {"instId": sym, "bar": "1D", "limit": 1}
+            # "1Dutc": "1D" cierra en UTC+8. (Esta clase esta muerta: la definicion de
+            # OKXFuturesFetcher de mas abajo la sobreescribe y es la que usa GLOBAL_FETCHERS.)
+            params = {"instId": sym, "bar": "1Dutc", "limit": 1}
             resp = requests.get(f"{self.base_url}/market/candles", params=params).json()
             data = resp.get("data", [])
             if not data: return None
@@ -2034,7 +2036,10 @@ class OKXFuturesFetcher:
         clean_symbol = f"{base_asset}-USDT-SWAP"
         
         # 1. OHLCV
-        k_data = self._get("/api/v5/market/candles", {"instId": clean_symbol, "bar": "1D", "limit": 1})
+        # "1Dutc": "1D" cierra en UTC+8, asi que la vela "de hoy" que pegabamos sobre una
+        # fecha UTC empezaba a las 16:00 del dia anterior. El historico viene de Coinalyze
+        # (ya en UTC), solo la fila del dia en curso estaba desalineada.
+        k_data = self._get("/api/v5/market/candles", {"instId": clean_symbol, "bar": "1Dutc", "limit": 1})
         # 2. Funding
         f_data = self._get("/api/v5/public/funding-rate", {"instId": clean_symbol})
         # 3. Open Interest
