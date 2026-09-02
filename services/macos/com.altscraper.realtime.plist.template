@@ -6,15 +6,15 @@
     <string>com.altscraper.realtime</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/pedro/Documents/Github/alt-scraper/venv/bin/python3</string>
-        <string>/Users/pedro/Documents/Github/alt-scraper/realtime_daemon.py</string>
+        <string>{{INSTALL_DIR}}/venv/bin/python3</string>
+        <string>{{INSTALL_DIR}}/realtime_daemon.py</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/pedro/Documents/Github/alt-scraper</string>
+    <string>{{INSTALL_DIR}}</string>
     <key>StandardOutPath</key>
-    <string>/Users/pedro/Documents/Github/alt-scraper/realtime_daemon.log</string>
+    <string>{{INSTALL_DIR}}/realtime_daemon.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/pedro/Documents/Github/alt-scraper/realtime_daemon.log</string>
+    <string>{{INSTALL_DIR}}/realtime_daemon.log</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

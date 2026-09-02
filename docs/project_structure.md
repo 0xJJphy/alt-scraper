@@ -72,9 +72,7 @@ Este documento describe la jerarquía de archivos y la función de cada componen
 
 ### 🍎 macOS / Launchd
 - `manage_services_mac.sh`: Script interactivo de utilidad para instalar, desinstalar, iniciar, detener y monitorizar los demonios locales en macOS.
-- `services/macos/com.altscraper.realtime.plist`: Configuración de Launchd para el demonio en tiempo real.
-- `services/macos/com.altscraper.klines-ws.plist`: Configuración de Launchd para el demonio de WebSocket klines.
-- `services/macos/com.altscraper.orderbook.plist`: Configuración de Launchd para el demonio del libro de órdenes.
+- `services/macos/*.plist.template`: Plantillas de Launchd (realtime, klines-ws, orderbook). `manage_services_mac.sh install` las renderiza en `~/Library/LaunchAgents` sustituyendo `{{INSTALL_DIR}}` por la ruta local del repo, igual que los `*.service.template` de systemd.
 
 ---
 

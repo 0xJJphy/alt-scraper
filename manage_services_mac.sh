@@ -2,14 +2,22 @@
 
 # manage_services_mac.sh - Gestión de demonios en macOS usando launchd
 
-BASE_DIR="/Users/pedro/Documents/Github/alt-scraper"
+# Ruta del repo. Se deduce de la ubicación del propio script; se puede forzar con
+# BASE_DIR=/otra/ruta ./manage_services_mac.sh install
+BASE_DIR="${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 
 case "$1" in
     install)
         echo "🚀 Instalando servicios en LaunchAgents..."
         mkdir -p "$PLIST_DIR"
-        cp "$BASE_DIR/services/macos/"*.plist "$PLIST_DIR/"
+        # Los .plist se generan desde plantillas: la ruta de instalación es local a cada
+        # máquina y no tiene por qué estar en el repo (igual que los *.service.template).
+        for tpl in "$BASE_DIR/services/macos/"*.plist.template; do
+            out="$PLIST_DIR/$(basename "${tpl%.template}")"
+            sed "s#{{INSTALL_DIR}}#$BASE_DIR#g" "$tpl" > "$out"
+        done
+        echo "   Plists generados en $PLIST_DIR (INSTALL_DIR=$BASE_DIR)"
         
         # Cargar los servicios en launchctl
         launchctl bootstrap gui/$(id -u) "$PLIST_DIR/com.altscraper.realtime.plist"

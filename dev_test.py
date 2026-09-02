@@ -9,7 +9,7 @@ import requests
 import psycopg2
 from dotenv import load_dotenv
 
-load_dotenv(".env.dev")
+load_dotenv()
 
 TOR_PROXY = os.getenv("TOR_PROXY", "socks5h://127.0.0.1:9050")
 TOR_CONTROL_HOST = "127.0.0.1"
