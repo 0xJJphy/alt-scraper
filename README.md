@@ -127,7 +127,12 @@ The system is designed to run statelessly in the cloud. It will:
 | `binance` | Binance | `BTCUSDT` | `BTCUSDT_PERP.A` |
 | `bybit` | Bybit | `BTCUSDT` | `BTCUSDT_PERP.3` |
 | `okx` | OKX | `BTC-USDT` | `BTC-USDT-SWAP.6` |
+| `coinbase` | Coinbase | `BTC-USD` (quote USD) | - |
 | `aggregated`| All-in-one| - | `BTCUSDT_PERP` |
+
+Coinbase is spot-only and quotes against **USD** instead of USDT (401 online pairs vs 21).
+It is not part of the nightly pipeline yet — run it explicitly with
+`python spot_scraper.py --exchanges coinbase`.
 
 ---
 

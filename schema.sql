@@ -103,7 +103,8 @@ INSERT INTO exchanges (name, code, display_name) VALUES
     ('kucoin', '0', 'KuCoin'),
     ('mexc', 'V', 'MEXC'),
     ('phemex', 'W', 'Phemex'),
-    ('coinex', 'F', 'CoinEx')
+    ('coinex', 'F', 'CoinEx'),
+    ('coinbase', 'C', 'Coinbase')   -- spot only (quote USD)
 ON CONFLICT (name) DO UPDATE SET 
     code = EXCLUDED.code,
     display_name = EXCLUDED.display_name;

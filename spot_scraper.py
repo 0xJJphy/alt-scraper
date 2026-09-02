@@ -39,6 +39,7 @@ BINANCE_SPOT_API = f"{BINANCE_SPOT_MIRRORS[0]}/api/v3/klines"
 BYBIT_SPOT_API = "https://api.bybit.com/v5/market/kline"
 OKX_SPOT_API = "https://www.okx.com/api/v5/market/history-candles"
 OKX_RUBIK_API = "https://www.okx.com/api/v5/rubik/stat/taker-volume"
+COINBASE_SPOT_API = "https://api.exchange.coinbase.com"
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
 SPOT_SYMBOL_CACHE = os.path.join("data", "cache", "spot_exchange_symbols.json")
 
@@ -123,12 +124,51 @@ def _fetch_okx_spot_symbols() -> Dict[str, str]:
     }
 
 
+def _fetch_coinbase_spot_symbols() -> Dict[str, str]:
+    """Productos USD de Coinbase.
+
+    Coinbase es el único venue de la tabla cuyo quote es USD y no USDT: solo tiene 21
+    pares USDT online frente a 401 en USD, así que restringirlo a USDT dejaría fuera el
+    89% del mercado. `volume_base` va en unidades del activo base, que es lo que se agrega
+    entre exchanges, y el desvío USD/USDT es el del peg (<0.1%).
+    """
+    resp = _tor.session.get(
+        f"{COINBASE_SPOT_API}/products",
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return {
+        p.get("base_currency", "").upper(): p.get("id", "")
+        for p in resp.json()
+        if p.get("quote_currency") == "USD"
+        and p.get("status") == "online"
+        and not p.get("trading_disabled")
+    }
+
+
+# Formato del símbolo por exchange: (separador, quote).
+SPOT_SYMBOL_FORMATS = {
+    "binance":  ("",  "USDT"),   # BTCUSDT
+    "bybit":    ("",  "USDT"),   # BTCUSDT
+    "okx":      ("-", "USDT"),   # BTC-USDT
+    "coinbase": ("-", "USD"),    # BTC-USD
+}
+
+
+def spot_symbol_for(exchange: str, base: str) -> str:
+    """Símbolo nativo tal y como se guarda en spot_daily_ohlcv.symbol."""
+    sep, quote = SPOT_SYMBOL_FORMATS.get(exchange.lower(), ("", "USDT"))
+    return f"{base}{sep}{quote}"
+
+
 def load_spot_exchange_symbols(exchanges: List[str], ttl_hours: float = 24.0) -> Dict[str, Dict[str, str]]:
     """
-    Load native spot USDT listings per exchange.
+    Load native spot listings per exchange (quote USDT, o USD en coinbase).
 
     This prevents wasting historical requests on assets that are in the global
-    universe but do not trade on a given spot venue.
+    universe but do not trade on a given spot venue. El quote de cada venue está en
+    SPOT_SYMBOL_FORMATS.
     """
     cached = _load_json_cache(SPOT_SYMBOL_CACHE, ttl_hours)
     symbols_by_exchange = cached.get("exchanges", {}) if cached else {}
@@ -138,13 +178,14 @@ def load_spot_exchange_symbols(exchanges: List[str], ttl_hours: float = 24.0) ->
         "binance": _fetch_binance_spot_symbols,
         "bybit": _fetch_bybit_spot_symbols,
         "okx": _fetch_okx_spot_symbols,
+        "coinbase": _fetch_coinbase_spot_symbols,
     }
 
     missing = [ex for ex in exchanges if ex in fetchers and ex not in loaded]
     for exchange in missing:
         try:
             loaded[exchange] = fetchers[exchange]()
-            print(f"[INFO] Loaded {len(loaded[exchange])} native spot USDT symbols for {exchange}")
+            print(f"[INFO] Loaded {len(loaded[exchange])} native spot {SPOT_SYMBOL_FORMATS.get(exchange, ('', 'USDT'))[1]} symbols for {exchange}")
         except Exception as e:
             print(f"[WARN] Could not load native spot symbols for {exchange}: {e}")
             loaded[exchange] = {}
@@ -848,7 +889,9 @@ class OKXSpotFetcher:
     def fetch_current_day_data(self, symbol: str, max_retries: int = 3) -> Optional[Dict]:
         for attempt in range(max_retries):
             try:
-                params = {"instId": f"{symbol}-USDT", "bar": "1D", "limit": 1}
+                # "1Dutc", no "1D": ver fetch_okx. Con "1D" antes de las 16:00 UTC esto
+                # devolvia la vela abierta AYER a las 16:00 y la guardabamos como la de hoy.
+                params = {"instId": f"{symbol}-USDT", "bar": "1Dutc", "limit": 1}
                 resp = _tor.session.get(f"{self.BASE_URL}/market/candles", params=params, headers=self.HEADERS, timeout=15)
                 if resp.status_code == 429:
                     print(f"    [OKX Spot] Rate limited, waiting {2 ** attempt}s...")
@@ -874,7 +917,21 @@ class OKXSpotFetcher:
         return None
 
     def fetch_bulk_rubik_delta(self, symbol: str, max_retries: int = 3) -> pd.DataFrame:
-        """Fetch Taker Buy Volume from Rubik (last 180 days)."""
+        """Fetch Taker Buy/Sell ratio from Rubik (last ~180 days).
+
+        OJO CON DOS COSAS, las dos nos han corrompido el delta de OKX:
+
+        1) OKX devuelve cada fila como [ts, sellVol, buyVol] — el SELL va primero. Leerlas
+           al revés invertía el signo del delta de todo el histórico de OKX (se veía en que
+           sign(volume_delta) anticorrelaba con el retorno del día: -0.20 en ETH, -0.14 en XRP,
+           mientras Binance/Bybit daban +0.23/+0.26).
+
+        2) Rubik se consulta por `ccy`, así que agrega TODOS los pares spot del activo
+           (USDT, USDC, BTC...), pero la fila que parcheamos es solo el par -USDT. Las
+           magnitudes no son comparables: buy+sell nunca cuadraba con volume_base.
+           Por eso devolvemos únicamente `buy_ratio` — la proporción sí es representativa,
+           la magnitud no. Quien llama la reescala con su propio volume_base.
+        """
         for attempt in range(max_retries):
             try:
                 params = {"ccy": symbol, "period": "1D", "instType": "SPOT"}
@@ -889,12 +946,13 @@ class OKXSpotFetcher:
                     return pd.DataFrame()
                 data = json_data.get("data", [])
                 if not data: return pd.DataFrame()
-                df = pd.DataFrame(data, columns=['timestamp', 'buy_volume_base', 'sell_volume_base'])
+                df = pd.DataFrame(data, columns=['timestamp', 'sell_volume_base', 'buy_volume_base'])
                 df['date'] = pd.to_datetime(df['timestamp'].astype('int64'), unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-                df['buy_volume_base'] = pd.to_numeric(df['buy_volume_base'])
-                df['sell_volume_base'] = pd.to_numeric(df['sell_volume_base'])
-                df['volume_delta'] = df['buy_volume_base'] - df['sell_volume_base']
-                return df[['date', 'buy_volume_base', 'sell_volume_base', 'volume_delta']]
+                buy = pd.to_numeric(df['buy_volume_base'], errors='coerce')
+                sell = pd.to_numeric(df['sell_volume_base'], errors='coerce')
+                total = buy + sell
+                df['buy_ratio'] = buy / total.where(total > 0)
+                return df[['date', 'buy_ratio']].dropna(subset=['buy_ratio'])
             except requests.exceptions.Timeout:
                 print(f"    [OKX Rubik] Timeout, attempt {attempt+1}/{max_retries}")
                 time.sleep(2 ** attempt)
@@ -903,20 +961,102 @@ class OKXSpotFetcher:
                 return pd.DataFrame()
         return pd.DataFrame()
 
+class CoinbaseSpotFetcher:
+    """Fetcher for the Coinbase Exchange public API (USD pairs)."""
+    BASE_URL = COINBASE_SPOT_API
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
+
+    def fetch_current_day_data(self, symbol: str, max_retries: int = 3) -> Optional[Dict]:
+        """Vela abierta de hoy. El histórico NO pasa por aquí: lo sirve Coinalyze entero
+        en una sola llamada (ver SpotScraper.fetch_coinbase), así que a Coinbase solo le
+        pedimos 1 petición por símbolo y corrida — muy por debajo de sus 10 req/s por IP.
+        """
+        for attempt in range(max_retries):
+            try:
+                resp = _tor.session.get(
+                    f"{self.BASE_URL}/products/{symbol}-USD/candles",
+                    params={"granularity": 86400}, headers=self.HEADERS, timeout=15,
+                )
+                if resp.status_code == 429:
+                    wait_time = int(float(resp.headers.get("Retry-After", 2 ** attempt)))
+                    print(f"    [Coinbase Spot] Rate limited, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                data = resp.json()
+                if not isinstance(data, list) or not data: return None
+                k = data[0]  # más reciente primero
+                # OJO: Coinbase devuelve [time, LOW, HIGH, OPEN, close, volume] — low y high
+                # van ANTES que open/close, al revés de lo habitual. Leerlo en el orden
+                # típico OHLC intercambia apertura con mínimo y máximo con cierre.
+                return {
+                    "price_open": float(k[3]), "price_high": float(k[2]),
+                    "price_low": float(k[1]), "price_close": float(k[4]),
+                    "volume_base": float(k[5]),
+                    # El endpoint no da volumen en quote: se deriva, igual que en
+                    # CoinalyzeClient.fetch_ohlcv.
+                    "volume_usd": float(k[5]) * float(k[4]),
+                }
+            except requests.exceptions.Timeout:
+                print(f"    [Coinbase Spot] Timeout, attempt {attempt+1}/{max_retries}")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"    [Coinbase Spot Error] {e}")
+                return None
+        return None
+
 GLOBAL_FETCHERS = {
     "binance": BinanceSpotFetcher(),
     "bybit": BybitSpotFetcher(),
-    "okx": OKXSpotFetcher()
+    "okx": OKXSpotFetcher(),
+    "coinbase": CoinbaseSpotFetcher()
 }
 
+# Tolerancia relativa al comparar el volumen de una fuente externa con el volumen propio
+# de la fila. Por debajo de esto asumimos que ambas describen el MISMO mercado.
+RECONCILE_TOL = 0.02
+
+
+def _reconciles(external_total: pd.Series, own_total: pd.Series) -> pd.Series:
+    """True donde el total de la fuente externa cuadra con el propio dentro de RECONCILE_TOL.
+
+    Es la comprobación que faltaba: sin ella mezclábamos el buy_volume de las klines de
+    Binance (par USDT) con el sell_volume de Coinalyze (que podía venir del par FDUSD o USDC
+    por la cadena de fallback), y el delta resultante medía la diferencia de escala entre dos
+    mercados distintos, no la presión compradora.
+    """
+    own = pd.to_numeric(own_total, errors='coerce')
+    ext = pd.to_numeric(external_total, errors='coerce')
+    rel = (ext - own).abs() / own.where(own > 0)
+    return rel <= RECONCILE_TOL
+
+
+def _needs_fill(series: pd.Series, volume_base: pd.Series) -> pd.Series:
+    """True donde el valor falta. Un 0 con volumen > 0 también cuenta como hueco."""
+    s = pd.to_numeric(series, errors='coerce')
+    v = pd.to_numeric(volume_base, errors='coerce')
+    return s.isna() | ((s == 0) & (v > 0))
+
+
 def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: str) -> pd.DataFrame:
-    """Hybrid patching for Spot data."""
+    """Hybrid patching for Spot data.
+
+    Regla única, aplicada igual a los tres exchanges: de una fuente externa solo aceptamos la
+    MAGNITUD si su volumen total reconcilia con el volume_base de la fila. Si no reconcilia,
+    la usamos solo como RATIO y reescalamos. Si no hay ni ratio, se queda a NULL.
+
+    Y solo rellenamos `buy_volume_base`: `sell_volume_base` y `volume_delta` se DERIVAN
+    siempre de volume_base - buy, así que el invariante buy + sell == volume_base se cumple
+    por construcción y el delta nunca puede volver a mezclar dos fuentes.
+    """
     if exchange.lower() not in GLOBAL_FETCHERS: return df
     fetcher = GLOBAL_FETCHERS[exchange.lower()]
-    
+
     # 1. Ensure Today's Data
     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    
+
     # Initialize metric columns if they don't exist
     target_cols = ['buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count']
     for col in target_cols:
@@ -934,6 +1074,16 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
             df = pd.concat([df, today_row], ignore_index=True)
 
     if df.empty: return df
+
+    for col in ['volume_base', 'buy_volume_base', 'sell_volume_base', 'txn_count', 'buy_txn_count']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Procedencia del par buy/sell, solo para el log. Permite auditar una corrida sin tener
+    # que deducir a posteriori de dónde salió cada número.
+    sources = []
+    if df['buy_volume_base'].notna().any():
+        sources.append(f"nativo:{exchange}")
 
     # 2. Patch missing Metrics (Taker Buy Volume & Txn Counts)
     # Use dedicated spot key to avoid quota contention with alt_scraper futures batch.
@@ -957,71 +1107,134 @@ def patch_missing_metrics(df: pd.DataFrame, base: str, exchange: str, symbol: st
         first_date_str = df_sorted.iloc[0]['date']
         patch_start_dt = datetime.strptime(first_date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
         patch_start_ts = int(patch_start_dt.timestamp() * 1000)
-        
+
         print(f"    [Hybrid] Patching metrics via Coinalyze bulk history (from {first_date_str})...")
         client = CoinalyzeClient(api_key)
-        # Mapping for Coinalyze Spot symbols
-        # Note: Bybit uses prefix 's', but OKX and Binance usually don't for main Spot pairs.
-        cz_map = {"binance": ".A", "bybit": ".6", "okx": ".3"}
-        suffix = cz_map.get(exchange.lower(), '')
-        prefix = "s" if exchange.lower() == "bybit" else ""
-        
+        # Mapping for Coinalyze Spot symbols: (prefijo, quote, sufijo de exchange).
+        # Bybit lleva prefijo 's'; coinbase cotiza contra USD, no USDT.
+        cz_map = {
+            "binance":  ("",  "USDT", ".A"),
+            "bybit":    ("s", "USDT", ".6"),
+            "okx":      ("",  "USDT", ".3"),
+            "coinbase": ("",  "USD",  ".C"),
+        }
+        prefix, quote, suffix = cz_map.get(exchange.lower(), ("", "USDT", ""))
+
         # Binance Spot mapping is tricky on Coinalyze. Fallback sequence: USDT -> FDUSD -> USDC
-        syms_to_try = [f"{prefix}{base}USDT{suffix}"]
+        # Cuidado: FDUSD/USDC son OTRO mercado. Sirven como ratio, nunca como magnitud — de ahí
+        # la reconciliación de más abajo.
+        syms_to_try = [f"{prefix}{base}{quote}{suffix}"]
         if exchange.lower() == "binance":
             syms_to_try.extend([f"{base}FDUSD.A", f"{base}USDC.A"])
 
         df_cz = pd.DataFrame()
+        cz_symbol_used = None
         for cz_sym in syms_to_try:
             temp_df = client.fetch_ohlcv(cz_sym, patch_start_ts, to_unix_ms(datetime.now(timezone.utc)))
             if not temp_df.empty:
                 # Check if we got any of the critical metrics (more permissive)
                 has_tx = 'txn_count' in temp_df.columns and temp_df['txn_count'].notna().any() and (temp_df['txn_count'] > 0).any()
                 has_btv = 'buy_volume_base' in temp_df.columns and temp_df['buy_volume_base'].notna().any()
-                
+
                 if has_tx or has_btv:
                     df_cz = temp_df
+                    cz_symbol_used = cz_sym
                     print(f"    [Hybrid] Using Coinalyze symbol: {cz_sym} (tx={has_tx}, btv={has_btv})")
                     break
-        
+
         if not df_cz.empty:
-            target_cols = ['buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count']
-            df = df.merge(df_cz[['date'] + [c for c in target_cols if c in df_cz.columns]], on='date', how='left', suffixes=('', '_new'))
-            for col in target_cols:
-                new_col = f"{col}_new"
-                if new_col in df.columns:
-                    # Fill if current is 0 or NaN, and new is not NaN
-                    df[col] = df[col].replace(0, pd.NA).fillna(df[new_col])
-                    df.drop(columns=[new_col], inplace=True)
+            cz_cols = {c: f"cz_{c}" for c in ['volume_base', 'buy_volume_base', 'txn_count', 'buy_txn_count'] if c in df_cz.columns}
+            cz = df_cz[['date'] + list(cz_cols)].rename(columns=cz_cols)
+            cz = cz.drop_duplicates(subset=['date'], keep='last')
+            df = df.merge(cz, on='date', how='left')
+
+            if 'cz_buy_volume_base' in df.columns and 'cz_volume_base' in df.columns:
+                vol_ok = _reconciles(df['cz_volume_base'], df['volume_base'])
+                cz_vol = pd.to_numeric(df['cz_volume_base'], errors='coerce')
+                cz_ratio = pd.to_numeric(df['cz_buy_volume_base'], errors='coerce') / cz_vol.where(cz_vol > 0)
+                # Magnitud si el mercado es el mismo; si no, solo la proporción reescalada.
+                cz_buy = pd.to_numeric(df['cz_buy_volume_base'], errors='coerce').where(vol_ok, cz_ratio * df['volume_base'])
+                fill = _needs_fill(df['buy_volume_base'], df['volume_base']) & cz_buy.notna()
+                if fill.any():
+                    df.loc[fill, 'buy_volume_base'] = cz_buy[fill]
+                    scaled = int((fill & ~vol_ok).sum())
+                    sources.append(f"coinalyze:{cz_symbol_used}" + (f"(ratio x{scaled})" if scaled else ""))
+                    if scaled:
+                        print(f"    [Hybrid] {scaled} filas de {cz_symbol_used} no reconcilian con "
+                              f"volume_base: usadas como ratio, no como magnitud.")
+
+            # Los contadores van en pareja (txn_count, buy_txn_count): o vienen los dos de la
+            # misma fuente, o no valen. Mezclarlos daba buy_txn_count > txn_count (63 filas solo
+            # en BTC/binance) y por tanto sell_txn_count negativo.
+            if 'cz_txn_count' in df.columns and 'cz_buy_txn_count' in df.columns:
+                own_tx = pd.to_numeric(df['txn_count'], errors='coerce')
+                cz_btx = pd.to_numeric(df['cz_buy_txn_count'], errors='coerce')
+                tx_ok = _reconciles(df['cz_txn_count'], own_tx) | own_tx.isna()
+                take = tx_ok & cz_btx.notna() & _needs_fill(df['buy_txn_count'], df['volume_base'])
+                if take.any():
+                    df.loc[take, 'buy_txn_count'] = cz_btx[take]
+                    no_own = take & own_tx.isna()
+                    if no_own.any():
+                        df.loc[no_own, 'txn_count'] = pd.to_numeric(df['cz_txn_count'], errors='coerce')[no_own]
+                dropped = int((~tx_ok & cz_btx.notna()).sum())
+                if dropped:
+                    print(f"    [Hybrid] {dropped} filas con buy_txn_count descartadas: el "
+                          f"txn_count de Coinalyze no cuadra con el propio.")
+
+            df.drop(columns=[c for c in df.columns if c.startswith('cz_')], inplace=True)
             print(f"    [Hybrid] Patched {base} with Coinalyze depth data.")
 
-    # 3. Special Case: OKX Rubik Delta
+    # 3. Special Case: OKX Rubik — solo como RATIO (agrega todos los pares del activo).
     if exchange.lower() == "okx":
-        print(f"    [Hybrid] Patching OKX Taker Volume via Rubik...")
+        print(f"    [Hybrid] Patching OKX Taker Volume via Rubik (ratio)...")
         df_rubik = fetcher.fetch_bulk_rubik_delta(base)
         if not df_rubik.empty:
-            df = df.merge(df_rubik, on='date', how='left', suffixes=('', '_rubik'))
-            for col in ['buy_volume_base', 'sell_volume_base', 'volume_delta']:
-                rubik_col = f"{col}_rubik"
-                if rubik_col in df.columns:
-                    df[col] = df[col].fillna(df[rubik_col])
-                    df.drop(columns=[rubik_col], inplace=True)
+            df = df.merge(df_rubik.drop_duplicates(subset=['date'], keep='last'), on='date', how='left')
+            rubik_buy = df['buy_ratio'] * df['volume_base']
+            fill = _needs_fill(df['buy_volume_base'], df['volume_base']) & rubik_buy.notna()
+            if fill.any():
+                df.loc[fill, 'buy_volume_base'] = rubik_buy[fill]
+                sources.append(f"rubik-ratio(x{int(fill.sum())})")
+            df.drop(columns=['buy_ratio'], inplace=True)
 
-    # 4. Final Consistency Fix (Calculate Sell/Delta if components exist)
+    # 4. Derivados. sell y delta SIEMPRE salen de volume_base - buy: así el invariante
+    #    buy + sell == volume_base se cumple por construcción.
     if 'volume_base' in df.columns and 'buy_volume_base' in df.columns:
-        # Fill sell_volume if missing
-        df['sell_volume_base'] = df['sell_volume_base'].fillna(df['volume_base'] - df['buy_volume_base'])
-        # Always recalculate volume_delta if we have both buy/sell
+        df['sell_volume_base'] = df['volume_base'] - df['buy_volume_base']
         df['volume_delta'] = df['buy_volume_base'] - df['sell_volume_base']
-        
+
     if 'txn_count' in df.columns and 'buy_txn_count' in df.columns:
-        # Calculate sell_txn_count
-        df['sell_txn_count'] = df['txn_count'] - df['buy_txn_count']
-        
-    # 5. Final Cleanup (Drop duplicates and ensure consistency)
+        df['sell_txn_count'] = pd.to_numeric(df['txn_count'], errors='coerce') - pd.to_numeric(df['buy_txn_count'], errors='coerce')
+
+    # 5. Guarda de invariante. Es la red que impide que esto vuelva a corromperse en silencio:
+    #    antes, un sell contaminado se escribía en la DB sin que nada lo dijera.
+    if not df.empty:
+        vol = pd.to_numeric(df['volume_base'], errors='coerce')
+        buy = pd.to_numeric(df['buy_volume_base'], errors='coerce')
+        sell = pd.to_numeric(df['sell_volume_base'], errors='coerce')
+        bad_vol = buy.notna() & (
+            (buy < 0) | (sell < 0)
+            | (((buy + sell - vol).abs() / vol.where(vol > 0)) > RECONCILE_TOL)
+        )
+        if bad_vol.any():
+            print(f"    [WARN] {symbol}/{exchange}: {int(bad_vol.sum())} filas violan "
+                  f"buy+sell==volume_base — se anulan buy/sell/delta.")
+            df.loc[bad_vol, ['buy_volume_base', 'sell_volume_base', 'volume_delta']] = None
+
+        tx = pd.to_numeric(df['txn_count'], errors='coerce')
+        btx = pd.to_numeric(df['buy_txn_count'], errors='coerce')
+        bad_tx = btx.notna() & ((btx < 0) | (tx.notna() & (btx > tx)))
+        if bad_tx.any():
+            print(f"    [WARN] {symbol}/{exchange}: {int(bad_tx.sum())} filas con "
+                  f"buy_txn_count > txn_count — se anulan los contadores buy/sell.")
+            df.loc[bad_tx, ['buy_txn_count', 'sell_txn_count']] = None
+
+        print(f"    [Hybrid] {symbol}/{exchange} buy/sell desde: {', '.join(sources) or 'sin datos'}")
+
+    # 6. Final Cleanup (Drop duplicates and ensure consistency)
     if not df.empty:
         df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-    
+
     return df
 
 class SpotScraper:
@@ -1153,13 +1366,38 @@ class SpotScraper:
         df['exchange'], df['symbol'] = 'bybit', f"{base}USDT"
         return patch_missing_metrics(df, base, 'bybit', f"{base}USDT")
 
+    def fetch_coinbase(self, base: str, start_ts: int, end_ts: int) -> pd.DataFrame:
+        """ Coinbase Spot Hybrid (Coinalyze Primary) — mismo patrón que Bybit.
+
+        Coinalyze sirve Coinbase con símbolo {BASE}USD.C, con buy volume y contadores de
+        operaciones desde 2017 y cierres idénticos a la API de Coinbase, así que el
+        histórico completo entra en una sola llamada y el delta cumple el invariante sin
+        necesidad de reescalar nada.
+        """
+        print(f"  [Coinbase] Sourcing from Coinalyze...")
+        api_key = os.getenv("COINALYZE_API_KEY_SPOT") or os.getenv("COINALYZE_API_KEY")
+        if not api_key: return pd.DataFrame()
+        client = CoinalyzeClient(api_key)
+        df = client.fetch_ohlcv(f"{base}USD.C", start_ts, end_ts)
+        if df.empty: return pd.DataFrame()
+        symbol = spot_symbol_for('coinbase', base)
+        df['exchange'], df['symbol'] = 'coinbase', symbol
+        df = patch_missing_metrics(df, base, 'coinbase', symbol)
+
+        final_cols = ['date', 'price_open', 'price_high', 'price_low', 'price_close', 'volume_base', 'volume_usd', 'buy_volume_base', 'sell_volume_base', 'volume_delta', 'txn_count', 'buy_txn_count', 'sell_txn_count', 'symbol', 'exchange']
+        return df[[c for c in final_cols if c in df.columns]]
+
     def fetch_okx(self, base: str, start_ts: int, end_ts: int) -> pd.DataFrame:
         """ OKX Spot Hybrid """
         print(f"  [OKX] Fetching {base}...")
         all_data = []
         current_after = end_ts + 86400000
         while True:
-            params = {"instId": f"{base}-USDT", "bar": "1D", "after": current_after, "limit": 100}
+            # "1D" en OKX cierra en el corte de UTC+8 (16:00 UTC), no en medianoche UTC:
+            # la fila okx describia otras 24h que la de binance/bybit con la MISMA `date`
+            # (308 bps de diferencia media en price_close, frente a 23 bps de bybit).
+            # "1Dutc" es la misma vela alineada a UTC.
+            params = {"instId": f"{base}-USDT", "bar": "1Dutc", "after": current_after, "limit": 100}
             try:
                 resp = _tor.session.get(OKX_SPOT_API, params=params, timeout=15)
                 if resp.status_code in (403, 418, 429):
@@ -1193,7 +1431,9 @@ def main():
     parser.add_argument("--csv", action="store_true", help="Save results to local CSV files (default: False)")
     parser.add_argument("--top-range", type=str, default=None, help="Rank range (e.g. 1-50)")
     parser.add_argument("--symbols", type=str, default=None, help="Specific symbols (e.g. BTC,ETH)")
-    parser.add_argument("--exchanges", type=str, default="binance,bybit,okx", help="Exchanges to fetch")
+    parser.add_argument("--exchanges", type=str, default="binance,bybit,okx",
+                        help="Exchanges to fetch. Disponibles: binance,bybit,okx,coinbase "
+                             "(coinbase aún no entra en el default ni en run_pipeline.py)")
     parser.add_argument("--start", type=str, default="2017-01-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--output-dir", type=str, default="data/spot", help="Output directory")
     parser.add_argument("--metadata-only", action="store_true", help="Only sync metadata and exit")
@@ -1304,28 +1544,16 @@ def main():
         if not args.skip_exchange_symbol_filter:
             bases_for_exchange = [base for base in target_bases if base in exchange_symbols]
             skipped = len(target_bases) - len(bases_for_exchange)
-            print(f"  [Filter] {len(bases_for_exchange)} tradable USDT spot assets on {exchange}; skipping {skipped} unsupported assets.")
+            print(f"  [Filter] {len(bases_for_exchange)} tradable {SPOT_SYMBOL_FORMATS.get(exchange, ('', 'USDT'))[1]} spot assets on {exchange}; skipping {skipped} unsupported assets.")
         else:
             bases_for_exchange = target_bases
 
         for base in bases_for_exchange:
             try:
-                # Determine save path and incremental start
-                fname = f"{base}USDT_spot_1d.csv"
-                if exchange == 'okx': fname = f"{base}-USDT_spot_1d.csv"
-                path = os.path.join(exch_dir, f"{base}USDT_spot_1d.csv") # Default format
-                
-                # Check for exchange-specific formats if needed, but keeping it consistent
-                if exchange == 'okx': path = os.path.join(exch_dir, f"{base}USDT_spot_1d.csv")
-                # Wait, earlier verification showed okx saved as BTCUSDT_spot_1d.csv in its dir
-                # Let's check what I did in the previous tool calls
-                
-                path = os.path.join(exch_dir, f"{base}USDT_spot_1d.csv")
-                
-                # Dynamic start for incremental fetch
-                # Standardize symbol/exchange format for DB lookup
-                db_symbol = f"{base}USDT"
-                if exchange == 'okx': db_symbol = f"{base}-USDT"
+                # Símbolo nativo del venue (BTCUSDT / BTC-USDT / BTC-USD) y ruta del CSV.
+                # El nombre de fichero va sin separador, que es como se guardaron siempre.
+                db_symbol = spot_symbol_for(exchange, base)
+                path = os.path.join(exch_dir, f"{db_symbol.replace('-', '')}_spot_1d.csv")
                 
                 dynamic_start = scraper.get_incremental_start(path, start_ts, db_symbol, exchange, db_manager)
                 
@@ -1334,6 +1562,7 @@ def main():
                     time.sleep(0.3 if _tor.active else 1.0)  # Tor rotates IP → lower 429 risk
                 elif exchange == 'bybit': df_new = scraper.fetch_bybit(base, dynamic_start, end_ts)
                 elif exchange == 'okx': df_new = scraper.fetch_okx(base, dynamic_start, end_ts)
+                elif exchange == 'coinbase': df_new = scraper.fetch_coinbase(base, dynamic_start, end_ts)
                 else: break
                 
                 if not df_new.empty:

@@ -112,3 +112,91 @@ Tabla operativa de corto plazo escrita en cada poll de `realtime_daemon.py`. Con
 ### 3.3 `symbols` (Mapeo)
 - `base_asset`, `quote_asset`, `symbol` (nombre nativo en el exchange).
 - `exchange_id`, `contract_type`, `is_active`, `first_data_date`, `last_data_date`.
+
+---
+
+## 🪙 4. Tabla de Spot
+
+### 4.1 `spot_daily_ohlcv` (Histórico Diario Spot)
+*PK compuesta `(date, symbol, exchange)`. La escribe `spot_scraper.py`.*
+- `date`, `symbol` (nativo del exchange: `BTCUSDT`, `BTC-USDT`, `BTC-USD`), `exchange` (`binance`, `bybit`, `okx`, `coinbase`).
+- **OHLCV:** `price_open`, `price_high`, `price_low`, `price_close`, `volume_base`, `volume_usd`.
+- **Microestructura (CVD):** `buy_volume_base`, `sell_volume_base`, `volume_delta`,
+  `txn_count`, `buy_txn_count`, `sell_txn_count`.
+
+**Invariante del delta** — se cumple por construcción y hay que mantenerlo:
+
+```
+buy_volume_base + sell_volume_base == volume_base        (tolerancia 2%)
+volume_delta                       == buy - sell
+0 <= buy_txn_count <= txn_count
+```
+
+`sell_volume_base` y `volume_delta` **nunca** se importan de una fuente externa: se derivan de
+`volume_base - buy_volume_base`. Una fuente externa (Coinalyze, Rubik) solo aporta magnitud si su
+volumen reconcilia con el `volume_base` de la fila; si no, se usa únicamente como **ratio** y se
+reescala. Romper esto es lo que corrompió el delta hasta la migración `005`: el `buy` salía de un
+mercado y el `sell` de otro, y el delta acababa midiendo la diferencia de escala entre los dos.
+
+Auditar en cualquier momento con:
+
+```bash
+python audit_spot_delta.py --source db
+```
+
+Una correlación **negativa** entre `sign(volume_delta)` y el retorno diario es la firma de columnas
+`buy`/`sell` invertidas en el parser de alguna fuente.
+
+La columna `med btxn/txn` del auditor marca con `!` los exchanges cuya mediana de
+`buy_txn_count / txn_count` se aleja de 0.5. Un día suelto fuera de la banda `[0.2, 0.8]` es normal
+(volumen mínimo, flujo unidireccional); un sesgo sistemático significa que los dos contadores no
+describen el mismo mercado.
+
+**Coinbase** cotiza contra **USD**, no USDT (401 pares online frente a 21, y 60% del universo
+trackeado frente al 11%). `volume_base` va en unidades del activo base, así que agrega igual que el
+resto; el `price_close` difiere del de un par USDT lo que desvíe el peg (<0.1%). Sus velas diarias sí
+cierran a **medianoche UTC**. La fuente es Coinalyze (`{BASE}USD.C`, con `bv`/`tx`/`btx` desde
+2017-01-01), que reconcilia con el propio `volume_base` y por tanto entra en magnitud, sin degradar a
+ratio. Hoy **no está en el pipeline nocturno**: se lanza a mano con
+`python spot_scraper.py --exchanges coinbase`.
+
+**Alineación horaria** — todas las fuentes tienen que describir el MISMO día UTC. Las velas diarias
+de OKX se piden con `bar=1Dutc`, **nunca** `1D`: en OKX la vela `1D` cierra en el corte de UTC+8, así
+que cubre `[D 16:00, D+1 16:00)` UTC. Con `1D` cada fila okx describía otras 24h que la fila de
+binance/bybit con la misma `date` (308 bps de desviación media en `price_close`, frente a 23 bps de
+bybit) y además descorrelacionaba el delta, porque el `buy_ratio` de Rubik sí viene en días UTC.
+Ver `migrations/006_reload_okx_spot_1dutc.sql`; lo fija `tests/test_okx_utc_alignment.py`.
+
+Contraste de sanidad, comparando `price_close` por `(date, activo)` — cualquier exchange que se
+salga de un dígito de mediana está en otra ventana temporal:
+
+| | media | mediana |
+|---|---|---|
+| okx vs binance | 10.2 bps | 4.3 bps |
+| bybit vs binance | 23.1 bps | 4.8 bps |
+
+> `IP-USDT` y `TON-USDT` no se pudieron recargar desde OKX (`code 51001`: instrumentos
+> deslistados). Se realinearon desde Coinalyze, que sí conserva su histórico y en UTC — ver 4.2.
+
+### 4.2 Activos deslistados — no se borran nunca
+
+La tabla conserva los pares que ya no cotizan, y su última vela marca la fecha de deslistado:
+
+| exchange | vivos | deslistados |
+|---|---|---|
+| binance | 142 | 6 |
+| bybit | 136 | 7 |
+| okx | 130 | 2 |
+| coinbase | 107 | 0 |
+
+Quitarlos metería **sesgo de supervivencia**: un backtest sobre el universo resultante solo
+vería los activos que sobrevivieron y sobreestimaría el retorno. Esto manda sobre cualquier
+criterio de limpieza — si un par deslistado tiene datos defectuosos, se **corrigen**, no se
+borra la fila.
+
+Caso resuelto así: tras la recarga a `1Dutc` de la 006, `TON-USDT` e `IP-USDT` se quedaron con
+velas UTC+8 (212 y 405 bps de desvío) porque OKX ya no sirve su histórico en ningún `bar`.
+Coinalyze sí lo conserva (`TONUSDT.3`, `IPUSDT.3`) y en UTC, así que se realinearon con
+`reload_okx_delisted_from_coinalyze.py` en vez de eliminarlas: quedaron en 6.5 y 6.8 bps
+**conservando la fecha de deslistado exacta**. Se recortan 285 días del arranque de las series,
+que Coinalyze no cubre; un inicio más tardío no sesga —lo que sesga es truncar la muerte.
