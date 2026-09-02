@@ -15,13 +15,15 @@ en la misma tabla. La causa no era la red:
 Bybit y OKX no sufrían porque reciben el snapshot por el propio WebSocket.
 """
 import asyncio
+import json
 import time
 import unittest
 from collections import deque
 from unittest import mock
 
 from orderbook_daemon import (BinanceFuturesStream, BinanceSpotStream,
-                              CoinbaseSpotStream, compute_metrics)
+                              BybitLinearStream, CoinbaseSpotStream,
+                              OKXSwapStream, UpbitSpotStream, compute_metrics)
 
 ASSETS = [{"base_asset": "BTC", "symbol_binance": "BTCUSDT",
            "symbol_binance_spot": "BTCUSDT"}]
@@ -389,3 +391,212 @@ class CoinbaseResetTest(unittest.TestCase):
         self.assertIsNotNone(s.get_metrics().get("BTC-USD"))
         s.books["BTC-USD"].reset()
         self.assertEqual(s.get_metrics(), {})
+
+
+# ---------------------------------------------------------------------------
+# Rechazos de suscripción e integridad — bybit y okx
+# ---------------------------------------------------------------------------
+
+BB_ASSETS = [{"base_asset": "BTC", "symbol_bybit": "BTCUSDT"}]
+OK_ASSETS = [{"base_asset": "BTC", "symbol_okx": "BTC-USDT-SWAP"}]
+
+
+def _bb(tipo, u, b=None, a=None):
+    return {"topic": "orderbook.1000.BTCUSDT", "type": tipo,
+            "data": {"u": u, "b": b or [["100", "1"]], "a": a or [["101", "1"]]}}
+
+
+class RechazoDeSuscripcionTest(unittest.TestCase):
+    """Un rechazo del servidor no puede acabar en el mismo cajón que el ruido.
+
+    Es el fallo que en coinbase dio cero snapshots sin una sola línea de log: el mensaje
+    de error no tiene la forma de un mensaje de datos, así que el filtro que separa datos
+    de control lo descartaba y el stream se quedaba mudo creyéndose suscrito. Estaba
+    igual en bybit y en okx; el texto de abajo es el que devuelve bybit de verdad al
+    pedir una profundidad que no existe.
+    """
+
+    def test_bybit_propaga_el_rechazo(self):
+        s = BybitLinearStream(BB_ASSETS)
+        with self.assertRaisesRegex(ConnectionError, "handler not found"):
+            s._validar_ack({"op": "subscribe", "success": False,
+                            "ret_msg": "error:handler not found,topic:orderbook.500.BTCUSDT"})
+
+    def test_bybit_acepta_el_acuse_bueno_y_no_lo_confunde_con_datos(self):
+        s = BybitLinearStream(BB_ASSETS)
+        self.assertTrue(s._validar_ack({"op": "subscribe", "success": True}))
+        self.assertTrue(s._validar_ack({"op": "pong"}))
+        self.assertFalse(s._validar_ack(_bb("snapshot", 1)))
+
+    def test_okx_propaga_el_rechazo(self):
+        # okx descartaba todo lo que llevara `event`, y sus errores van justo ahí.
+        with self.assertRaisesRegex(ConnectionError, "60012"):
+            OKXSwapStream._validar_evento(
+                {"event": "error", "code": "60012", "msg": "Invalid request"})
+
+    def test_okx_deja_pasar_el_evento_normal_sin_confundirlo_con_datos(self):
+        self.assertTrue(OKXSwapStream._validar_evento({"event": "subscribe"}))
+        self.assertFalse(OKXSwapStream._validar_evento(
+            {"arg": {"instId": "BTC-USDT-SWAP"}, "action": "snapshot", "data": [{}]}))
+
+
+class BybitSecuenciaTest(unittest.TestCase):
+    """Bybit era el único stream sin ninguna verificación de integridad.
+
+    binance valida `pu`/`U`, okx comprueba checksum y coinbase el `sequence_num`. Bybit
+    manda `u` incrementando de uno en uno y no se miraba, así que un delta perdido dentro
+    de una conexión viva corrompía el libro en silencio hasta la siguiente reconexión.
+    """
+
+    def test_un_delta_consecutivo_pasa(self):
+        s = BybitLinearStream(BB_ASSETS)
+        s._validar_secuencia("BTCUSDT", _bb("snapshot", 10))
+        s._validar_secuencia("BTCUSDT", _bb("delta", 11))
+        self.assertEqual(s._u["BTCUSDT"], 11)
+
+    def test_un_hueco_rompe_la_conexion(self):
+        s = BybitLinearStream(BB_ASSETS)
+        s._validar_secuencia("BTCUSDT", _bb("snapshot", 10))
+        with self.assertRaisesRegex(ConnectionError, "hueco de secuencia"):
+            s._validar_secuencia("BTCUSDT", _bb("delta", 12))
+
+    def test_el_snapshot_reinicia_el_contador_en_vez_de_validarlo(self):
+        # Al resuscribir, bybit reenvía el libro entero con un `u` que no continúa el
+        # anterior. Tratarlo como hueco dejaría el stream en bucle de reconexión.
+        s = BybitLinearStream(BB_ASSETS)
+        s._validar_secuencia("BTCUSDT", _bb("snapshot", 10))
+        s._validar_secuencia("BTCUSDT", _bb("snapshot", 999))
+        self.assertEqual(s._u["BTCUSDT"], 999)
+
+    def test_cada_simbolo_lleva_su_propio_contador(self):
+        s = BybitLinearStream([{"base_asset": "BTC", "symbol_bybit": "BTCUSDT"},
+                               {"base_asset": "ETH", "symbol_bybit": "ETHUSDT"}])
+        s._validar_secuencia("BTCUSDT", _bb("snapshot", 10))
+        s._validar_secuencia("ETHUSDT", _bb("snapshot", 500))
+        s._validar_secuencia("BTCUSDT", _bb("delta", 11))
+        self.assertEqual((s._u["BTCUSDT"], s._u["ETHUSDT"]), (11, 500))
+
+
+class ResetAlReconectarTest(unittest.TestCase):
+    def test_un_libro_reseteado_deja_de_emitir_metricas(self):
+        # Entre el error de WebSocket y el snapshot nuevo, un libro viejo se leería como
+        # bueno: orderbook_latest lo recoge cada 60 s.
+        s = BybitLinearStream(BB_ASSETS)
+        s.books["BTCUSDT"].apply_snapshot([(100.0, 1.0)], [(101.0, 1.0)])
+        self.assertIsNotNone(s.get_metrics().get("BTCUSDT"))
+        s.books["BTCUSDT"].reset()
+        self.assertEqual(s.get_metrics(), {})
+
+
+# ---------------------------------------------------------------------------
+# Upbit — doble suscripción, fina y agrupada
+# ---------------------------------------------------------------------------
+
+UP_ASSETS = [{"base_asset": "BTC", "symbol_upbit": "KRW-BTC"}]
+
+
+def _unidad(bp, bs, ap, asz):
+    return {"bid_price": bp, "bid_size": bs, "ask_price": ap, "ask_size": asz}
+
+
+class UpbitNivelTest(unittest.TestCase):
+    """El `level` de Upbit sólo admite potencias de diez.
+
+    Medido contra el servidor: 10, 10000, 100000 y 1000000 funcionan; 5, 50, 50000 y
+    500000 dejan el par mudo sin devolver error. Los valores esperados de abajo son los
+    que se verificaron en vivo, con su alcance real entre paréntesis.
+    """
+
+    def test_el_nivel_sale_de_la_escalera_de_potencias(self):
+        f = UpbitSpotStream._nivel_para
+        self.assertEqual(f(106_061_000, 0.12, 30), 1_000_000)   # KRW-BTC → 27,70%
+        self.assertEqual(f(3_299_500, 0.12, 30), 100_000)       # KRW-ETH → 90,77%
+        self.assertEqual(f(1_839, 0.12, 30), 10)                # KRW-XRP → 16,08%
+
+    def test_los_pares_que_ya_alcanzan_no_se_agrupan(self):
+        # KRW-DOGE llega al 26% sin agrupar porque su tick es un 0,9% del precio:
+        # agruparlo sólo empeoraría la resolución sin ganar nada.
+        s = UpbitSpotStream(UP_ASSETS)
+        s._mid_krw["KRW-BTC"] = 112.5
+        s.books["KRW-BTC"].apply_snapshot([(80.0, 1.0), (100.0, 1.0)],
+                                          [(101.0, 1.0), (130.0, 1.0)])
+        self.assertEqual(s._calcular_niveles(), {})
+
+    def test_un_par_por_debajo_de_un_krw_no_se_agrupa(self):
+        # KRW-SHIB cotiza a 0,01 KRW y la escalera tiene suelo en 1: el cubo saldría cien
+        # veces mayor que el precio. Upbit lo dejaba mudo, y a KRW-XEC le devolvía un
+        # único cubo con una cobertura falsa del 100%.
+        s = UpbitSpotStream(UP_ASSETS)
+        s._mid_krw["KRW-BTC"] = 0.01
+        s.books["KRW-BTC"].apply_snapshot([(0.0099, 1.0)], [(0.0101, 1.0)])
+        self.assertEqual(s._calcular_niveles(), {})
+
+
+class UpbitSuscripcionTest(unittest.TestCase):
+    def test_siempre_va_la_entrada_sin_agrupar_y_una_por_nivel(self):
+        s = UpbitSpotStream(UP_ASSETS)
+        pet = json.loads(s._suscripcion(["KRW-BTC", "KRW-ETH", "KRW-XRP"],
+                                        {"KRW-BTC": 1_000_000, "KRW-ETH": 1_000_000,
+                                         "KRW-XRP": 10}).decode())
+        libros = [e for e in pet if e.get("type") == "orderbook"]
+        self.assertIsNone(libros[0].get("level"))
+        self.assertEqual(len(libros[0]["codes"]), 3)
+        agrupadas = {e["level"]: e["codes"] for e in libros[1:]}
+        self.assertEqual(agrupadas, {10: ["KRW-XRP"],
+                                     1_000_000: ["KRW-BTC", "KRW-ETH"]})
+
+    def test_sin_niveles_solo_va_la_entrada_fina(self):
+        s = UpbitSpotStream(UP_ASSETS)
+        pet = json.loads(s._suscripcion(["KRW-BTC"], {}).decode())
+        self.assertEqual(len([e for e in pet if e.get("type") == "orderbook"]), 1)
+
+
+class UpbitRuteoTest(unittest.TestCase):
+    def test_el_campo_level_decide_a_que_libro_va(self):
+        s = UpbitSpotStream(UP_ASSETS)
+        with mock.patch.object(s, "_get_rate", return_value=1.0):
+            s._aplicar({"type": "orderbook", "code": "KRW-BTC", "level": 0,
+                        "orderbook_units": [_unidad(100.0, 1.0, 101.0, 1.0)]})
+            s._aplicar({"type": "orderbook", "code": "KRW-BTC", "level": 1_000_000,
+                        "orderbook_units": [_unidad(90.0, 5.0, 110.0, 5.0)]})
+        self.assertEqual(s.books["KRW-BTC"].bids, {100.0: 1.0})
+        self.assertEqual(s.books_wide["KRW-BTC"].bids, {90.0: 5.0})
+
+
+class UpbitCombinarTest(unittest.TestCase):
+    """El libro fino manda; el agrupado sólo rellena lo que el fino no alcanza."""
+
+    @staticmethod
+    def _metricas(bids, asks):
+        return compute_metrics(dict(bids), dict(asks))
+
+    def test_la_banda_que_el_fino_cubre_no_se_toca(self):
+        fino  = self._metricas([(99.5, 7.0)], [(100.5, 3.0)])
+        ancho = self._metricas([(90.0, 1.0)], [(110.0, 1.0)])
+        m = UpbitSpotStream._combinar(fino, ancho)
+        self.assertEqual(m["bid_qty_1pct"], fino["bid_qty_1pct"])
+
+    def test_la_banda_que_el_fino_no_alcanza_se_rellena(self):
+        fino  = self._metricas([(99.99, 1.0)], [(100.01, 1.0)])   # ~0,01% de alcance
+        ancho = self._metricas([(91.0, 4.0), (99.0, 6.0)], [(101.0, 2.0), (109.0, 3.0)])
+        self.assertIsNone(fino["imbalance_10pct"])
+        m = UpbitSpotStream._combinar(fino, ancho)
+        self.assertEqual(m["imbalance_10pct"], ancho["imbalance_10pct"])
+        self.assertEqual(m["depth_coverage_pct"], ancho["depth_coverage_pct"])
+
+    def test_una_banda_agrupada_vacia_no_se_acepta(self):
+        # El cubo agrupado puede ser MÁS ANCHO que la banda. En KRW-ETH, con level=100000
+        # sobre un mid de 3,3M KRW, cada cubo mide el 3% del precio: dentro del ±1% no
+        # cae ninguno, compute_metrics suma cero a los dos lados y devuelve imbalance
+        # 0.0, que se lee como "equilibrado" en vez de "no medible".
+        fino  = self._metricas([(99.99, 1.0)], [(100.01, 1.0)])
+        ancho = self._metricas([(97.0, 5.0)], [(103.0, 5.0)])
+        self.assertEqual(ancho["imbalance_1pct"], 0.0)
+        self.assertEqual(ancho["bid_levels_1pct"], 0)
+        m = UpbitSpotStream._combinar(fino, ancho)
+        self.assertIsNone(m["imbalance_1pct"])
+        self.assertEqual(m["imbalance_10pct"], ancho["imbalance_10pct"])
+
+    def test_sin_libro_agrupado_devuelve_el_fino_tal_cual(self):
+        fino = self._metricas([(99.5, 1.0)], [(100.5, 1.0)])
+        self.assertEqual(UpbitSpotStream._combinar(fino, None), fino)

@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -712,6 +713,15 @@ class BinanceFuturesStream:
 # ---------------------------------------------------------------------------
 
 class BybitLinearStream:
+    """Libro de Bybit linear (perpetuos USDT) por WebSocket V5.
+
+    Techo de profundidad: 1000 niveles, el canal mas hondo que publica el exchange.
+    Verificado contra el servidor que `orderbook.500` no existe en linear
+    (responde `error:handler not found`) y que `orderbook.1000` si vale, tanto en
+    linear como en spot. Ver docs/database.md 2.1 bis: cada venue sirve una
+    profundidad distinta y por eso las bandas no son comparables entre ellos.
+    """
+
     WS_URL      = "wss://stream.bybit.com/v5/public/linear"
     EXCHANGE    = "bybit"
     MARKET_TYPE = "futures"
@@ -724,6 +734,43 @@ class BybitLinearStream:
         for a in self.assets:
             sym = a[self.SYM_KEY].upper()
             self.books[sym] = LocalOrderBook(sym, self.EXCHANGE)
+        self._u: Dict[str, int] = {}   # ultimo updateId visto por simbolo
+
+    def _validar_ack(self, msg: dict) -> bool:
+        """Devuelve True si el mensaje era un acuse, y revienta si fue un rechazo.
+
+        Un rechazo de bybit llega como {"success": false, "ret_msg": "error:handler not
+        found,topic:orderbook.500.BTCUSDT"} y NO tiene `topic`, asi que el filtro por
+        `orderbook.` lo descartaba sin dejar rastro: el stream se creia suscrito y se
+        quedaba mudo para siempre. Es el mismo fallo que en coinbase dio cero snapshots
+        sin una sola linea de log.
+        """
+        if "success" not in msg and msg.get("op") not in ("subscribe", "pong"):
+            return False
+        if msg.get("success") is False:
+            raise ConnectionError(f"bybit rechazo la suscripcion: {msg.get('ret_msg')}")
+        return True
+
+    def _validar_secuencia(self, symbol: str, msg: dict) -> None:
+        """Comprueba que no falta ningun delta.
+
+        Era el unico stream sin ninguna verificacion de integridad: binance valida
+        `pu`/`U`, okx comprueba checksum y coinbase el `sequence_num`. Bybit manda `u`
+        incrementando de uno en uno y no se miraba, asi que un delta perdido dentro de
+        una conexion viva corrompia el libro en silencio hasta la siguiente reconexion,
+        que puede tardar horas.
+        """
+        u = msg.get("data", {}).get("u")
+        if u is None:
+            return
+        if msg.get("type") == "snapshot":
+            self._u[symbol] = u          # el snapshot reinicia, no valida
+            return
+        anterior = self._u.get(symbol)
+        if anterior is not None and u != anterior + 1:
+            raise ConnectionError(
+                f"bybit hueco de secuencia en {symbol}: esperaba {anterior + 1}, llego {u}")
+        self._u[symbol] = u
 
     async def _run_chunk(self, symbols: List[str]) -> None:
         backoff = 5
@@ -740,7 +787,7 @@ class BybitLinearStream:
                             await ws.send(json.dumps({"op": "ping"}))
                             last_ping = time.time()
                         msg = json.loads(raw)
-                        if msg.get("op") in ("subscribe", "pong"):
+                        if self._validar_ack(msg):
                             continue
                         topic = msg.get("topic", "")
                         if not topic.startswith("orderbook."):
@@ -749,6 +796,7 @@ class BybitLinearStream:
                         book   = self.books.get(symbol)
                         if not book:
                             continue
+                        self._validar_secuencia(symbol, msg)
                         data = msg.get("data", {})
                         bids = [(float(p), float(q)) for p, q in data.get("b", [])]
                         asks = [(float(p), float(q)) for p, q in data.get("a", [])]
@@ -758,6 +806,13 @@ class BybitLinearStream:
                             book.apply_delta(bids, asks)
             except Exception as e:
                 log.warning("bybit WS error: %s — reconnecting in %ds", e, backoff)
+                # Se han perdido deltas: los libros de este trozo ya no son de fiar, y
+                # bybit reenvia un snapshot completo al resuscribir.
+                for sym in symbols:
+                    book = self.books.get(sym)
+                    if book:
+                        book.reset()
+                    self._u.pop(sym, None)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
 
@@ -783,6 +838,14 @@ class BybitLinearStream:
 # ---------------------------------------------------------------------------
 
 class OKXSwapStream:
+    """Libro de OKX swap (perpetuos USDT) por el canal publico `books`.
+
+    Techo de profundidad: 400 niveles. Los canales mas hondos (`books-l2-tbt`,
+    `books50-l2-tbt`) exigen cuenta VIP4+, asi que no hay opcion publica mejor: okx
+    solo alcanza el 10% del mid en dos tercios de sus filas, frente al 100% de
+    binance futures. Ver docs/database.md 2.1 bis.
+    """
+
     WS_URL      = "wss://ws.okx.com:8443/ws/v5/public"
     EXCHANGE    = "okx"
     MARKET_TYPE = "futures"
@@ -800,6 +863,22 @@ class OKXSwapStream:
         """CRC32 over interleaved top-25 bid+ask levels as 'price:qty:...' string."""
         return True
 
+    @staticmethod
+    def _validar_evento(msg: dict) -> bool:
+        """Devuelve True si el mensaje era de control, y revienta si fue un rechazo.
+
+        Los rechazos de okx llegan como {"event":"error","code":...,"msg":...}, asi que
+        descartar todo lo que lleve `event` los tragaba: el stream se quedaba mudo
+        creyendose suscrito, sin una sola linea de log. Es el mismo fallo que en coinbase
+        escondio el tope de 30 productos por conexion.
+        """
+        if "event" not in msg:
+            return False
+        if msg.get("event") == "error":
+            raise ConnectionError(
+                f"okx rechazo la suscripcion: {msg.get('code')} {msg.get('msg')}")
+        return True
+
     async def _run_chunk(self, inst_ids: List[str]) -> None:
         backoff = 5
         while True:
@@ -812,7 +891,7 @@ class OKXSwapStream:
                     log.info("okx WS subscribed (%d instruments)", len(inst_ids))
                     async for raw in ws:
                         msg = json.loads(raw)
-                        if "event" in msg:
+                        if self._validar_evento(msg):
                             continue
                         action = msg.get("action", "")
                         # instId is in msg["arg"]["instId"], not in data[0]
@@ -840,6 +919,12 @@ class OKXSwapStream:
                                     await ws.send(json.dumps({"op": "subscribe", "args": [{"channel": "books", "instId": inst}]}))
             except Exception as e:
                 log.warning("okx WS error: %s — reconnecting in %ds", e, backoff)
+                # Se han perdido deltas: hasta que llegue el snapshot nuevo, un libro
+                # viejo mentiria sin avisar y orderbook_latest lo leeria a los 60 s.
+                for inst in inst_ids:
+                    book = self.books.get(inst)
+                    if book:
+                        book.reset()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
 
@@ -865,17 +950,49 @@ class OKXSwapStream:
 # ---------------------------------------------------------------------------
 
 class UpbitSpotStream:
+    """Libro de Upbit spot, suscrito DOS veces por par: sin agrupar y agrupado.
+
+    Upbit esta capado a 30 niveles por lado -- `count` de 100 o de 500 devuelve 30
+    igual-- asi que en los pares caros esos 30 niveles no llegan ni al 0,15% del mid y
+    las bandas anchas salian NULL: medido sobre 30 dias, solo el 29% de las filas de
+    upbit tenian `imbalance_10pct`, contra el 100% de binance futures.
+
+    El parametro `level` agrupa por precio y el alcance escala lineal con el
+    (`alcance ~ 30 * level / mid`), pero con dos pegas medidas contra el servidor:
+
+      * Solo valen POTENCIAS DE DIEZ. 5, 50, 50000 y 500000 dejan el par mudo; 10,
+        10000, 100000 y 1000000 funcionan. Con saltos de 10x no se puede afinar.
+      * Un `level` inadecuado no da error: el par simplemente deja de llegar, o se corta
+        la conexion. Es la misma familia de fallo silencioso que costo una tarde en
+        coinbase, de ahi el plazo de ESPERA_DATOS.
+
+    Como el salto es de 10x, un solo `level` que alcance el 10% hace cubos tan anchos
+    que la banda del 1% se quedaria en tres cubos y su bid_qty heredaria un error de
+    cuantizacion grande -- y esa banda hoy funciona en el 98% de las filas. Por eso se
+    mantienen los dos libros: el fino manda en lo que alcanza y el agrupado solo rellena
+    las bandas que el fino no cubre. Verificado que Upbit sirve el mismo par dos veces
+    con niveles distintos y los distingue con el campo `level` de cada mensaje.
+    """
+
     WS_URL      = "wss://api.upbit.com/websocket/v1"
     REST_BASE   = "https://api.upbit.com/v1"
     EXCHANGE    = "upbit"
     MARKET_TYPE = "spot"
 
+    NIVELES_UPBIT    = 30      # tope duro del exchange, no configurable
+    ALCANCE_OBJETIVO = 0.12    # margen sobre la banda mas ancha, que es del 10%
+    ESPERA_MIDS      = 10.0    # s escuchando sin agrupar antes de calcular los `level`
+    ESPERA_DATOS     = 60.0    # s sin un solo mensaje -> la suscripcion no prendio
+
     def __init__(self, assets: List[dict]):
         self.assets = [a for a in assets if a.get("symbol_upbit")]
         self.books: Dict[str, LocalOrderBook] = {}
+        self.books_wide: Dict[str, LocalOrderBook] = {}
         for a in self.assets:
             sym = a["symbol_upbit"]  # e.g. "KRW-BTC"
-            self.books[sym] = LocalOrderBook(sym, self.EXCHANGE)
+            self.books[sym]      = LocalOrderBook(sym, self.EXCHANGE)
+            self.books_wide[sym] = LocalOrderBook(sym, self.EXCHANGE)
+        self._mid_krw: Dict[str, float] = {}   # mid en KRW, para calcular el `level`
         self._krw_usd_rate: float = 0.0
         self._rate_lock           = threading.Lock()
         self._last_rate_refresh   = 0.0
@@ -905,49 +1022,158 @@ class UpbitSpotStream:
         with self._rate_lock:
             return self._krw_usd_rate
 
+    @staticmethod
+    def _nivel_para(mid_krw: float, alcance_objetivo: float, niveles: int) -> int:
+        """Menor potencia de diez que cubre el alcance pedido. Solo valen esas."""
+        if mid_krw <= 0:
+            return 0
+        minimo = mid_krw * alcance_objetivo / niveles
+        return 10 ** max(0, math.ceil(math.log10(minimo))) if minimo > 0 else 0
+
+    def _calcular_niveles(self) -> Dict[str, int]:
+        """Un `level` por par, solo para los que sin agrupar no llegan a la banda ancha.
+
+        Los pares baratos ya alcanzan lejos porque su tick es un porcentaje grande del
+        precio (KRW-DOGE llega al 26% sin agrupar), asi que agruparlos solo empeoraria
+        la resolucion sin ganar nada.
+        """
+        objetivo = self.ALCANCE_OBJETIVO * 100.0
+        # Un cubo tiene que caber al menos dos veces en la banda mas ancha; si no, el
+        # libro agrupado no resuelve ni esa y solo aporta ruido.
+        cubo_maximo = (DEPTH_BANDS[-1] / 100.0) / 2.0
+        niveles = {}
+        for code, book in self.books.items():
+            m = book.snapshot()
+            if not m or m["depth_coverage_pct"] >= objetivo:
+                continue
+            mid   = self._mid_krw.get(code, 0.0)
+            nivel = self._nivel_para(mid, self.ALCANCE_OBJETIVO, self.NIVELES_UPBIT)
+            # La escalera tiene suelo en 1 KRW, asi que en los pares que cotizan por
+            # debajo de esa cifra el cubo saldria mas grande que el propio precio.
+            # KRW-SHIB (mid 0,01 KRW) pedia level=1 y Upbit lo dejaba mudo; KRW-XEC si
+            # se suscribia y devolvia un unico cubo con una cobertura falsa del 100%.
+            if nivel <= 0 or nivel > mid * cubo_maximo:
+                continue
+            niveles[code] = nivel
+        return niveles
+
+    def _suscripcion(self, codes: List[str], niveles: Dict[str, int]) -> bytes:
+        """Una entrada sin agrupar con todos los pares, mas una por cada `level` usado.
+
+        Verificado que conviven en el mismo mensaje y que Upbit etiqueta cada respuesta
+        con su `level`, incluso sirviendo el mismo par dos veces.
+        """
+        entradas = [{"type": "orderbook", "codes": codes, "count": self.NIVELES_UPBIT}]
+        por_nivel: Dict[int, List[str]] = {}
+        for code, nivel in niveles.items():
+            por_nivel.setdefault(nivel, []).append(code)
+        for nivel, grupo in sorted(por_nivel.items()):
+            entradas.append({"type": "orderbook", "codes": sorted(grupo),
+                             "count": self.NIVELES_UPBIT, "level": nivel})
+        return json.dumps([{"ticket": str(uuid.uuid4())}] + entradas).encode("utf-8")
+
+    def _aplicar(self, msg: dict) -> None:
+        code = msg.get("code", "")
+        # `level` distingue los dos juegos: 0 o ausente es el libro fino.
+        agrupado = bool(msg.get("level"))
+        book = (self.books_wide if agrupado else self.books).get(code)
+        if not book:
+            return
+        rate = self._get_rate()
+        if rate <= 0:
+            return
+        units = msg.get("orderbook_units", [])
+        if not units:
+            return
+        if not agrupado:
+            self._mid_krw[code] = (float(units[0]["ask_price"])
+                                   + float(units[0]["bid_price"])) / 2.0
+        bids = [(float(u["bid_price"]) * rate, float(u["bid_size"])) for u in units]
+        asks = [(float(u["ask_price"]) * rate, float(u["ask_size"])) for u in units]
+        book.apply_snapshot(bids, asks)
+
     async def run(self) -> None:
         self._refresh_krw_usd()
         codes   = [a["symbol_upbit"] for a in self.assets]
         backoff = 5
         while True:
             try:
-                subscribe_msg = json.dumps([
-                    {"ticket": str(uuid.uuid4())},
-                    {"type": "orderbook", "codes": codes, "count": 30},
-                ]).encode("utf-8")
                 async with websockets.connect(self.WS_URL, ping_interval=30, ping_timeout=30) as ws:
                     backoff = 5
-                    await ws.send(subscribe_msg)
+                    await ws.send(self._suscripcion(codes, {}))
                     log.info("upbit WS connected (%d symbols)", len(codes))
-                    async for raw in ws:
-                        msg  = json.loads(raw)
+                    agrupado_pedido = False
+                    t0 = time.time()
+                    while True:
+                        # Upbit no acusa recibo de la suscripcion: si no llega nada, la
+                        # unica senal de que no prendio es el silencio. Sin este plazo
+                        # el stream se queda mudo indefinidamente sin un solo log.
+                        raw = await asyncio.wait_for(ws.recv(), timeout=self.ESPERA_DATOS)
+                        msg = json.loads(raw)
                         if msg.get("type") != "orderbook":
                             continue
-                        code = msg.get("code", "")
-                        book = self.books.get(code)
-                        if not book:
-                            continue
-                        rate = self._get_rate()
-                        if rate <= 0:
-                            continue
-                        units = msg.get("orderbook_units", [])
-                        bids  = [(float(u["bid_price"]) * rate, float(u["bid_size"])) for u in units]
-                        asks  = [(float(u["ask_price"]) * rate, float(u["ask_size"])) for u in units]
-                        book.apply_snapshot(bids, asks)
+                        self._aplicar(msg)
+                        if not agrupado_pedido and time.time() - t0 >= self.ESPERA_MIDS:
+                            agrupado_pedido = True
+                            niveles = self._calcular_niveles()
+                            if niveles:
+                                await ws.send(self._suscripcion(codes, niveles))
+                                log.info("upbit: agrupando %d de %d simbolos para "
+                                         "alcanzar la banda ancha", len(niveles), len(codes))
             except Exception as e:
                 log.warning("upbit WS error: %s — reconnecting in %ds", e, backoff)
+                # Cada mensaje de upbit es un snapshot entero, pero hasta que llegue el
+                # siguiente un libro viejo se leeria como bueno en orderbook_latest.
+                for code in codes:
+                    for coleccion in (self.books, self.books_wide):
+                        book = coleccion.get(code)
+                        if book:
+                            book.reset()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
+
+    @staticmethod
+    def _combinar(fino: dict, ancho: Optional[dict]) -> dict:
+        """Las bandas que el libro fino no alcanza se toman del agrupado.
+
+        El fino manda en todo lo que cubre: precio, spread y bandas estrechas salen de
+        el, con la resolucion nativa del exchange. El agrupado solo aporta donde el fino
+        pone NULL, que es justo lo que antes se perdia.
+
+        Con una condicion, encontrada probandolo en vivo: un cubo agrupado puede ser mas
+        ANCHO que la propia banda. En KRW-ETH, con level=100000 sobre un mid de 3,3M KRW,
+        cada cubo mide el 3% del precio, asi que dentro del +-1% no cae ninguno,
+        compute_metrics suma cero a los dos lados y devuelve imbalance 0.0 -- que se lee
+        como "equilibrado" cuando la verdad es "no medible a esta granularidad". Por eso
+        una banda del agrupado solo se acepta si tiene algo a los dos lados.
+        """
+        if not ancho:
+            return fino
+        m = dict(fino)
+        for pct in DEPTH_BANDS:
+            col = BAND_COLS[pct]
+            if m.get(f"imbalance_{col}pct") is not None:
+                continue      # el fino ya la cubre, y con mejor resolucion
+            if not (ancho.get(f"bid_levels_{col}pct") and ancho.get(f"ask_levels_{col}pct")):
+                continue
+            for x in ("bid_qty", "ask_qty", "bid_levels", "ask_levels", "imbalance"):
+                m[f"{x}_{col}pct"] = ancho[f"{x}_{col}pct"]
+        m["depth_coverage_pct"] = max(fino["depth_coverage_pct"],
+                                      ancho["depth_coverage_pct"])
+        return m
 
     def get_metrics(self) -> Dict[str, dict]:
         out = {}
         for a in self.assets:
             sym  = a["symbol_upbit"]
             book = self.books.get(sym)
-            if book:
-                m = book.snapshot()
-                if m:
-                    out[sym] = {"base_asset": a["base_asset"], **m}
+            if not book:
+                continue
+            m = book.snapshot()
+            if not m:
+                continue
+            ancho = self.books_wide[sym].snapshot() if sym in self.books_wide else None
+            out[sym] = {"base_asset": a["base_asset"], **self._combinar(m, ancho)}
         return out
 
 

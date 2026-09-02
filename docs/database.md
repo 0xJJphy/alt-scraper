@@ -96,6 +96,69 @@ Tabla operativa de corto plazo escrita en cada poll de `realtime_daemon.py`. Con
     - `bid_levels_Xpct`, `ask_levels_Xpct`: Cantidad de niveles de precio (densidad).
     - `imbalance_Xpct`: Sesgo del libro `(bid-ask)/(bid+ask)`. Valores > 0 indican presión compradora.
 
+### 2.1 bis Las bandas NO son comparables entre venues
+
+Cada exchange sirve una profundidad distinta, así que la misma columna se apoya en
+distinta cantidad de libro según quién la haya escrito. Medido sobre los snapshots de los
+últimos 30 días:
+
+| venue | tipo | cobertura media | filas con banda 10% | filas con banda 1% |
+|---|---|---|---|---|
+| binance | futures | 95,92% | **100,0%** | 100,0% |
+| bybit | spot | 80,12% | 97,3% | 99,0% |
+| binance | spot | 58,44% | 96,3% | 98,6% |
+| bybit | futures | 58,03% | 94,1% | 98,8% |
+| okx | futures | 30,02% | **67,6%** | 96,9% |
+| upbit | spot | 8,42% | **29,3%** | 98,0% |
+
+El techo de cada uno es del exchange, no del scraper:
+
+- **binance** entrega 1000 niveles por REST (`limit=1000`, el máximo) y los mantiene por
+  `depth@500ms`.
+- **bybit** usa `orderbook.1000`, la profundidad más honda que publica. Verificado que
+  `orderbook.500` no existe en linear (`error:handler not found`) y que 1000 sí funciona
+  en spot y en linear.
+- **okx** usa el canal `books`, que da 400 niveles. Los más hondos (`books-l2-tbt`,
+  `books50-l2-tbt`) exigen cuenta VIP4+, así que no hay opción pública mejor.
+- **upbit** está capado a 30 niveles: `count` de 100 o de 500 devuelve 30 igual. Ver 2.1 ter.
+- **coinbase** entrega el libro completo, sin recortar.
+
+> **Consecuencia práctica**: promediar `imbalance_10pct` entre venues mezcla
+> composiciones que cambian según quién tenga dato ese día, y la ausencia no es
+> aleatoria — es la misma clase de sesgo que el de supervivencia (ver 4.2). Para
+> comparar entre venues, la única banda con cobertura casi universal es la del **1%**.
+
+### 2.1 ter Upbit: dos libros por par, fino y agrupado
+
+Upbit no deja pasar de 30 niveles, y en los pares caros esos 30 niveles no cubren ni el
+0,15% del mid. Su parámetro `level` agrupa por precio y el alcance escala lineal
+(`alcance ≈ 30 × level / mid`), pero **sólo admite potencias de diez**: verificado contra
+el servidor que 10, 10000, 100000 y 1000000 funcionan mientras 5, 50, 50000 y 500000
+dejan el par mudo sin devolver error.
+
+Con saltos de 10× no se puede afinar: un `level` que alcance el 10% hace cubos tan anchos
+que la banda del 1% se quedaría en tres cubos. Por eso cada par se suscribe **dos veces**,
+sin agrupar y agrupado, y las métricas se combinan: el libro fino manda en todo lo que
+alcanza y el agrupado sólo rellena las bandas que el fino deja a NULL.
+
+Resultado medido sobre 34 pares:
+
+| | antes | después |
+|---|---|---|
+| filas con banda 10% | 11/34 (32%) | **31/34 (91%)** |
+| cobertura mediana | 5,37% | 21,93% |
+
+Dos consecuencias al leer filas de upbit:
+
+- `bid_levels_Xpct` y `ask_levels_Xpct` cuentan **cubos agregados** en las bandas que
+  vienen del libro agrupado, no niveles de precio reales, así que su densidad no es
+  comparable con la de otros venues. Las cantidades y los imbalances sí lo son: agrupar
+  no crea ni destruye profundidad.
+- Una banda a NULL con `depth_coverage_pct` alto significa "no medible a la granularidad
+  del exchange", no "no alcanzada". Pasa en los pares que cotizan por debajo de 1 KRW
+  (KRW-SHIB a 0,01 KRW), donde el escalón más pequeño de la escalera ya es mayor que el
+  propio precio y no hay agrupación posible.
+
 ### 2.2 `orderbook_daily_metrics` (Agregación Diaria)
 *Resumen de volatilidad de liquidez.*
 - `spread_bps_open`, `spread_bps_high`, `spread_bps_low`, `spread_bps_close`.
@@ -200,6 +263,33 @@ salga de un dígito de mediana está en otra ventana temporal:
 
 > `IP-USDT` y `TON-USDT` no se pudieron recargar desde OKX (`code 51001`: instrumentos
 > deslistados). Se realinearon desde Coinalyze, que sí conserva su histórico y en UTC — ver 4.2.
+
+#### Por qué okx sólo tiene `volume_delta` en el 12% de sus filas
+
+No es un fallo pendiente, es el techo de la fuente. OKX no publica taker volume nativo,
+así que se deriva de la ratio de Rubik, que sólo sirve ~180 días: 25.251 filas con delta
+entre 132 símbolos son 191 días por símbolo. Los otros tres venues lo publican en todo su
+histórico.
+
+**`spot_daily_ohlcv_okx_pre1dutc` no sirve para rellenarlo.** Esa tabla es el estado
+anterior a la corrección de UTC+8 y conserva 19.420 filas con delta que a la tabla viva le
+faltan, pero comparando las 24.775 filas donde ambas tienen dato:
+
+| | valor |
+|---|---|
+| ratio buy/volumen, tabla viva | 0,4501 |
+| ratio buy/volumen, `pre1dutc` | 0,5256 |
+| diferencia media de `volume_base` | **56,74%** |
+| correlación entre las dos ratios | **−0,4450** |
+
+`pre1dutc` cerraba el día en UTC+8, así que su "día" son dos tercios del día real más un
+tercio del anterior — de ahí el 57% de diferencia en volumen. Y la correlación negativa es
+la prueba de que su ratio no es una versión ruidosa de la buena sino una sistemáticamente
+desplazada: dos medidas de la misma magnitud correlacionan en positivo.
+
+Importarlas metería un buy/sell sesgado en el 9% del histórico de okx. Un NULL es honesto;
+un delta equivocado contamina en silencio cualquier backtest que lo use. La tabla se
+conserva igualmente, por el mismo motivo que los deslistados.
 
 ### 4.2 Activos deslistados — no se borran nunca
 
