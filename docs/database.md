@@ -70,6 +70,18 @@ Tabla operativa de corto plazo escrita en cada poll de `realtime_daemon.py`. Con
 - `liq_longs_acc`, `liq_shorts_acc`: Liquidaciones acumuladas desde las 00:00 UTC.
 - `polled_at`, `updated_at`.
 
+### 1.5 `futures_klines_15m` (Velas 15m Cerradas / Intradía de Alta Frecuencia)
+*Velas OHLCV cerradas oficiales del exchange por `(candle_open_at, symbol, exchange)`.*
+- **Identificadores y Tiempos:**
+    - `candle_open_at`, `candle_close_at` (Timestamptz): Intervalo exacto de la vela.
+    - `symbol`, `exchange`, `base_asset`.
+- **OHLCV:** `price_open`, `price_high`, `price_low`, `price_close`, `volume_base`, `volume_usd`.
+- **Microestructura (CVD):** `buy_volume_base`, `sell_volume_base`, `volume_delta`, `txn_count`.
+- **Trazabilidad y Origen:**
+    - `source`: Canal de entrada (`ws`, `rest_reconciled`, `backfill`).
+    - `ws_received_at`, `rest_reconciled_at`, `exchange_event_time`, `polled_at`.
+- **Escrita por:** `futures_ws_daemon.py` (en vivo vía WebSocket + reconciliador REST continuo) y `klines_15m_backfill.py` (descarga histórica idempotente hacia atrás).
+
 ---
 
 ## 📚 2. Tablas de Orderbook (Liquidez)
@@ -112,6 +124,16 @@ Tabla operativa de corto plazo escrita en cada poll de `realtime_daemon.py`. Con
 ### 3.3 `symbols` (Mapeo)
 - `base_asset`, `quote_asset`, `symbol` (nombre nativo en el exchange).
 - `exchange_id`, `contract_type`, `is_active`, `first_data_date`, `last_data_date`.
+
+### 3.4 `market_cap_history` (Historial Point-in-Time sin Sesgo de Supervivencia)
+*PK compuesta `(date, symbol)`. Registra el ranking y capitalización histórica de mercado.*
+- `date` (Date), `symbol` (Varchar): Activo base (ej: `BTC`, `SOL`).
+- `market_cap_usd` (Decimal 24,4): Capitalización en USD a la fecha del snapshot.
+- `rank_raw` (Integer): Posición absoluta en capitalización de mercado.
+- `in_top_50` (Boolean): Indica si el activo pertenecía al top 50 (excluyendo stablecoins, staked y wrapped tokens).
+- `ever_in_top_50` (Boolean): Flag acumulativo que indica si el activo ha estado alguna vez en el top 50 histórico.
+- `source` (Varchar): Fuente del dato (`cmc`, `coingecko`).
+- **Alimentado por:** `backfill_market_cap_history.py` y snapshots diarios de `alt_scraper.py`.
 
 ---
 
@@ -157,7 +179,8 @@ trackeado frente al 11%). `volume_base` va en unidades del activo base, así que
 resto; el `price_close` difiere del de un par USDT lo que desvíe el peg (<0.1%). Sus velas diarias sí
 cierran a **medianoche UTC**. La fuente es Coinalyze (`{BASE}USD.C`, con `bv`/`tx`/`btx` desde
 2017-01-01), que reconcilia con el propio `volume_base` y por tanto entra en magnitud, sin degradar a
-ratio. Hoy **no está en el pipeline nocturno**: se lanza a mano con
+ratio. **Entra en el pipeline nocturno**, que pide los cuatro venues explícitamente; el default
+de `--exchanges` sigue siendo los tres de USDT, así que a mano hay que nombrarlo:
 `python spot_scraper.py --exchanges coinbase`.
 
 **Alineación horaria** — todas las fuentes tienen que describir el MISMO día UTC. Las velas diarias
@@ -200,3 +223,21 @@ Coinalyze sí lo conserva (`TONUSDT.3`, `IPUSDT.3`) y en UTC, así que se realin
 `reload_okx_delisted_from_coinalyze.py` en vez de eliminarlas: quedaron en 6.5 y 6.8 bps
 **conservando la fecha de deslistado exacta**. Se recortan 285 días del arranque de las series,
 que Coinalyze no cubre; un inicio más tardío no sesga —lo que sesga es truncar la muerte.
+
+---
+
+## 🔄 5. Migraciones de Base de Datos
+
+Las alteraciones estructurales y correcciones históricas se versionan en `migrations/`:
+
+| Archivo | Propósito |
+|---|---|
+| `001_futures_intraday_snapshots.sql` | Crea la tabla de snapshots intradía de 48h para operativa live. |
+| `002_futures_klines_15m.sql` | Crea la tabla de klines 15m con soporte OHLCV y microestructura. |
+| `003_rename_matic_rndr_base_assets.sql` | Normalización de rebrandings de activos base (`MATIC` -> `POL`, `RNDR` -> `RENDER`). |
+| `004_futures_klines_ws_metadata.sql` | Añade campos de metadatos y trazabilidad WS/REST a `futures_klines_15m`. |
+| `005_fix_spot_volume_delta.sql` | Corrige la fórmula de CVD delta en spot (`sell = volume_base - buy`). |
+| `006_reload_okx_spot_1dutc.sql` | Alinea OKX spot a velas diarias `1Dutc` (medianoche UTC en vez de UTC+8). |
+| `008_drop_binance_foreign_txn_counts.sql` | Depura transacciones foráneas inconsistentes en Binance spot. |
+| `add_market_cap_history.sql` | Crea `market_cap_history` para registro de top-50 point-in-time sin sesgo de supervivencia. |
+
