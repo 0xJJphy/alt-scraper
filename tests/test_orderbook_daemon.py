@@ -20,7 +20,8 @@ import unittest
 from collections import deque
 from unittest import mock
 
-from orderbook_daemon import BinanceFuturesStream, BinanceSpotStream
+from orderbook_daemon import (BinanceFuturesStream, BinanceSpotStream,
+                              CoinbaseSpotStream, compute_metrics)
 
 ASSETS = [{"base_asset": "BTC", "symbol_binance": "BTCUSDT",
            "symbol_binance_spot": "BTCUSDT"}]
@@ -245,3 +246,200 @@ class PendingBufferTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Coinbase spot
+# ---------------------------------------------------------------------------
+
+CB_ASSETS = [{"base_asset": "BTC", "symbol_coinbase": "BTC-USD"}]
+
+
+def _u(side, price, qty):
+    return {"side": side, "price_level": str(price), "new_quantity": str(qty)}
+
+
+def _ev(tipo, updates, prod="BTC-USD"):
+    return {"type": tipo, "product_id": prod, "updates": updates}
+
+
+class _FakeWS:
+    """Recoge lo que el stream envía, sin red."""
+
+    def __init__(self):
+        self.enviados = []
+
+    async def send(self, msg):
+        self.enviados.append(msg)
+
+
+class CoinbaseLadoTest(unittest.TestCase):
+    """El lado vendedor de Coinbase se llama `offer`, no `ask`.
+
+    Es la misma clase de trampa que invirtió el delta de OKX con Rubik: un nombre de
+    campo distinto al habitual que, si se resuelve con un `else`, cambia el signo de
+    todos los imbalances sin que nada falle.
+    """
+
+    def test_offer_va_al_ask_y_no_al_bid(self):
+        s = CoinbaseSpotStream(CB_ASSETS)
+        s._apply_event(_ev("snapshot", [_u("bid", 100, 1), _u("offer", 101, 2)]))
+        libro = s.books["BTC-USD"]
+        self.assertEqual(libro.bids, {100.0: 1.0})
+        self.assertEqual(libro.asks, {101.0: 2.0})
+
+    def test_un_lado_desconocido_se_ignora_en_vez_de_caer_al_ask(self):
+        # Si Coinbase renombrara el campo, es preferible un libro incompleto (que deja
+        # de emitir métricas) a uno invertido (que las emite mal).
+        bids, asks = CoinbaseSpotStream._parse_updates([_u("ask", 101, 2)])
+        self.assertEqual((bids, asks), ([], []))
+
+    def test_cantidad_cero_borra_el_nivel(self):
+        s = CoinbaseSpotStream(CB_ASSETS)
+        s._apply_event(_ev("snapshot", [_u("bid", 100, 1), _u("bid", 99, 5),
+                                        _u("offer", 101, 2)]))
+        s._apply_event(_ev("update", [_u("bid", 99, 0)]))
+        self.assertNotIn(99.0, s.books["BTC-USD"].bids)
+        self.assertIn(100.0, s.books["BTC-USD"].bids)
+
+    def test_los_deltas_previos_al_snapshot_no_se_aplican(self):
+        # Sin snapshot no hay centro de recorte, y aplicarlos crearía un libro fantasma.
+        s = CoinbaseSpotStream(CB_ASSETS)
+        s._apply_event(_ev("update", [_u("bid", 100, 1)]))
+        self.assertFalse(s.books["BTC-USD"].initialized)
+
+
+class CoinbaseRecorteTest(unittest.TestCase):
+    """El libro se recorta a ±25% del mid.
+
+    Medido sobre los 107 libros reales: a ±12% tres libros dispersos (2Z, BEAM, BNT)
+    se quedaban por debajo del 10% y perdían la banda ancha en silencio.
+    """
+
+    def test_el_recorte_no_altera_ninguna_banda(self):
+        mid = 100.0
+        bids = [(mid * (1 - i / 1000.0), 1.0) for i in range(1, 401)]   # hasta -40%
+        asks = [(mid * (1 + i / 1000.0), 1.0) for i in range(1, 401)]
+        s = CoinbaseSpotStream(CB_ASSETS)
+        s._apply_event(_ev("snapshot",
+                           [_u("bid", p, q) for p, q in bids]
+                           + [_u("offer", p, q) for p, q in asks]))
+        recortado = s.books["BTC-USD"].snapshot()
+        entero    = compute_metrics(dict(bids), dict(asks))
+
+        for clave, valor in entero.items():
+            if clave == "depth_coverage_pct":
+                continue
+            self.assertEqual(recortado[clave], valor, clave)
+
+        # La única columna que cambia, y satura en el recorte en vez de llegar al 40%.
+        self.assertLess(recortado["depth_coverage_pct"], entero["depth_coverage_pct"])
+        self.assertGreaterEqual(recortado["depth_coverage_pct"], 10.0)
+
+    def test_un_libro_disperso_deja_la_banda_ancha_nula(self):
+        # Sólo hay niveles hasta el ±5%: la del 10% debe salir NULL, no inventada.
+        s = CoinbaseSpotStream(CB_ASSETS)
+        s._apply_event(_ev("snapshot", [_u("bid", 95, 1), _u("bid", 99, 1),
+                                        _u("offer", 101, 1), _u("offer", 105, 1)]))
+        m = s.books["BTC-USD"].snapshot()
+        self.assertIsNone(m["imbalance_10pct"])
+        self.assertIsNotNone(m["imbalance_1pct"])
+
+
+class CoinbaseValidarTest(unittest.TestCase):
+    """Regresión de los dos fallos silenciosos que aparecieron al probarlo en vivo.
+
+    Los dos daban cero snapshots sin una sola línea de log: el stream se creía suscrito
+    y no lo estaba, o se reconectaba en bucle creyendo que perdía mensajes.
+    """
+
+    def test_los_mensajes_de_control_cuentan_para_la_secuencia(self):
+        # `subscriptions` también consume número: validar sólo los de l2_data hacía
+        # saltar un hueco falso de exactamente 1 en cada suscripción.
+        s = CoinbaseSpotStream(CB_ASSETS)
+        esperado = s._validar({"channel": "subscriptions", "sequence_num": 0}, None)
+        self.assertEqual(esperado, 1)
+        esperado = s._validar({"channel": "l2_data", "sequence_num": 1}, esperado)
+        self.assertEqual(esperado, 2)
+
+    def test_un_hueco_real_rompe_la_conexion(self):
+        s = CoinbaseSpotStream(CB_ASSETS)
+        with self.assertRaises(ConnectionError):
+            s._validar({"channel": "l2_data", "sequence_num": 5}, 3)
+
+    def test_el_error_del_servidor_no_se_traga(self):
+        # Los errores no llevan `channel`, así que el filtro por l2_data los descartaba.
+        s = CoinbaseSpotStream(CB_ASSETS)
+        with self.assertRaisesRegex(ConnectionError, "too many L2"):
+            s._validar({"type": "error",
+                        "message": "too many L2 streams requested in a single session"}, None)
+
+    def test_el_tope_de_productos_por_conexion_se_respeta(self):
+        # Medido contra el servidor: 30 van, 31 devuelve error. El recentrado hace
+        # unsubscribe+subscribe, así que conviene no rozar el tope.
+        self.assertLessEqual(CoinbaseSpotStream.CHUNK, 30)
+
+
+class CoinbaseRecentradoTest(unittest.TestCase):
+    """Recortar y mantener el libro vivo se muerden entre sí.
+
+    Ningún otro stream tiene este problema porque ninguno recorta: si el precio se
+    mueve, los niveles que quedaron fuera del recorte NO vuelven, porque los deltas
+    sólo traen lo que cambia. El libro se queda cojo por un lado sin avisar.
+    """
+
+    @staticmethod
+    def _con_libro():
+        s = CoinbaseSpotStream(CB_ASSETS)
+        s._apply_event(_ev("snapshot", [_u("bid", 100, 1), _u("offer", 101, 1)]))
+        return s
+
+    def test_una_deriva_grande_pide_resuscripcion(self):
+        s = self._con_libro()
+        s._apply_event(_ev("update", [_u("bid", 100, 0), _u("offer", 101, 0),
+                                      _u("bid", 115, 1), _u("offer", 116, 1)]))
+        ws = _FakeWS()
+        _run(s._recentrar(ws, ["BTC-USD"], {"ultimo_chequeo": 0.0, "frontera": None}))
+        self.assertTrue(any("unsubscribe" in m for m in ws.enviados))
+        self.assertTrue(any('"subscribe"' in m for m in ws.enviados))
+
+    def test_una_deriva_pequena_no_toca_nada(self):
+        s = self._con_libro()
+        s._apply_event(_ev("update", [_u("bid", 100, 0), _u("offer", 101, 0),
+                                      _u("bid", 102, 1), _u("offer", 103, 1)]))
+        ws = _FakeWS()
+        _run(s._recentrar(ws, ["BTC-USD"], {"ultimo_chequeo": 0.0, "frontera": None}))
+        self.assertEqual(ws.enviados, [])
+
+    def test_se_recentra_una_vez_por_frontera_y_no_mas(self):
+        s = self._con_libro()
+        ws = _FakeWS()
+        estado = {"ultimo_chequeo": 0.0, "frontera": None}
+        with mock.patch("orderbook_daemon._seconds_until_next_snapshot", return_value=30):
+            _run(s._recentrar(ws, ["BTC-USD"], estado))
+            self.assertTrue(ws.enviados)
+            ws.enviados.clear()
+            estado["ultimo_chequeo"] = 0.0          # fuerza otra comprobación
+            _run(s._recentrar(ws, ["BTC-USD"], estado))
+            self.assertEqual(ws.enviados, [])
+
+    def test_el_chequeo_no_corre_en_cada_mensaje(self):
+        # Se llama tras cada delta (cientos por segundo): sin la ventana de CHECK_EVERY
+        # el max/min sobre todos los libros se comería la CPU.
+        s = self._con_libro()
+        ws = _FakeWS()
+        estado = {"ultimo_chequeo": time.time(), "frontera": None}
+        with mock.patch("orderbook_daemon._seconds_until_next_snapshot", return_value=30):
+            _run(s._recentrar(ws, ["BTC-USD"], estado))
+        self.assertEqual(ws.enviados, [])
+
+
+class CoinbaseResetTest(unittest.TestCase):
+    def test_al_reconectar_el_libro_deja_de_emitir_metricas(self):
+        # Un libro al que le han faltado deltas miente sin avisar; es preferible que no
+        # emita nada hasta que llegue el snapshot nuevo, que tarda segundos.
+        s = CoinbaseSpotStream(CB_ASSETS)
+        s._apply_event(_ev("snapshot", [_u("bid", 100, 1), _u("offer", 101, 1)]))
+        self.assertIsNotNone(s.get_metrics().get("BTC-USD"))
+        s.books["BTC-USD"].reset()
+        self.assertEqual(s.get_metrics(), {})

@@ -33,7 +33,7 @@ Este documento describe la jerarquía de archivos y la función de cada componen
 | :--- | :--- |
 | `realtime_daemon.py` | Captura OI, Funding y L/S cada 15 min; actualiza `futures_latest` y `futures_intraday_snapshots` (48h). |
 | `futures_ws_daemon.py` | Servicio WebSocket continuo que captura klines de 15m en tiempo real con reconciliación REST en `futures_klines_15m`. |
-| `orderbook_daemon.py` | Servicio continuo vía WebSockets para capturar profundidad de libros de órdenes en `orderbook_latest` y `orderbook_snapshots`. |
+| `orderbook_daemon.py` | Servicio continuo vía WebSockets para capturar profundidad de libros de órdenes en `orderbook_latest` y `orderbook_snapshots`. Coinbase recorta el libro a ±25% del mid (los 21k niveles de BTC no aportan nada por encima de la banda del 10%), así que su `depth_coverage_pct` satura en ~25% y no es comparable con el de binance; las bandas sí lo son. |
 
 ---
 

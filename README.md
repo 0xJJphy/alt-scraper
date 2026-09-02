@@ -373,10 +373,12 @@ Supabase broadcasts a push every time the daemon upserts a row — the frontend 
 
 ## 📈 Orderbook WebSocket Daemon & Backfill
 
-The system includes a real-time order book depth scraper (`orderbook_daemon.py`) that captures the top 80 assets in live markets from Binance, Bybit, OKX, and Upbit using WebSockets. This minimizes API consumption and provides continuous, high-fidelity order book data.
+The system includes a real-time order book depth scraper (`orderbook_daemon.py`) that captures the top 80 assets in live markets from Binance, Bybit, OKX, Upbit, and Coinbase using WebSockets. This minimizes API consumption and provides continuous, high-fidelity order book data.
 
 ### Features
-- **Exchanges**: Binance Futures, Bybit Linear, OKX Swap, Upbit Spot.
+- **Exchanges**: Binance Futures, Binance Spot, Bybit Linear, Bybit Spot, OKX Swap, Upbit Spot, Coinbase Spot.
+- **Coinbase**: quotes against USD (not USDT) and its book is clipped to ±25% of the mid, so its
+  `depth_coverage_pct` saturates around 25% instead of reaching 100%. The depth bands are unaffected.
 - **WebSocket Streaming**: Maintains book state in real time and takes periodic snapshots to sync to the DB.
 - **Backfill Tool**: Includes `orderbook_backfill.py` for downloading available historical snapshots.
 
@@ -388,7 +390,7 @@ The system includes a real-time order book depth scraper (`orderbook_daemon.py`)
 python orderbook_daemon.py
 
 # Custom options
-python orderbook_daemon.py --top 50 --exchanges binance,bybit
+python orderbook_daemon.py --top 50
 ```
 
 #### Orderbook Backfill
