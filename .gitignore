@@ -65,6 +65,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+backups/
 
 # Data
 data/
