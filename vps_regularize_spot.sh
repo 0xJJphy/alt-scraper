@@ -61,7 +61,11 @@
 # USO
 #   bash vps_regularize_spot.sh
 #   REG_DRY_RUN=1 bash vps_regularize_spot.sh
-#   nohup bash vps_regularize_spot.sh > /dev/null 2>&1 &     # tarda; mejor en tmux/nohup
+#   nohup bash vps_regularize_spot.sh > /dev/null 2>&1 &     # ~45 min; mejor en tmux/nohup
+#
+# Tiempos medidos en una base de 815k filas: backup 6s, migracion 005 3s, 008 1s,
+# recarga de OKX 35 min (los 132 simbolos, uno a uno), deslistados 5s, coinbase 5 min,
+# auditoria 6s. Si el paso 3 no hace falta, la corrida entera baja a ~6 minutos.
 #
 # NO ejecutarlo a la vez que el pipeline nocturno: comparten la cuota de Coinalyze
 # (40 req/min por key) y se pisarían las filas. El script lo detecta y aborta.
@@ -422,7 +426,7 @@ else
         OKX_BACKUP_TABLE="spot_daily_ohlcv_okx_pre1dutc_$STAMP"
         log "Ya hay una tabla de backup de un pase anterior; esta vez se usa $OKX_BACKUP_TABLE"
     fi
-    log "OKX a ${OKX_BPS} bps de binance: sigue en UTC+8. Recargando (esto tarda ~20-30 min)..."
+    log "OKX a ${OKX_BPS} bps de binance: sigue en UTC+8. Recargando (132 simbolos, ~35 min)..."
     "$PYTHON_EXEC" -u "$DIR/reload_okx_spot_1dutc.py" --backup-table "$OKX_BACKUP_TABLE" 2>&1 | tee -a "$LOG_FILE"
     [ "${PIPESTATUS[0]}" -eq 0 ] || fallo "La recarga de OKX falló. Backup en $BACKUP_FILE"
 fi
@@ -453,10 +457,23 @@ else
     # Incremental: get_incremental_start() sólo baja lo que falte desde la última fila.
     CSV_FLAG=""
     [ "${REG_COINBASE_CSV:-1}" = "1" ] && CSV_FLAG="--csv"
-    log "Backfill desde $COINBASE_START (incremental; la primera vez tarda ~40 min)..."
+    log "Backfill desde $COINBASE_START (incremental; el historico completo tarda ~5 min)..."
     "$PYTHON_EXEC" -u "$DIR/spot_scraper.py" --exchanges coinbase --full-universe \
         --start "$COINBASE_START" $CSV_FLAG 2>&1 | tee -a "$LOG_FILE"
     [ "${PIPESTATUS[0]}" -eq 0 ] || fallo "El backfill de Coinbase falló. Backup en $BACKUP_FILE"
+
+    # Salir con 0 no significa haber bajado nada: el scraper puede creerse al dia por un CSV
+    # viejo y escribir cuatro filas. Se comprueba la COBERTURA, que es lo que importa.
+    CB_N="$(sql1 "SELECT count(*) FROM spot_daily_ohlcv WHERE exchange='coinbase'")"
+    CB_MIN="$(sql1 "SELECT coalesce(min(date)::text, 'ninguna') FROM spot_daily_ohlcv WHERE exchange='coinbase'")"
+    CB_CORTO="$(sql1 "SELECT coalesce(min(date) > date '$COINBASE_START' + 370, true) FROM spot_daily_ohlcv WHERE exchange='coinbase'")"
+    log "Coinbase en la base: $CB_N filas, desde $CB_MIN"
+    if [ "$CB_CORTO" = "t" ]; then
+        log "  Se pidió desde $COINBASE_START y lo mas antiguo es $CB_MIN: falta casi todo el historico."
+        log "  Causa habitual: hay CSV en data/spot/coinbase de una corrida anterior y la base"
+        log "  se restauro despues. Apartalos (mv data/spot/coinbase data/spot/coinbase.old) y repite."
+        fallo "El backfill de Coinbase se quedo corto. Backup en $BACKUP_FILE"
+    fi
 fi
 
 # ------------------------------------------------------------------ 6. auditoría

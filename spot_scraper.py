@@ -1251,7 +1251,16 @@ class SpotScraper:
                 last_date = datetime.combine(last_date_db, datetime.min.time(), tzinfo=timezone.utc)
                 print(f"    [Start] Found DB record: {last_date.date()}")
 
-        if not last_date and os.path.exists(path):
+        # El CSV es una CACHE; la base es el destino. Si la base esta activa y dice que no
+        # tiene nada de este simbolo, hay que bajarlo entero: preguntarle al CSV en ese caso
+        # hace que una restauracion de la base deje el backfill en unos pocos dias, en
+        # silencio y con codigo de salida 0. Solo se cae al CSV si no hay base.
+        db_activa = bool(db_manager and db_manager.enabled)
+        if not last_date and db_activa:
+            print(f"    [Start] Sin filas en la BD para {symbol}: descarga completa "
+                  f"(se ignora el CSV, que es cache).")
+
+        if not last_date and not db_activa and os.path.exists(path):
             try:
                 df = pd.read_csv(path)
                 if not df.empty and 'date' in df.columns:
@@ -1433,7 +1442,7 @@ def main():
     parser.add_argument("--symbols", type=str, default=None, help="Specific symbols (e.g. BTC,ETH)")
     parser.add_argument("--exchanges", type=str, default="binance,bybit,okx",
                         help="Exchanges to fetch. Disponibles: binance,bybit,okx,coinbase "
-                             "(coinbase aún no entra en el default ni en run_pipeline.py)")
+                             "(el default deja fuera coinbase; hay que nombrarlo)")
     parser.add_argument("--start", type=str, default="2017-01-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--output-dir", type=str, default="data/spot", help="Output directory")
     parser.add_argument("--metadata-only", action="store_true", help="Only sync metadata and exit")

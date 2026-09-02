@@ -11,8 +11,10 @@ las columnas buy/sell invertidas. Estos tests fijan las dos invariantes que lo c
 """
 import json
 import os
+import shutil
+import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from unittest import mock
 
 import pandas as pd
@@ -260,6 +262,54 @@ class SpotDeltaTest(unittest.TestCase):
         pd.testing.assert_series_equal(
             delta[mask], (buy - sell)[mask], check_names=False, rtol=1e-9
         )
+
+
+class _FakeDB:
+    """DatabaseManager reducido a lo unico que consulta get_incremental_start."""
+
+    def __init__(self, enabled, last_date=None):
+        self.enabled = enabled
+        self._last = last_date
+
+    def get_last_data_date(self, symbol, exchange):
+        return self._last
+
+
+class IncrementalStartTest(unittest.TestCase):
+    """El CSV es cache; la base es el destino.
+
+    Una restauracion de la base dejaba el backfill en unos pocos dias y con codigo de
+    salida 0: la BD no tenia ni una fila del simbolo, pero el CSV de una corrida anterior
+    seguia en disco y decidia la fecha de arranque. Nueve anos de historico perdidos sin
+    un solo aviso.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.csv = os.path.join(self.tmp, "BTCUSD_spot_1d.csv")
+        pd.DataFrame({"date": ["2026-09-01"], "price_close": [1.0]}).to_csv(self.csv, index=False)
+        self.scraper = spot_scraper.SpotScraper(output_dir=self.tmp)
+        self.desde_2017 = spot_scraper.to_unix_ms(datetime(2017, 1, 1, tzinfo=timezone.utc))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _arranque(self, db):
+        return self.scraper.get_incremental_start(
+            self.csv, self.desde_2017, "BTC-USD", "coinbase", db
+        )
+
+    def test_bd_vacia_ignora_el_csv(self):
+        self.assertEqual(self._arranque(_FakeDB(True, None)), self.desde_2017)
+
+    def test_bd_con_datos_manda_sobre_el_csv(self):
+        esperado = spot_scraper.to_unix_ms(datetime(2026, 8, 6, tzinfo=timezone.utc))
+        self.assertEqual(self._arranque(_FakeDB(True, date(2026, 8, 20))), esperado)
+
+    def test_sin_base_activa_se_sigue_usando_el_csv(self):
+        esperado = spot_scraper.to_unix_ms(datetime(2026, 8, 18, tzinfo=timezone.utc))
+        self.assertEqual(self._arranque(_FakeDB(False)), esperado)
+        self.assertEqual(self._arranque(None), esperado)
 
 
 if __name__ == "__main__":

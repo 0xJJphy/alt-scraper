@@ -70,7 +70,11 @@ def main():
     # sólo añadía ~25 min de reloj. Arreglado el limitador, el paralelo vuelve.
     print("\n[2-3/4] Running Spot + Futures scrapers in parallel...", flush=True)
     parallel_results = run_command_parallel({
-        "SPOT": [sys.executable, "-u", spot_script, "--limit", top_n],
+        # Coinbase se nombra aqui y no en el default de spot_scraper.py: asi el nocturno
+        # dice explicitamente que venues cubre y una llamada manual sin argumentos sigue
+        # comportandose como siempre. Usa COINALYZE_API_KEY_SPOT, cupo aparte del de futuros.
+        "SPOT": [sys.executable, "-u", spot_script, "--limit", top_n,
+                 "--exchanges", "binance,bybit,okx,coinbase"],
         "FUTURES": [sys.executable, "-u", alts_script, "--limit", top_n, "--exchanges", "binance,bybit,okx"],
     })
     if parallel_results.get("SPOT", 0) != 0:
