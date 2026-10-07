@@ -45,6 +45,9 @@ load_dotenv()
 # API Configuration
 # ==============================================================================
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+# market_cap_history keeps the global CoinGecko rank for the top 250 * pages (default 1000) so smaller
+# listed alts also get a daily rank; the tracked-universe selection still uses page 1 only.
+MCAP_SNAPSHOT_PAGES = int(os.getenv("MCAP_SNAPSHOT_PAGES", "4"))
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
 COINALYZE_BATCH_SIZE = int(os.environ.get("COINALYZE_BATCH_SIZE", "10"))  # symbols per batch request
 
@@ -686,12 +689,13 @@ class AssetMetadataManager:
         if self.allow_csv:
             self.df.to_csv(self.file_path, index=False)
 
-def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[str]] = None, max_retries: int = 3) -> List[Dict]:
+def coingecko_get_top_candidates(n: int = 50, specific_symbols: Optional[List[str]] = None, max_retries: int = 3,
+                                 page: int = 1) -> List[Dict]:
     """Fetch top tokens from CoinGecko markets with retry for null market_cap."""
     print(f"[INFO] Fetching market data from CoinGecko (specific={bool(specific_symbols)})...")
 
     url = f"{COINGECKO_BASE}/coins/markets"
-    params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": 1, "sparkline": "false"}
+    params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": page, "sparkline": "false"}
     if specific_symbols:
         params["symbols"] = ",".join(specific_symbols).lower()
         params["per_page"] = 100
@@ -2437,7 +2441,15 @@ def main():
         # Persist daily market cap snapshot BEFORE filtering — captures full universe for backtesting
         today_str = datetime.now(UTC).strftime("%Y-%m-%d")
         if db_manager and db_manager.enabled:
-            db_manager.bulk_upsert_market_cap_history(today_str, candidates, top_n=limit)
+            snapshot = list(candidates)
+            for page in range(2, MCAP_SNAPSHOT_PAGES + 1):
+                time.sleep(2.5)
+                extra = coingecko_get_top_candidates(page=page)
+                if not extra:
+                    print(f"[CG] Market cap snapshot stopped at page {page - 1}")
+                    break
+                snapshot.extend(extra)
+            db_manager.bulk_upsert_market_cap_history(today_str, snapshot, top_n=limit)
 
         new_top_symbols = []
         for c in candidates:
