@@ -57,3 +57,31 @@ def test_mcap_row_t_is_close_of_t_minus_1():
     shifted = {t: closes[t] * 1e9 for t in caps if t in closes}
     assert bf.check(caps, closes)["ok"]
     assert not bf.check(shifted, closes)["ok"]
+
+
+def _days(end, ks):
+    return {end - timedelta(days=k) for k in ks}
+
+
+def test_auto_detects_new_base_and_recent_gap_only():
+    end = date(2026, 10, 8)
+    start = end - timedelta(days=365)
+    full = _days(end, range(1, 366))
+    have = {
+        "OK": full,                                  # complete
+        "LATE": _days(end, range(1, 100)),           # CG history starts late: old holes only
+        "RECENT": full - _days(end, [2, 3]),         # snapshot missed two recent days
+        # "NEW" has no rows at all
+    }
+    todo = bf.select_todo(["OK", "LATE", "RECENT", "NEW"], have, start, end,
+                          auto=True, recent_days=7, min_missing=1, max_bases=0)
+    assert todo == ["NEW", "RECENT"]  # no rows first, then most recent days missing
+
+
+def test_auto_cap_and_manual_mode():
+    end = date(2026, 10, 8)
+    start = end - timedelta(days=365)
+    have = {"LATE": _days(end, range(1, 100))}
+    assert bf.select_todo(["A", "B", "C"], {}, start, end, True, 7, 1, 2) == ["A", "B"]
+    assert bf.select_todo(["LATE"], have, start, end, False, 7, 1, 0) == ["LATE"]
+    assert bf.select_todo(["LATE"], have, start, end, True, 7, 1, 0) == []

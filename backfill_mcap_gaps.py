@@ -31,6 +31,14 @@ Usage:
     python backfill_mcap_gaps.py --apply              # write the gaps
     python backfill_mcap_gaps.py --symbols BAND,ENJ --days 365 --apply
     python backfill_mcap_gaps.py --ids US=some-coingecko-id --apply
+    python backfill_mcap_gaps.py --auto --apply       # daily pipeline step (run_pipeline.py)
+
+--auto (detection for the daily run): a base is a gap only if it has no row in the
+whole window (new listing / outside the CoinGecko top 1000) or misses a day in the
+last --recent-days days (failed snapshot, rank fell out of the snapshot pages).
+Older holes alone do not trigger a fetch, so coins whose CoinGecko history starts
+late are not re-downloaded every day. At most --max-bases bases per run, those
+with the most missing recent days first.
 """
 
 import argparse
@@ -188,21 +196,43 @@ def check(caps: Dict[date, float], closes: Dict[date, float]) -> dict:
 
 
 def insert_rows(conn, rows: List[Tuple]) -> int:
+    # RETURNING + fetch counts every page (cur.rowcount only reflects the last page of execute_values)
     with conn.cursor() as cur:
-        execute_values(
+        inserted = execute_values(
             cur,
             """
             INSERT INTO market_cap_history (date, symbol, market_cap_rank, market_cap_usd, in_top_50, ever_in_top_50, source)
             VALUES %s
             ON CONFLICT (date, symbol) DO NOTHING
+            RETURNING 1
             """,
             rows,
             template="(%s, %s, NULL, %s, false, false, 'coingecko')",
             page_size=1000,
+            fetch=True,
         )
-        n = cur.rowcount
     conn.commit()
-    return n
+    return len(inserted)
+
+
+def select_todo(bases: Sequence[str], have: Dict[str, set], start: date, end: date,
+                auto: bool, recent_days: int, min_missing: int, max_bases: int) -> List[str]:
+    """Bases to process. Manual mode: >= min_missing missing days in [start, end).
+    Auto mode: no row at all in [start, end), or a missing day in [end - recent_days, end)."""
+    expected = (end - start).days
+    recent = {end - timedelta(days=k) for k in range(1, recent_days + 1)}
+    scored = []
+    for b in bases:
+        got = have.get(b, set())
+        if auto:
+            miss_recent = len(recent - got)
+            if not got or miss_recent:
+                scored.append((-(recent_days + 1) if not got else -miss_recent, b))
+        elif expected - len(got) >= min_missing:
+            scored.append((0, b))
+    scored.sort()
+    out = [b for _, b in scored]
+    return out[:max_bases] if max_bases > 0 else out
 
 
 def main():
@@ -212,6 +242,10 @@ def main():
     ap.add_argument("--ids", default="", help="manual overrides SYMBOL=coingecko-id,... (still validated)")
     ap.add_argument("--min-missing", type=int, default=1, help="skip bases with fewer missing days")
     ap.add_argument("--apply", action="store_true", help="write to market_cap_history (default: dry run)")
+    ap.add_argument("--auto", action="store_true", help="daily detection: no rows at all or a recent missing day")
+    ap.add_argument("--recent-days", type=int, default=7, help="--auto: recent window checked for missing days")
+    ap.add_argument("--max-bases", type=int, default=None,
+                    help="cap of bases per run (default: 40 with --auto, unlimited otherwise)")
     args = ap.parse_args()
 
     db_url = os.getenv("DATABASE_URL")
@@ -228,12 +262,19 @@ def main():
         bases = target_bases(conn, symbols)
         have = existing_dates(conn, list(bases), start, end)
         expected = (end - start).days
-        todo = {b: v for b, v in bases.items() if expected - len(have.get(b, ())) >= args.min_missing}
-        print(f"[INFO] {len(bases)} bases, {len(todo)} with >= {args.min_missing} missing days in [{start}, {end})"
+        max_bases = args.max_bases if args.max_bases is not None else (40 if args.auto else 0)
+        picked = select_todo(list(bases), have, start, end, args.auto, args.recent_days, args.min_missing, max_bases)
+        todo = {b: bases[b] for b in picked}
+        rule = (f"no rows or a missing day in the last {args.recent_days}d" if args.auto
+                else f">= {args.min_missing} missing days in [{start}, {end})")
+        print(f"[INFO] {len(bases)} bases, {len(todo)} to process ({rule}; cap {max_bases or 'none'})"
               f" | mode={'APPLY' if args.apply else 'DRY RUN'}")
+        if not todo:
+            print("[DONE] no gaps detected")
+            return
         coins = cg_get("/coins/list") or []
         report, total_new = [], 0
-        for i, (base, (exchange, fsym)) in enumerate(sorted(todo.items()), 1):
+        for i, (base, (exchange, fsym)) in enumerate(todo.items(), 1):
             entry = {"base": base, "futures": f"{exchange}:{fsym}", "missing_days": expected - len(have.get(base, ()))}
             try:
                 closes = futures_closes(conn, exchange, fsym, start)

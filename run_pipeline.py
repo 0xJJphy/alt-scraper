@@ -82,6 +82,16 @@ def main():
     if parallel_results.get("FUTURES", 0) != 0:
         failed_steps.append("Futures Scraper")
 
+    # 3b. Fill CoinGecko market-cap gaps for the listed futures universe. Runs after the
+    # futures scraper because that one writes today's top-1000 snapshot: only bases still
+    # missing rows are fetched, and every CoinGecko id is validated against futures closes
+    # before inserting (ON CONFLICT DO NOTHING). MCAP_GAP_FILL=0 disables the step.
+    if os.getenv("MCAP_GAP_FILL", "1") != "0":
+        print("\n[3b/5] Filling market-cap gaps (CoinGecko)...", flush=True)
+        if run_command([sys.executable, "-u", os.path.join(base_dir, "backfill_mcap_gaps.py"),
+                        "--auto", "--apply"], label="MCAP_GAPS") != 0:
+            failed_steps.append("Mcap Gap Fill")
+
     # 4. Compute daily L/S high/low from today's snapshots → futures_daily_metrics
     print("\n[4/5] Computing L/S daily high/low from snapshots...", flush=True)
     try:
