@@ -92,6 +92,19 @@ def main():
                         "--auto", "--apply"], label="MCAP_GAPS") != 0:
             failed_steps.append("Mcap Gap Fill")
 
+    # 3c. Repair interior 15m kline gaps from the last days (daemon outages). Each gap is
+    # filled from the exchange REST API only if it reproduces the neighbouring bars already
+    # in the DB; bars the exchange no longer serves stay missing (exit 3 = partial, not a
+    # failure). Manifests for --rollback land in logs/repair_klines15m/. KLINE_GAP_REPAIR=0
+    # disables the step.
+    if os.getenv("KLINE_GAP_REPAIR", "1") != "0":
+        print("\n[3c/5] Repairing recent 15m kline gaps...", flush=True)
+        rc = run_command([sys.executable, "-u", os.path.join(base_dir, "repair_klines15m.py"),
+                          "--repair", "--apply", "--recent-days", os.getenv("KLINE_GAP_RECENT_DAYS", "3"),
+                          "--max-gaps", os.getenv("KLINE_GAP_MAX_GAPS", "300")], label="KLINE_GAPS")
+        if rc not in (0, 3):
+            failed_steps.append("Kline Gap Repair")
+
     # 4. Compute daily L/S high/low from today's snapshots → futures_daily_metrics
     print("\n[4/5] Computing L/S daily high/low from snapshots...", flush=True)
     try:

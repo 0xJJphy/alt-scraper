@@ -19,9 +19,11 @@ Este documento describe la jerarquía de archivos y la función de cada componen
 | :--- | :--- |
 | `alt_scraper.py` | Scraper principal de históricos de Futuros (vía Coinalyze API y APIs nativas). |
 | `spot_scraper.py` | Scraper de históricos de Spot (Binance, Bybit, OKX 1Dutc, Coinbase USD; con CVD robusto y prioridad DB sobre caché CSV). |
-| `run_pipeline.py` | Orquestador diario que ejecuta los scrapers en paralelo (Spot + Futuros) y gestiona la limpieza y persistencia en PostgreSQL/Supabase. |
+| `run_pipeline.py` | Orquestador diario que ejecuta los scrapers en paralelo (Spot + Futuros) y gestiona la limpieza y persistencia en PostgreSQL/Supabase. Tras los scrapers rellena huecos de market cap (`MCAP_GAP_FILL=0` lo desactiva) y repara huecos 15m recientes (`KLINE_GAP_REPAIR=0`). |
 | `discover_universe.py` | Genera la lista de activos candidatos que han podido estar en el top 50 desde 2020 consultando CoinGecko y `asset_metadata`. |
 | `backfill_market_cap_history.py` | Genera el historial diario/semanal de capitalización y pertenencia al top 50 point-in-time sin sesgo de supervivencia (CMC / CoinGecko). |
+| `backfill_mcap_gaps.py` | Rellena días ausentes de market cap CoinGecko del universo de futuros, validando cada id contra los cierres; `--auto` es el paso diario. |
+| `repair_klines15m.py` | Detecta y repara huecos interiores de `futures_klines_15m` desde la REST de cada exchange con validación de barras vecinas y manifiesto de `--rollback`; `--recent-days` es el paso diario. |
 | `backfill_ls_ranges.py` | Backfill de rangos de ratios Long/Short. |
 | `run_backfill.py` | Orquestador de backfill histórico masivo. |
 
